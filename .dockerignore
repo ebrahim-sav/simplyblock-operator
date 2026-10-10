@@ -18,3 +18,6 @@
 
 # Re-include LICENSE file
 !LICENSE
+
+# Re-include the MDS image's ssh wrapper (Dockerfile.mds copies it in)
+!csi-driver/deploy/image/mds-ssh.sh
