@@ -228,3 +228,58 @@ func TestStartFailureIsReturned(t *testing.T) {
 		t.Error("Run succeeded although QEMU did not start")
 	}
 }
+
+// Regression: 2026-10-10-mds-shutdown-loses-replies (pnfs-1791652310). A
+// client's mkdir reached nfsd while the guest was stopping it: nfsd made the
+// directory, its threads exited before the reply went out, and the client's
+// retry on the new server failed with EEXIST. The runner stops new requests
+// from reaching the guest, gives those already in it DrainWait to be answered,
+// and only then presses the power button.
+func TestShutdownDrainsTheGuestBeforeThePowerButton(t *testing.T) {
+	q := newFakeQEMU()
+	s := supervisor(q)
+	var order []string
+	var drainedAt, pressedAt time.Time
+	s.Drain = func(context.Context) error {
+		order = append(order, "drain")
+		drainedAt = time.Now()
+		return nil
+	}
+	s.DrainWait = 50 * time.Millisecond
+	s.Powerdown = func(context.Context) error {
+		order = append(order, "powerdown")
+		pressedAt = time.Now()
+		q.stop(nil)
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(ctx, s)
+	waitFor(t, "readiness", s.Ready)
+	cancel()
+
+	if err := result(t, done); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if len(order) != 2 || order[0] != "drain" || order[1] != "powerdown" {
+		t.Fatalf("shutdown steps = %v, want [drain powerdown]", order)
+	}
+	if gap := pressedAt.Sub(drainedAt); gap < s.DrainWait {
+		t.Errorf("the power button came %v after the drain, want at least %v", gap, s.DrainWait)
+	}
+}
+
+// A drain that cannot be installed still shuts the guest down: the shutdown is
+// what the pod is waiting for.
+func TestAFailedDrainStillPowersDown(t *testing.T) {
+	q := newFakeQEMU()
+	s := supervisor(q)
+	s.Drain = func(context.Context) error { return errors.New("iptables: no such chain") }
+	s.DrainWait = time.Hour
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runAsync(ctx, s)
+	waitFor(t, "readiness", s.Ready)
+	cancel()
+	if err := result(t, done); err != nil {
+		t.Errorf("Run = %v, want a clean shutdown", err)
+	}
+}

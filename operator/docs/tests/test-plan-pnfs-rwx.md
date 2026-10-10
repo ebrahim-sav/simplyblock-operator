@@ -189,6 +189,8 @@ restarted rather than migrated (design §13).
 | U-102 | The guest has a free page reporting balloon on both architectures                                                                                                                    | Positive                       | `TestGuestHasAFreePageReportingBalloon`                                                                                                                                    |
 | U-103 | Debug SSH is off without a key; with one, the key goes through fw_cfg and the command line turns it on                                                                               | Positive + Negative            | `TestDebugSSHIsOffWithoutAKey`, `TestDebugSSHHandsTheKeyToTheGuestAndTurnsItOn`                                                                                            |
 | U-104 | The runner's debug key is a private pair the guest accepts, new at every boot                                                                                                        | Positive                       | `TestDebugSSHKeyIsAPrivatePairTheGuestAccepts`, `TestDebugSSHKeyIsNewEveryBoot`                                                                                            |
+| U-105 | Regression (run `pnfs-1791652310`): the runner drains the guest and waits before the power button, and a failed drain still powers it down                                           | Regression                     | `TestShutdownDrainsTheGuestBeforeThePowerButton`, `TestAFailedDrainStillPowersDown`                                                                                        |
+| U-106 | The drain drops every packet carrying a request to the guest's NFS port and lets bare ACKs through                                                                                   | Positive                       | `TestTheDrainDropsRequestsButNotAcknowledgments`                                                                                                                          |
 | U-76  | The relay resolves connections as the operator's identity, and delete proceeds without the control plane                                                                             | Positive                       | `TestCreateHandsTheGuestAConnectionResolvedForTheOperatorsIdentity`, `TestDeleteGoesAheadWithoutTheControlPlane`                                                           |
 | U-77  | A create without a resolvable connection reaches no guest, and a connection arriving with the call is dropped                                                                        | Negative                       | `TestCreateWithoutAConnectionReachesNoGuest`, `TestAConnectionArrivingWithTheCallIsNotPassedOn`                                                                            |
 | U-83  | The nfsd watchdog reads pool statistics by column name, a missing file as nfsd not running, and only nfsd threads with their state and wait                                          | Positive + Negative            | `TestPoolStatsAreSummedByColumnName`, `TestMissingPoolStatsIsNFSDNotRunning`, `TestThreadStateIsReadAfterTheLastParenthesis`, `TestOnlyNFSDThreadsAreRead`                 |
@@ -490,7 +492,7 @@ Struck rows are not counted.
 
 | Class                    | Scenarios | Covered | Not covered |
 |--------------------------|-----------|---------|-------------|
-| Unit (`U-`)              | 76        | 76      | 0           |
+| Unit (`U-`)              | 78        | 78      | 0           |
 | Operator (`O-`)          | 38        | 36      | 2           |
 | Sanity (`SAN-`)          | 2         | 0       | 2           |
 | Integration (`I-`)       | 3         | 3       | 0           |
@@ -498,7 +500,7 @@ Struck rows are not counted.
 | Failure injection (`F-`) | 14        | 4       | 10          |
 | Security (`SEC-`)        | 8         | 0       | 8           |
 | Load and soak (`L-`)     | 6         | 0       | 6           |
-| **Total**                | **165**   | **131** | **34**      |
+| **Total**                | **167**   | **133** | **34**      |
 
 Unit and operator coverage follows the code. The live classes are the gaps: four
 `F-` rows rest on a recorded run with a manual pod delete rather than on a suite

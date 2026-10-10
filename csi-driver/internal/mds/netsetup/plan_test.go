@@ -100,3 +100,21 @@ func TestInboundClientAddressesAreNotRewritten(t *testing.T) {
 func ruleEqual(a, b Rule) bool {
 	return a.Table == b.Table && a.Chain == b.Chain && slices.Equal(a.Spec, b.Spec)
 }
+
+// The shutdown drain drops what carries a request to the guest's nfsd, and
+// nothing else: a bare TCP segment, at most 80 bytes with every option, is a
+// client's ACK, which a reply larger than one window still needs.
+func TestTheDrainDropsRequestsButNotAcknowledgments(t *testing.T) {
+	p := DefaultPlan("eth0")
+	want := Rule{
+		Table: "filter",
+		Chain: "FORWARD",
+		Spec: []string{
+			"-d", p.Guest.String() + "/32", "-p", "tcp", "--dport", "2049",
+			"-m", "length", "!", "--length", "0:80", "-j", "DROP",
+		},
+	}
+	if got := p.DrainRule(); !ruleEqual(got, want) {
+		t.Errorf("DrainRule = %v, want %v", got, want)
+	}
+}

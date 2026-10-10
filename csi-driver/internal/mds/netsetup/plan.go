@@ -110,3 +110,18 @@ func (p Plan) Rules() []Rule {
 		}},
 	}
 }
+
+// noPayloadMax is the longest packet that carries no TCP payload: a 20-byte IP
+// header and a 60-byte TCP header with every option.
+const noPayloadMax = 80
+
+// DrainRule stops requests from reaching the guest's nfsd while the guest
+// shuts down. It drops every forwarded packet to the guest's NFS port that
+// carries data. A client's bare ACKs still pass, so a reply larger than one
+// TCP window, already being sent, still completes.
+func (p Plan) DrainRule() Rule {
+	return Rule{Table: "filter", Chain: "FORWARD", Spec: []string{
+		"-d", p.Guest.String() + "/32", "-p", "tcp", "--dport", strconv.Itoa(NFSPort),
+		"-m", "length", "!", "--length", "0:" + strconv.Itoa(noPayloadMax), "-j", "DROP",
+	}}
+}

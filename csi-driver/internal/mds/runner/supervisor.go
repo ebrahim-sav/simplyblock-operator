@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"k8s.io/klog"
+
 	"github.com/simplyblock/atlas/errs/deferrers"
 )
 
@@ -42,6 +44,12 @@ type Supervisor struct {
 	Probe func(ctx context.Context) error
 	// Powerdown asks the guest to shut down.
 	Powerdown func(ctx context.Context) error
+	// Drain stops new requests from reaching the guest before Powerdown.
+	// Optional.
+	Drain func(ctx context.Context) error
+	// DrainWait is how long requests already in the guest get to be answered
+	// after Drain.
+	DrainWait time.Duration
 
 	BootDeadline  time.Duration
 	ProbeInterval time.Duration
@@ -111,6 +119,7 @@ func (s *Supervisor) probeOnce(ctx context.Context) error {
 // exit, then kills QEMU. The guest unmounts its filesystems and stops nfsd on
 // the way down, which a kill skips.
 func (s *Supervisor) shutdown(proc Process, exited <-chan error) error {
+	s.drain()
 	ctx, cancel := context.WithTimeout(context.Background(), s.ShutdownGrace)
 	defer cancel()
 
@@ -126,6 +135,29 @@ func (s *Supervisor) shutdown(proc Process, exited <-chan error) error {
 		return fmt.Errorf("guest did not power down within %s, killed QEMU", s.ShutdownGrace)
 	}
 }
+
+// drain stops new requests from reaching the guest, then waits DrainWait for
+// those already in it to be answered. NFSv4.1 runs a request once only within a
+// session, and a restarted server has none: a request the stopping guest ran
+// but never answered is run again on the new one, and a mkdir or a rename then
+// fails. A request that never reached the guest is run once, on the new
+// server. A drain that fails is logged, and the guest is shut down regardless.
+func (s *Supervisor) drain() {
+	if s.Drain == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), drainInstallTimeout)
+	defer cancel()
+	if err := s.Drain(ctx); err != nil {
+		klog.Warningf("draining the guest before shutdown: %v; shutting down without it", err)
+		return
+	}
+	time.Sleep(s.DrainWait)
+}
+
+// drainInstallTimeout bounds installing the drain, so a stuck iptables cannot
+// eat the pod's termination grace period.
+const drainInstallTimeout = 5 * time.Second
 
 // kill kills QEMU and waits until it has exited, so nothing outlives Run.
 func kill(proc Process, exited <-chan error) {

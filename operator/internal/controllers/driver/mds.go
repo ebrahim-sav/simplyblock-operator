@@ -68,9 +68,10 @@ const (
 	mdsProbePort       = 8080
 	mdsNFSPort         = 2049
 
-	// The runner gives a powered-down guest 20s to exit. The pod's grace
-	// period has to leave it that, or kubelet kills QEMU first and the guest
-	// never unmounts.
+	// The runner first drains the guest's requests (3s, and up to 5s to
+	// install the drain) and then gives the powered-down guest 20s to exit.
+	// The pod's grace period has to leave it all of that, or kubelet kills
+	// QEMU first and the guest never unmounts.
 	mdsTerminationGraceSeconds = 30
 
 	// The CRD's default for spec.pnfs.mds.stateSize, for an object admission

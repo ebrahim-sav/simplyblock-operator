@@ -57,6 +57,7 @@ type config struct {
 	debugSSH               bool
 	bootDeadline           time.Duration
 	shutdownGrace          time.Duration
+	drainWait              time.Duration
 
 	// The operator's link endpoint, under the node plugin's flag names, so
 	// the driver passes both the same arguments.
@@ -100,6 +101,9 @@ func parseFlags() config {
 		"Time the guest has to turn healthy before the pod restarts")
 	flag.DurationVar(&c.shutdownGrace, "shutdown-grace", 20*time.Second,
 		"Time a powered-down guest has to exit; keep below the pod's termination grace period")
+	flag.DurationVar(&c.drainWait, "drain-wait", 3*time.Second,
+		"Time the requests already in the guest get to be answered once new ones are dropped, before the "+
+			"power button; drain-wait plus shutdown-grace stays below the pod's termination grace period")
 	flag.BoolVar(&c.link, "link", false, "Dial the operator once the guest is healthy and relay its export calls")
 	flag.StringVar(&c.linkHubAddress, "link-hub-address", "", "The operator's link endpoint, host:port")
 	flag.StringVar(&c.linkServerName, "link-server-name", "",
@@ -222,6 +226,10 @@ func run(ctx context.Context, c config) error {
 		BootDeadline:  c.bootDeadline,
 		ProbeInterval: 2 * time.Second,
 		ShutdownGrace: c.shutdownGrace,
+		Drain: func(ctx context.Context) error {
+			return netsetup.EnsureRules(ctx, netsetup.ExecIPTables, []netsetup.Rule{plan.DrainRule()})
+		},
+		DrainWait: c.drainWait,
 	}
 
 	probes := serveProbes(c.probeAddress, sup)
