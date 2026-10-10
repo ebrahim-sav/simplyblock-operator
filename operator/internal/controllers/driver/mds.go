@@ -12,6 +12,7 @@
 package driver
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -26,8 +27,10 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/ptr"
@@ -129,6 +132,52 @@ func MDSResourcesProblem(spec *simplyblockv1alpha2.DriverPNFSMDS) string {
 	}
 	return fmt.Sprintf("spec.pnfs.mds.resources.limits.memory is %s, under the %s the metadata "+
 		"server needs: its guest gets the limit less 256Mi for QEMU", mem.String(), MDSMinMemoryLimit)
+}
+
+// UpdateMDS gives an existing metadata server StatefulSet the pod template this
+// release builds, when its recorded hash says it has another one, and reports
+// whether it wrote. Only the template and the hash are written: the selector
+// and the claim templates cannot be changed, and the claim template's class is
+// read from the existing object rather than looked up again. A template edited
+// by hand keeps its hash, and is left as it is.
+func UpdateMDS(
+	ctx context.Context, c client.Client, d *simplyblockv1alpha2.SimplyblockDriver,
+	existing *appsv1.StatefulSet,
+) (bool, error) {
+	stateClass := ""
+	if len(existing.Spec.VolumeClaimTemplates) > 0 {
+		if class := existing.Spec.VolumeClaimTemplates[0].Spec.StorageClassName; class != nil {
+			stateClass = *class
+		}
+	}
+	_, desired, err := MDSObjects(d, existing.Labels[MDSClusterLabel], stateClass)
+	if err != nil {
+		return false, err
+	}
+	want := desired.Annotations[MDSTemplateHashAnnotation]
+	if existing.Annotations[MDSTemplateHashAnnotation] == want {
+		return false, nil
+	}
+	existing.Spec.Template = desired.Spec.Template
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations[MDSTemplateHashAnnotation] = want
+	if err := c.Update(ctx, existing); err != nil {
+		// Every export of the cluster, and the driver reconciler, can find the
+		// same old template, and only one update lands. A loser whose re-read shows the current hash is
+		// done. Otherwise, the conflict is returned and the next reconcile reads
+		// the StatefulSet again.
+		if apierrors.IsConflict(err) {
+			var live appsv1.StatefulSet
+			if getErr := c.Get(ctx, client.ObjectKeyFromObject(existing), &live); getErr == nil &&
+				live.Annotations[MDSTemplateHashAnnotation] == want {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("updating the metadata server StatefulSet %s: %w", existing.Name, err)
+	}
+	return true, nil
 }
 
 // mdsStatefulSetNameLimit is the longest a StatefulSet name may be; see

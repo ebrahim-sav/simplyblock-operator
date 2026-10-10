@@ -311,6 +311,7 @@ through the control plane's API.
 | O-45 | Every node advertising the flow service is asked, for TCP port 2049 to the export's ClusterIP and the old address only. One request per Service and address, duplicates collapse, a canceled request is never sent, one node failing does not stop the others, and an invalid address asks nobody                                          | Positive + Negative + Boundary | `TestEveryCapableNodeForgetsTheOldAddress`, `TestRequestsForOneAddressCollapse`, `TestANodeFailingDoesNotStopTheOthers`, `TestAnInvalidAddressAsksNobody`, `TestOneRequestPerServiceAndAddress`, `TestACanceledRequestIsNotSent`                              |
 | O-46 | Regression (run `pnfs-1791627120`): an export assembled by the running pod but recording another pod's address has its EndpointSlice and status repointed, without reassembly                                                                                                                                                              | Regression                     | `TestAnExportAssembledByTheRunningPodFollowsItsAddress`                                                                                                                                                                                                       |
 | O-47 | A memory request left unset defaults to 512Mi under the limit, and one the spec states is kept                                                                                                                                                                                                                                             | Positive                       | `TestMDSPodRequestsLessMemoryThanItsLimit`, `TestMDSPodKeepsTheMemoryRequestItIsGiven`                                                                                                                                                                        |
+| O-48 | Regression (run `pnfs-1791627120`): a driver reconcile updates an outdated MDS StatefulSet with no export reconciling, and leaves a current one unwritten                                                                                                                                                                                  | Regression                     | `TestADriverReconcileUpdatesAnOutdatedMDSWithoutAnyExport`, `TestADriverReconcileLeavesACurrentMDSAlone`                                                                                                                                                      |
 
 ---
 
@@ -493,14 +494,14 @@ Struck rows are not counted.
 | Class                    | Scenarios | Covered | Not covered |
 |--------------------------|-----------|---------|-------------|
 | Unit (`U-`)              | 78        | 78      | 0           |
-| Operator (`O-`)          | 38        | 36      | 2           |
+| Operator (`O-`)          | 39        | 37      | 2           |
 | Sanity (`SAN-`)          | 2         | 0       | 2           |
 | Integration (`I-`)       | 3         | 3       | 0           |
 | End-to-end (`E-`)        | 18        | 12      | 6           |
 | Failure injection (`F-`) | 14        | 4       | 10          |
 | Security (`SEC-`)        | 8         | 0       | 8           |
 | Load and soak (`L-`)     | 6         | 0       | 6           |
-| **Total**                | **167**   | **133** | **34**      |
+| **Total**                | **168**   | **134** | **34**      |
 
 Unit and operator coverage follows the code. The live classes are the gaps: four
 `F-` rows rest on a recorded run with a manual pod delete rather than on a suite

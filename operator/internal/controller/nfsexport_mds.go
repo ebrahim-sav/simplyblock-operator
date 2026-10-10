@@ -20,7 +20,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -159,7 +158,7 @@ func (r *NFSExportReconciler) ensureMDS(
 			return false, &mdsWaitError{reason: "MDSNameCollision", message: fmt.Sprintf(
 				"StatefulSet %s belongs to storage cluster %q, not %s", key.Name, owner, clusterID)}
 		}
-		return r.updateMDS(ctx, d, clusterID, &existing)
+		return r.updateMDS(ctx, d, &existing)
 	case !apierrors.IsNotFound(err):
 		return false, fmt.Errorf("reading the metadata server StatefulSet %s: %w", key.Name, err)
 	}
@@ -193,46 +192,14 @@ func (r *NFSExportReconciler) ensureMDS(
 // cannot be changed, and the claim template's class is read from the existing
 // object rather than looked up again.
 func (r *NFSExportReconciler) updateMDS(
-	ctx context.Context, d *simplyblockv1alpha2.SimplyblockDriver, clusterID string,
-	existing *appsv1.StatefulSet,
+	ctx context.Context, d *simplyblockv1alpha2.SimplyblockDriver, existing *appsv1.StatefulSet,
 ) (bool, error) {
 	// Enforced on an update as on a create: limits the runner refuses would
 	// replace a running guest with one that never boots.
 	if problem := driver.MDSResourcesProblem(d.Spec.PNFS.MDS); problem != "" {
 		return false, &mdsWaitError{reason: "MDSResourcesInvalid", message: problem}
 	}
-	stateClass := ""
-	if len(existing.Spec.VolumeClaimTemplates) > 0 {
-		stateClass = ptr.Deref(existing.Spec.VolumeClaimTemplates[0].Spec.StorageClassName, "")
-	}
-	_, desired, err := driver.MDSObjects(d, clusterID, stateClass)
-	if err != nil {
-		return false, err
-	}
-	want := desired.Annotations[driver.MDSTemplateHashAnnotation]
-	if existing.Annotations[driver.MDSTemplateHashAnnotation] == want {
-		return false, nil
-	}
-	existing.Spec.Template = desired.Spec.Template
-	if existing.Annotations == nil {
-		existing.Annotations = map[string]string{}
-	}
-	existing.Annotations[driver.MDSTemplateHashAnnotation] = want
-	if err := r.Update(ctx, existing); err != nil {
-		// Every export of the cluster can find the same old template, and only
-		// one update lands. A loser whose re-read shows the current hash is
-		// done. Otherwise, the conflict is returned and the next reconcile reads
-		// the StatefulSet again.
-		if apierrors.IsConflict(err) {
-			var live appsv1.StatefulSet
-			if getErr := r.Get(ctx, client.ObjectKeyFromObject(existing), &live); getErr == nil &&
-				live.Annotations[driver.MDSTemplateHashAnnotation] == want {
-				return false, nil
-			}
-		}
-		return false, fmt.Errorf("updating the metadata server StatefulSet %s: %w", existing.Name, err)
-	}
-	return true, nil
+	return driver.UpdateMDS(ctx, r.Client, d, existing)
 }
 
 // refreshMDS brings a Ready export's metadata server StatefulSet up to this
@@ -263,7 +230,7 @@ func (r *NFSExportReconciler) refreshMDS(ctx context.Context, export *simplybloc
 	if existing.Labels[driver.MDSClusterLabel] != handle.ClusterID {
 		return nil
 	}
-	updated, err := r.updateMDS(ctx, d, handle.ClusterID, &existing)
+	updated, err := r.updateMDS(ctx, d, &existing)
 	var wait *mdsWaitError
 	switch {
 	case errors.As(err, &wait):
