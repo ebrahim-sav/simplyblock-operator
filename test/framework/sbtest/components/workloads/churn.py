@@ -51,6 +51,10 @@ class Arrival:
     lifetime_s: float
 
 
+#: How often the watcher looks for deleted own volumes that are gone.
+GONE_WATCH_INTERVAL_S = 5.0
+
+
 class ChurnPlan:
     """When churn pods arrive. Pure: it never touches a cluster, so it is testable alone.
 
@@ -136,6 +140,8 @@ class ChurnWorkload(Component):
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._loop: threading.Thread | None = None
+        self._watcher: threading.Thread | None = None
+        self._watch_stop = threading.Event()
         self._seed = 0
 
     # ── the flow ─────────────────────────────────────────────────────────────────────
@@ -178,6 +184,13 @@ class ChurnWorkload(Component):
 
         self._loop = threading.Thread(target=loop, name="churn", daemon=True)
         self._loop.start()
+
+        def watch() -> None:
+            while not self._watch_stop.wait(GONE_WATCH_INTERVAL_S):
+                self._watch_once(ctx)
+
+        self._watcher = threading.Thread(target=watch, name="churn-gone", daemon=True)
+        self._watcher.start()
 
     def _active(self) -> int:
         with self._lock:
@@ -332,6 +345,10 @@ class ChurnWorkload(Component):
             worker.join(timeout=max(0.0, deadline - time.monotonic()))
         with self._lock:
             records = list(self._records)
+        self._watch_stop.set()
+        if self._watcher:
+            self._watcher.join(timeout=60)
+            self._watcher = None
         self._check_gone(ctx, [r for r in records if r.own_volume and r.pvc_deleted])
         ctx.save_json("churn.json", {"seed": self._seed, "pods": [{
             "pod": r.pod, "claim": r.claim, "own_volume": r.own_volume, "node": r.node,
@@ -344,18 +361,36 @@ class ChurnWorkload(Component):
         ctx.log.info(f"{self.name}: {len(records)} pod(s) joined and left, {own} with a "
                      f"volume of their own (seed {self._seed})")
 
-    def _check_gone(self, ctx: RunContext, records: list[_Record]) -> None:
-        """Whether each deleted own volume's PV and NFSExport are gone, waiting a while."""
+    def _watch_once(self, ctx: RunContext) -> None:
+        """Look once at every deleted own volume not yet seen gone. The watcher runs this
+        every few seconds for the whole run, so a volume's gone_s is when it went, give or
+        take one interval, rather than when collection looked."""
+        with self._lock:
+            pending = [r for r in self._records
+                       if r.own_volume and r.pvc_deleted and r.gone_s is None]
+        self._look(pending)
+
+    def _look(self, records: list[_Record]) -> list[_Record]:
+        """Record which of records are gone, and return those still there."""
         ns = str(self.opt("namespace"))
-        deadline = time.monotonic() + float(self.opt("gone_timeout_s"))
-        pending = list(records)
-        while pending:
-            for r in list(pending):
-                r.pv_gone = not r.pv or not _exists(None, "pv", r.pv)
-                r.export_gone = not r.lvol or not _exists(ns, "nfsexport", f"nfsexp-{r.lvol}")
-                if r.pv_gone and r.export_gone and r.pvc_deleted:
+        left = []
+        for r in records:
+            r.pv_gone = not r.pv or not _exists(None, "pv", r.pv)
+            r.export_gone = not r.lvol or not _exists(ns, "nfsexport", f"nfsexp-{r.lvol}")
+            if r.pv_gone and r.export_gone and r.pvc_deleted:
+                if r.gone_s is None:
                     r.gone_s = (datetime.now(UTC) - r.pvc_deleted).total_seconds()
-                    pending.remove(r)
+            else:
+                left.append(r)
+        return left
+
+    def _check_gone(self, ctx: RunContext, records: list[_Record]) -> None:
+        """The last look, at collection: the volumes the watcher has not seen go get
+        gone_timeout_s more. One it already saw keeps the time it went."""
+        deadline = time.monotonic() + float(self.opt("gone_timeout_s"))
+        pending = [r for r in records if r.gone_s is None]
+        while pending:
+            pending = self._look(pending)
             if not pending or time.monotonic() >= deadline:
                 return
             time.sleep(5)
@@ -364,6 +399,7 @@ class ChurnWorkload(Component):
         # Whatever churn created and did not delete, a failed run included.
         ns, selector = str(self.opt("namespace")), f"{CHURN_LABEL}={ctx.run_id}"
         self._stop.set()
+        self._watch_stop.set()
         kube.run(["-n", ns, "delete", "pod", "-l", selector, "--ignore-not-found",
                   "--grace-period=5"], check=False, timeout=300)
         kube.run(["-n", ns, "delete", "pvc", "-l", selector, "--ignore-not-found"],

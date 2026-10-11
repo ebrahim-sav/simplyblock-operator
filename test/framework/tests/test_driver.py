@@ -598,6 +598,43 @@ class ChurnPodSpec(unittest.TestCase):
         self.assertIn("-fio-", inst.evidence)
 
 
+class ChurnGoneTiming(unittest.TestCase):
+    """How long a deleted own volume took to go is measured while the run goes on, not at
+    collection. Checked only at the end, every volume read as about as old as the run:
+    pnfs-1791662135 reported 3653s for a volume the provisioner deleted within minutes."""
+
+    def test_a_volume_gone_early_keeps_the_time_it_went(self):
+        """Regression: 2026-10-11-churn-gone-measured-at-collect (pnfs-1791662135)."""
+        from sbtest.components.workloads import churn
+        w = churn.ChurnWorkload(namespace="default")
+        deleted = datetime.now(UTC) - timedelta(seconds=30)
+        r = churn._Record(pod="run1-churn-1", claim="run1-churn-1", own_volume=True,
+                          node="worker-1", created=deleted)
+        r.pvc_deleted, r.pv, r.lvol = deleted, "pvc-1", "lv-1"
+        w._records.append(r)
+        with _Ctx() as ctx, mock.patch.object(churn, "_exists", lambda *a: False):
+            w._watch_once(ctx)                   # the watcher sees it gone now, ~30s in
+            later = datetime.now(UTC) + timedelta(seconds=3600)
+            with mock.patch.object(churn, "datetime") as dt:
+                dt.now.return_value = later      # collection an hour later
+                w._check_gone(ctx, [r])
+        self.assertTrue(r.pv_gone and r.export_gone)
+        self.assertIsNotNone(r.gone_s)
+        assert r.gone_s is not None
+        self.assertLess(r.gone_s, 60, f"gone_s = {r.gone_s}: measured at collection")
+
+    def test_a_volume_still_there_is_left_for_the_next_look(self):
+        from sbtest.components.workloads import churn
+        w = churn.ChurnWorkload(namespace="default")
+        r = churn._Record(pod="run1-churn-2", claim="run1-churn-2", own_volume=True,
+                          node="worker-1", created=datetime.now(UTC))
+        r.pvc_deleted, r.pv, r.lvol = datetime.now(UTC), "pvc-2", "lv-2"
+        w._records.append(r)
+        with _Ctx() as ctx, mock.patch.object(churn, "_exists", lambda *a: True):
+            w._watch_once(ctx)
+        self.assertIsNone(r.gone_s)
+
+
 #: What the reservation script prints on a pNFS client, captured on lab-talos: a namespace
 #: under the MDS's reservation with one client registered, the MDS's own state disk, which
 #: carries no reservation at all, and a device whose report produced nothing.
