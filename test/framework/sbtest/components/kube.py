@@ -72,11 +72,34 @@ def list_pods(namespace: str, name_contains: list[str] | None = None) -> list[Po
 
 def exec_sh(namespace: str, pod: str, script: str, container: str | None = None,
             timeout: int = 300) -> str:
+    return exec_result(namespace, pod, script, container=container, timeout=timeout).stdout
+
+
+def exec_result(namespace: str, pod: str, script: str, container: str | None = None,
+                timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    """exec_sh with the exit code and stderr kept, for a caller that has to say why a command
+    failed rather than only that its output was empty."""
     args = ["-n", namespace, "exec", pod]
     if container:
         args += ["-c", container]
     args += ["--", "sh", "-c", script]
-    return run(args, timeout=timeout, check=False).stdout
+    return run(args, timeout=timeout, check=False)
+
+
+def pod_mounting(namespace: str, claim: str) -> tuple[str, str] | None:
+    """A running fio pod mounting claim, and its first container."""
+    cp = run(["-n", namespace, "get", "pods", "-l", "app=fio", "-o", "json"], check=False)
+    if cp.returncode != 0:
+        return None
+    for p in json.loads(cp.stdout or "{}").get("items", []):
+        if p.get("status", {}).get("phase") != "Running":
+            continue
+        claims = {(v.get("persistentVolumeClaim") or {}).get("claimName")
+                  for v in p.get("spec", {}).get("volumes", [])}
+        containers = p.get("spec", {}).get("containers", [])
+        if claim in claims and containers:
+            return str(p["metadata"]["name"]), str(containers[0]["name"])
+    return None
 
 
 def short(node: str) -> str:

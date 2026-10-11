@@ -89,6 +89,7 @@ class FakeCluster:
         self.snapshot_ready = True
         self.marker = "0123456789abcdef0123456789abcdef"
         self.restored = self.marker
+        self.marker_error = ""
         self.delete_rc = 0
         self.stuck = False      # a deletion accepted but held by a finalizer
         self.pods = True        # whether a fio pod mounts r1-shared-0
@@ -128,13 +129,20 @@ class FakeCluster:
                 return subprocess.CompletedProcess(args, 1, "", "timed out waiting for the condition")
         return subprocess.CompletedProcess(args, rc, out, "forbidden" if rc else "")
 
+    def exec_result(self, ns: str, pod: str, script: str,
+                    **kw: object) -> subprocess.CompletedProcess[str]:
+        if self.marker_error and "dd if=/dev/urandom" in script:
+            self.calls.append("exec " + script)
+            return subprocess.CompletedProcess([], 1, "", self.marker_error)
+        return subprocess.CompletedProcess([], 0, self.exec_sh(ns, pod, script, **kw), "")
+
     def exec_sh(self, _ns: str, _pod: str, script: str, **_: object) -> str:
         self.calls.append("exec " + script)
         if "df " in script:
             size = self.df.pop(0) if len(self.df) > 1 else self.df[0]
             # Sizes are kept in bytes and served as df -kP prints them, in KiB.
             return str(size // 1024) if isinstance(size, int) else size
-        if "head -c" in script:
+        if "dd if=/dev/urandom" in script:
             return self.marker
         if "md5sum" in script:
             return self.restored
@@ -148,7 +156,8 @@ def run_op(fake: FakeCluster, op: str, shared: dict | None = None,
     args.update(opts)
     c = volume_ops.VolumeOps(**args)
     with tempfile.TemporaryDirectory() as d, mock.patch.object(kube, "run", fake.run), \
-            mock.patch.object(kube, "exec_sh", fake.exec_sh):
+            mock.patch.object(kube, "exec_sh", fake.exec_sh), \
+            mock.patch.object(kube, "exec_result", fake.exec_result):
         ctx = RunContext(run_id="r1", outdir=d, log=Logger(os.path.join(d, "run.log")))
         c.bind_namespaces(ctx)
         ctx.shared["pnfs.claims"] = ["r1-shared-0"]
@@ -374,3 +383,26 @@ class ClientSize(unittest.TestCase):
         with mock.patch.object(kube, "exec_sh", exec_sh):
             got = VolumeOps(namespace="default")._df("default", ("p", "c"))
         self.assertEqual(got, 22020096 * 1024)
+
+
+class SnapshotMarker(unittest.TestCase):
+    """The marker a snapshot carries is written by a shell command in an Alpine fio pod, so
+    it has to work with BusyBox's tools, and a write that fails says why
+    (pnfs-1791662135)."""
+
+    def test_the_marker_script_writes_and_checksums_with_any_coreutils(self):
+        """Regression: 2026-10-11-snapshot-marker-busybox-head (pnfs-1791662135). `head -c
+        1M` is refused by BusyBox and by BSD head alike, so the snapshot never had a marker."""
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "run1-volops-1.marker")
+            out = subprocess.run(["sh", "-c", volume_ops.marker_script(path, 2)],
+                                 capture_output=True, text=True, check=False)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertRegex(out.stdout.strip(), r"^[0-9a-f]{32}$")
+            self.assertEqual(os.path.getsize(path), 2 << 20)
+
+    def test_a_marker_write_that_fails_reports_why(self):
+        fake = FakeCluster()
+        fake.marker_error = "head: invalid number '1M'"
+        record = run_op(fake, "snapshot")
+        self.assertIn("invalid number", record["error"])

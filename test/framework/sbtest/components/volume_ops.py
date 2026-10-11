@@ -310,18 +310,7 @@ class VolumeOps(Component):
 
     def _client(self, ns: str, claim: str) -> tuple[str, str] | None:
         """A running fio pod mounting claim, and its first container."""
-        cp = kube.run(["-n", ns, "get", "pods", "-l", "app=fio", "-o", "json"], check=False)
-        if cp.returncode != 0:
-            return None
-        for p in json.loads(cp.stdout or "{}").get("items", []):
-            if p.get("status", {}).get("phase") != "Running":
-                continue
-            claims = {(v.get("persistentVolumeClaim") or {}).get("claimName")
-                      for v in p.get("spec", {}).get("volumes", [])}
-            containers = p.get("spec", {}).get("containers", [])
-            if claim in claims and containers:
-                return str(p["metadata"]["name"]), str(containers[0]["name"])
-        return None
+        return kube.pod_mounting(ns, claim)
 
     def _df(self, ns: str, client: tuple[str, str]) -> int:
         """The size of the client's mount in bytes. Anything but a byte count fails: read as
@@ -351,12 +340,12 @@ class VolumeOps(Component):
         marker = f"{ctx.run_id}-volops-{n}.marker"
         path = f"{self.opt('mount')}/{marker}"
         try:
-            record.marker_md5 = kube.exec_sh(
-                ns, client[0], f"head -c {int(self.opt('marker_mb'))}M /dev/urandom > {path}.tmp "
-                f"&& mv {path}.tmp {path} && sync && md5sum {path} | cut -d' ' -f1",
-                container=client[1], timeout=120).strip()
-            if not record.marker_md5:
-                record.fail(f"writing the marker in {client[0]} returned no checksum")
+            cp = kube.exec_result(ns, client[0], marker_script(path, int(self.opt("marker_mb"))),
+                                  container=client[1], timeout=120)
+            record.marker_md5 = cp.stdout.strip()
+            if cp.returncode != 0 or not record.marker_md5:
+                record.fail(f"writing the marker in {client[0]} failed (exit {cp.returncode}): "
+                            f"{(cp.stderr or '').strip()[:200] or 'no output'}")
                 return
             name = f"{ctx.run_id}-volops-{n}"
             record.requested = datetime.now(UTC)
@@ -553,3 +542,12 @@ def _bytes(quantity: object) -> int:
 
 def _iso(t: datetime | None) -> str | None:
     return t.isoformat().replace("+00:00", "Z") if t else None
+
+
+
+def marker_script(path: str, mb: int) -> str:
+    """Write mb MiB of random data to path through a temporary file, sync it, and print its
+    md5. dd with a byte count, because it reads the same in BusyBox, GNU, and BSD: the fio
+    pods are Alpine, and BusyBox's head refuses a size like 1M."""
+    return (f"dd if=/dev/urandom of={path}.tmp bs=1048576 count={mb} 2>/dev/null "
+            f"&& mv {path}.tmp {path} && sync && md5sum {path} | cut -d' ' -f1")
