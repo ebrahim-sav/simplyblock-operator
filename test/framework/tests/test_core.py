@@ -902,6 +902,52 @@ class GrabberReuse(unittest.TestCase):
         self.assertLess(order.index("collect.collect"), order.index("stream.teardown"))
 
 
+class RestartFollowsEveryContainer(unittest.TestCase):
+    """The victim's log is followed with `kubectl logs -f --all-containers`, which refuses a
+    pod with more containers than --max-log-requests allows (5 by default). The
+    csi-controller has six, so every restart log of it was an empty file
+    (pnfs-1791711824), and the refusal went to /dev/null."""
+
+    def follow_args(self, containers: tuple[str, ...]) -> tuple[list[str], dict[str, Any]]:
+        import subprocess
+
+        from sbtest.components import chaos
+
+        seen: dict[str, Any] = {}
+
+        class Proc:
+            def __init__(self, args: list[str], **kw: Any) -> None:
+                seen["args"], seen["kw"] = args, kw
+
+        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+
+        r = chaos.Restarter(ready_timeout_s=0)
+        victim = kube.Pod(name="simplyblock-csi-controller-0", namespace="simplyblock",
+                          node="w1", containers=containers, phase="Running")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(kube, "run", run), \
+                mock.patch.object(chaos, "_uid", return_value="u1"), \
+                mock.patch.object(chaos, "_finish", lambda f: None), \
+                mock.patch.object(r, "_victim", return_value=victim), \
+                mock.patch.object(chaos.subprocess, "Popen", Proc):
+            ctx = RunContext(run_id="r1", outdir=d, log=Logger(os.path.join(d, "run.log")))
+            r.bind_namespaces(ctx)
+            r._restart(ctx, "csi-controller")
+            ctx.log.close()
+        return seen["args"], seen["kw"]
+
+    def test_every_container_of_a_six_container_pod_is_followed(self):
+        args, _ = self.follow_args(tuple(f"c{i}" for i in range(6)))
+        limits = [int(a.split("=", 1)[1]) for a in args if a.startswith("--max-log-requests=")]
+        self.assertTrue(limits and limits[0] >= 6, args)
+
+    def test_a_refusal_lands_in_the_log_rather_than_nowhere(self):
+        import subprocess
+
+        _, kw = self.follow_args(("c0",))
+        self.assertIsNot(kw.get("stderr"), subprocess.DEVNULL, kw)
+
+
 class RestartDeleteFailure(unittest.TestCase):
     """A restart whose delete failed did not happen. Recorded as one, chaos.recovery
     reported the untouched pod as never coming back (review on #698)."""

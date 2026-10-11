@@ -219,7 +219,7 @@ class Restarter(Component):
             self._records.append(record)
             self._attempts += 1
             record.log = f"restart-{self._attempts}-{target}-{victim.name}.txt"
-        follower = self._follow(ctx, victim.name, record.log)
+        follower = self._follow(ctx, victim, record.log)
         args = ["-n", self.opt("namespace"), "delete", "pod", victim.name, "--wait=false"]
         if self.opt("grace_period_s") is not None:
             args.append(f"--grace-period={int(self.opt('grace_period_s'))}")
@@ -254,17 +254,23 @@ class Restarter(Component):
         ctx.log.warn(f"{self.name}: {target} {victim.name} had no Ready replacement within "
                      f"{self.opt('ready_timeout_s')}s")
 
-    def _follow(self, ctx: RunContext, pod: str,
+    def _follow(self, ctx: RunContext, pod: kube.Pod,
                 name: str) -> tuple[subprocess.Popen[bytes], Any] | None:
         """Follow the victim's log into the run directory until its containers exit, which
-        is after the deletion: the shutdown is part of what is worth reading."""
+        is after the deletion: the shutdown is part of what is worth reading.
+
+        kubectl follows at most --max-log-requests streams (5 unless raised) and refuses the
+        whole pod beyond that, so the limit is the pod's container count. Its stderr goes
+        into the same file, so a refusal is read there rather than leaving it empty."""
         try:
             fh = open(ctx.path(name), "wb")  # noqa: SIM115
             proc = subprocess.Popen(  # noqa: S603
-                ["kubectl", "-n", self.opt("namespace"), "logs", "-f", pod, "--all-containers",
-                 "--timestamps", "--prefix"], stdout=fh, stderr=subprocess.DEVNULL)
+                ["kubectl", "-n", self.opt("namespace"), "logs", "-f", pod.name,
+                 "--all-containers", "--timestamps", "--prefix",
+                 f"--max-log-requests={max(5, len(pod.containers))}"],
+                stdout=fh, stderr=subprocess.STDOUT)
         except Exception as e:  # noqa: BLE001
-            ctx.log.warn(f"{self.name}: cannot follow {pod}'s log: {e}")
+            ctx.log.warn(f"{self.name}: cannot follow {pod.name}'s log: {e}")
             return None
         return proc, fh
 
