@@ -30,6 +30,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -638,6 +639,17 @@ func deadlineExpired(export *simplyblockv1alpha2.NFSExport) bool {
 // Owns the Service and EndpointSlice it creates, so a manual delete of either
 // is noticed and repaired on the export's own reconcile rather than left
 // until something else touches the NFSExport.
+// nfsExportConcurrency is how many exports reconcile at once. After a metadata
+// server restart every export of the cluster is reassembled, and the guest's
+// grace period can end as soon as every client has reclaimed: one at a time,
+// about a second each, the last ones came back after it.
+const nfsExportConcurrency = 8
+
+// nfsExportControllerOptions are the NFSExport controller's options.
+func nfsExportControllerOptions() controller.Options {
+	return controller.Options{MaxConcurrentReconciles: nfsExportConcurrency}
+}
+
 func (r *NFSExportReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&simplyblockv1alpha2.NFSExport{}).
@@ -658,5 +670,6 @@ func (r *NFSExportReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				return ok
 			}))).
 		Named("nfsexport").
+		WithOptions(nfsExportControllerOptions()).
 		Complete(r)
 }

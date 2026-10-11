@@ -607,3 +607,13 @@ func TestPodHostedCallsCarryTheStatefulSetsHostNQN(t *testing.T) {
 		t.Errorf("host NQNs = %v, want [%s]", asm.hostNQNs, want)
 	}
 }
+
+// Regression: 2026-10-11-mds-grace-ends-before-exports (pnfs-1791662135). After a
+// metadata server restart its exports were reassembled one at a time, about one a
+// second, and grace ended before the last ones were back. Exports reconcile
+// concurrently, so a restart restores them together.
+func TestExportsReconcileConcurrently(t *testing.T) {
+	if got := nfsExportControllerOptions().MaxConcurrentReconciles; got < 8 {
+		t.Errorf("MaxConcurrentReconciles = %d, want at least 8", got)
+	}
+}

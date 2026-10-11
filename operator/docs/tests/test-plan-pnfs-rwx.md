@@ -191,6 +191,7 @@ restarted rather than migrated (design §13).
 | U-104 | The runner's debug key is a private pair the guest accepts, new at every boot                                                                                                        | Positive                       | `TestDebugSSHKeyIsAPrivatePairTheGuestAccepts`, `TestDebugSSHKeyIsNewEveryBoot`                                                                                            |
 | U-105 | Regression (run `pnfs-1791652310`): the runner drains the guest and waits before the power button, and a failed drain still powers it down                                           | Regression                     | `TestShutdownDrainsTheGuestBeforeThePowerButton`, `TestAFailedDrainStillPowersDown`                                                                                        |
 | U-106 | The drain drops every packet carrying a request to the guest's NFS port and lets bare ACKs through                                                                                   | Positive                       | `TestTheDrainDropsRequestsButNotAcknowledgments`                                                                                                                           |
+| U-107 | Regression (run `pnfs-1791662135`): the kernel command line keeps unknown exports answered with a retry for 60s after nfsd starts                                                    | Regression                     | `TestKernelCmdlineCarriesTheStaticAddress`                                                                                                                                 |
 | U-76  | The relay resolves connections as the operator's identity, and delete proceeds without the control plane                                                                             | Positive                       | `TestCreateHandsTheGuestAConnectionResolvedForTheOperatorsIdentity`, `TestDeleteGoesAheadWithoutTheControlPlane`                                                           |
 | U-77  | A create without a resolvable connection reaches no guest, and a connection arriving with the call is dropped                                                                        | Negative                       | `TestCreateWithoutAConnectionReachesNoGuest`, `TestAConnectionArrivingWithTheCallIsNotPassedOn`                                                                            |
 | U-83  | The nfsd watchdog reads pool statistics by column name, a missing file as nfsd not running, and only nfsd threads with their state and wait                                          | Positive + Negative            | `TestPoolStatsAreSummedByColumnName`, `TestMissingPoolStatsIsNFSDNotRunning`, `TestThreadStateIsReadAfterTheLastParenthesis`, `TestOnlyNFSDThreadsAreRead`                 |
@@ -312,6 +313,7 @@ through the control plane's API.
 | O-46 | Regression (run `pnfs-1791627120`): an export assembled by the running pod but recording another pod's address has its EndpointSlice and status repointed, without reassembly                                                                                                                                                              | Regression                     | `TestAnExportAssembledByTheRunningPodFollowsItsAddress`                                                                                                                                                                                                       |
 | O-47 | A memory request left unset defaults to 512Mi under the limit, and one the spec states is kept                                                                                                                                                                                                                                             | Positive                       | `TestMDSPodRequestsLessMemoryThanItsLimit`, `TestMDSPodKeepsTheMemoryRequestItIsGiven`                                                                                                                                                                        |
 | O-48 | Regression (run `pnfs-1791627120`): a driver reconcile updates an outdated MDS StatefulSet with no export reconciling, and leaves a current one unwritten                                                                                                                                                                                  | Regression                     | `TestADriverReconcileUpdatesAnOutdatedMDSWithoutAnyExport`, `TestADriverReconcileLeavesACurrentMDSAlone`                                                                                                                                                      |
+| O-49 | Regression (run `pnfs-1791662135`): exports reconcile concurrently, so a restart reassembles them together                                                                                                                                                                                                                                 | Regression                     | `TestExportsReconcileConcurrently`                                                                                                                                                                                                                            |
 
 ---
 
@@ -493,15 +495,15 @@ Struck rows are not counted.
 
 | Class                    | Scenarios | Covered | Not covered |
 |--------------------------|-----------|---------|-------------|
-| Unit (`U-`)              | 78        | 78      | 0           |
-| Operator (`O-`)          | 39        | 37      | 2           |
+| Unit (`U-`)              | 79        | 79      | 0           |
+| Operator (`O-`)          | 40        | 38      | 2           |
 | Sanity (`SAN-`)          | 2         | 0       | 2           |
 | Integration (`I-`)       | 3         | 3       | 0           |
 | End-to-end (`E-`)        | 18        | 12      | 6           |
 | Failure injection (`F-`) | 14        | 4       | 10          |
 | Security (`SEC-`)        | 8         | 0       | 8           |
 | Load and soak (`L-`)     | 6         | 0       | 6           |
-| **Total**                | **168**   | **134** | **34**      |
+| **Total**                | **170**   | **136** | **34**      |
 
 Unit and operator coverage follows the code. The live classes are the gaps: four
 `F-` rows rest on a recorded run with a manual pod delete rather than on a suite
