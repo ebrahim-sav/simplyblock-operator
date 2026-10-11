@@ -128,18 +128,19 @@ restarted rather than migrated (design §13).
 
 #### CSI node: priming the layout (design §10.1, §10.4), in `csi-driver/internal/csi/node/pnfs_prime_test.go`
 
-| #    | Scenario                                                                                                  | Type                | Test                                                                               |
-|------|-----------------------------------------------------------------------------------------------------------|---------------------|------------------------------------------------------------------------------------|
-| U-46 | The probe writes one synced block and leaves nothing behind on the export                                 | Positive            | `TestPrimeLayoutTouchesTheMountAndLeavesNothingBehind`                             |
-| U-47 | An unwritable mount is reported, and a canceled stage starts no I/O                                       | Negative            | `TestPrimeLayoutReportsAnUnwritableMount`, `TestPrimeLayoutRespectsACanceledStage` |
-| U-48 | A staging mount is probed when first seen                                                                 | Positive            | `TestAStagingMountIsPrimedWhenFirstSeen`                                           |
-| U-49 | A staging mount is probed again after its transport reconnects, and not without a reconnect               | Positive + Negative | `TestAStagingMountIsPrimedAgainAfterAReconnect`                                    |
-| U-50 | A probe still running is not started a second time                                                        | Boundary            | `TestAProbeStillRunningIsNotStartedTwice`                                          |
-| U-51 | A failed probe is retried on the next pass                                                                | Negative            | `TestAFailedProbeIsRetried`                                                        |
-| U-52 | A pod's bind of a staging mount, another driver's mount, and a mount without a SCSI layout are not probed | Negative            | `TestOnlyThisDriversPNFSStagingMountsArePrimed`                                    |
-| U-93 | Regression (run `pnfs-1791629269`): a probe never changes the probe file's size                           | Regression          | `TestPrimeLayoutNeverChangesAnExistingProbesSize`                                  |
-| U-94 | Regression (run `pnfs-1791629269`): one mount's probes never overlap, other mounts' run along             | Regression          | `TestProbesOfOneMountDoNotOverlap`, `TestProbesOfDifferentMountsRunTogether`       |
-| U-95 | A probe canceled while it waits for another probe of its mount never starts                               | Negative            | `TestAProbeCanceledWhileWaitingDoesNotStart`                                       |
+| #     | Scenario                                                                                                                                         | Type                | Test                                                                                                         |
+|-------|--------------------------------------------------------------------------------------------------------------------------------------------------|---------------------|--------------------------------------------------------------------------------------------------------------|
+| U-46  | The probe writes one synced block and leaves nothing behind on the export                                                                        | Positive            | `TestPrimeLayoutTouchesTheMountAndLeavesNothingBehind`                                                       |
+| U-47  | An unwritable mount is reported, and a canceled stage starts no I/O                                                                              | Negative            | `TestPrimeLayoutReportsAnUnwritableMount`, `TestPrimeLayoutRespectsACanceledStage`                           |
+| U-48  | A staging mount is probed when first seen                                                                                                        | Positive            | `TestAStagingMountIsPrimedWhenFirstSeen`                                                                     |
+| U-49  | A staging mount is probed again after its transport reconnects, and not without a reconnect                                                      | Positive + Negative | `TestAStagingMountIsPrimedAgainAfterAReconnect`                                                              |
+| U-50  | A probe still running is not started a second time                                                                                               | Boundary            | `TestAProbeStillRunningIsNotStartedTwice`                                                                    |
+| U-51  | A failed probe is retried on the next pass                                                                                                       | Negative            | `TestAFailedProbeIsRetried`                                                                                  |
+| U-52  | A pod's bind of a staging mount, another driver's mount, and a mount without a SCSI layout are not probed                                        | Negative            | `TestOnlyThisDriversPNFSStagingMountsArePrimed`                                                              |
+| U-93  | Regression (run `pnfs-1791629269`): a probe never changes the probe file's size                                                                  | Regression          | `TestPrimeLayoutNeverChangesAnExistingProbesSize`                                                            |
+| U-94  | Regression (run `pnfs-1791629269`): one mount's probes never overlap, other mounts' run along                                                    | Regression          | `TestProbesOfOneMountDoNotOverlap`, `TestProbesOfDifferentMountsRunTogether`                                 |
+| U-95  | A probe canceled while it waits for another probe of its mount never starts                                                                      | Negative            | `TestAProbeCanceledWhileWaitingDoesNotStart`                                                                 |
+| U-108 | Regression (run `pnfs-1791662135`): a probe whose write went through the metadata server took no layout and fails; one that bypassed it succeeds | Regression          | `TestAProbeWhoseWriteWentThroughTheServerTookNoLayout`, `TestAProbeWhoseWriteBypassedTheServerTookItsLayout` |
 
 #### NFS client mount statistics, in `atlas-lib/nfsclient/mountstats_test.go`, `csi-driver/e2e/mountstats_test.go`
 
@@ -495,7 +496,7 @@ Struck rows are not counted.
 
 | Class                    | Scenarios | Covered | Not covered |
 |--------------------------|-----------|---------|-------------|
-| Unit (`U-`)              | 79        | 79      | 0           |
+| Unit (`U-`)              | 80        | 80      | 0           |
 | Operator (`O-`)          | 40        | 38      | 2           |
 | Sanity (`SAN-`)          | 2         | 0       | 2           |
 | Integration (`I-`)       | 3         | 3       | 0           |
@@ -503,7 +504,7 @@ Struck rows are not counted.
 | Failure injection (`F-`) | 14        | 4       | 10          |
 | Security (`SEC-`)        | 8         | 0       | 8           |
 | Load and soak (`L-`)     | 6         | 0       | 6           |
-| **Total**                | **170**   | **136** | **34**      |
+| **Total**                | **171**   | **137** | **34**      |
 
 Unit and operator coverage follows the code. The live classes are the gaps: four
 `F-` rows rest on a recorded run with a manual pod delete rather than on a suite

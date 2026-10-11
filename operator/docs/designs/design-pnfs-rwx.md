@@ -845,7 +845,12 @@ Detect the pNFS path from `VolumeContext` (`access_protocol=nfs`). Then:
    `csi-driver/internal/csi/node/pnfs_prime.go`). A pod's `/dev` has no
    `disk/by-id`, so a device lookup a pod triggers fails and marks the device
    unavailable for two minutes. The device the probe resolves is cached for the
-   whole client, and every pod's later layout reuses it.
+   whole client, and every pod's later layout reuses it. A probe counts only
+   when its write bypassed the metadata server: the mount's NFS WRITE count in
+   `/proc/self/mountstats` is read before and after it. During the server's
+   grace period LAYOUTGET is refused, the write goes through the server as an
+   NFS WRITE, and the probe fails, so the node plugin probes again on its next
+   pass.
 5. **Stash the volume context:** the member list, `mds_ip`, and `fsid` go through `StashVolumeContext` for use at unstage and heal.
 
 The kernel automatically issues `LAYOUTGET` and performs direct block I/O over the attached namespaces. If the block path is unavailable it falls back to MDS-routed I/O.

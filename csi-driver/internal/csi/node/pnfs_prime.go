@@ -43,6 +43,21 @@ const scsiLayout = "LAYOUT_SCSI"
 // period and a while after, so seconds are enough to be first.
 const primeInterval = 2 * time.Second
 
+// mountWrites is the NFS WRITE count of the mount at path, and false when the
+// client reports no NFS mount there. A variable so the tests can set it.
+var mountWrites = func(path string) (int64, bool) {
+	mounts, err := nfsclient.ReadMountstats()
+	if err != nil {
+		return 0, false
+	}
+	for _, m := range mounts {
+		if m.MountPoint == path {
+			return m.Ops["WRITE"], true
+		}
+	}
+	return 0, false
+}
+
 // openProbe opens the probe file. A variable so the tests can see how.
 var openProbe = os.OpenFile
 
@@ -68,6 +83,8 @@ func primeLayout(ctx context.Context, stagingPath string) error {
 		return fmt.Errorf("pnfs: not taking the layout for %s: %w", stagingPath, err)
 	}
 
+	writesBefore, counted := mountWrites(stagingPath)
+
 	probe := filepath.Join(stagingPath, export.LayoutProbeName)
 	// Never O_TRUNC. A probe another node left behind is overwritten in place,
 	// because a size change makes the server recall every layout on the file,
@@ -90,6 +107,18 @@ func primeLayout(ctx context.Context, stagingPath string) error {
 	// cache, and the ordering against pod I/O depends on it.
 	if err := f.Sync(); err != nil {
 		return fmt.Errorf("pnfs: syncing the layout probe: %w", err)
+	}
+	// A write that reached the server as an NFS WRITE went through the metadata
+	// server: no layout was taken, and the device was not looked up. The server
+	// refuses layouts during its grace period, and the write still succeeds, so
+	// success alone says nothing. The mount's pods share the count, so a pod's
+	// own write through the server fails a probe too, and the next pass probes
+	// again.
+	if counted {
+		if writesAfter, ok := mountWrites(stagingPath); ok && writesAfter > writesBefore {
+			return fmt.Errorf("pnfs: the probe of %s went through the metadata server, so no layout "+
+				"was taken; the server may still be in its grace period", stagingPath)
+		}
 	}
 	return nil
 }

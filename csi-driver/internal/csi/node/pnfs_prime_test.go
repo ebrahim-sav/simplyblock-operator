@@ -279,3 +279,39 @@ func TestProbesOfDifferentMountsRunTogether(t *testing.T) {
 		}
 	}
 }
+
+// writesCounting replaces the probe's view of its mount's WRITE count for one
+// test: each call returns the next value of counts.
+func writesCounting(t *testing.T, counts ...int64) {
+	t.Helper()
+	real := mountWrites
+	i := 0
+	mountWrites = func(string) (int64, bool) {
+		if i >= len(counts) {
+			return counts[len(counts)-1], true
+		}
+		i++
+		return counts[i-1], true
+	}
+	t.Cleanup(func() { mountWrites = real })
+}
+
+// Regression: 2026-10-11-probe-in-grace-takes-no-layout (pnfs-1791662135). A
+// probe that ran during the restarted server's grace period was refused its
+// layout, so its write went through the metadata server, and it still reported
+// success. The application's later lookup of the device failed in its own
+// mount namespace and kept failing until the next restart. A probe whose write
+// reached the server as an NFS WRITE took no layout, and says so.
+func TestAProbeWhoseWriteWentThroughTheServerTookNoLayout(t *testing.T) {
+	writesCounting(t, 17, 18)
+	if err := primeLayout(context.Background(), t.TempDir()); err == nil {
+		t.Error("a probe whose write went through the metadata server reported success")
+	}
+}
+
+func TestAProbeWhoseWriteBypassedTheServerTookItsLayout(t *testing.T) {
+	writesCounting(t, 17, 17)
+	if err := primeLayout(context.Background(), t.TempDir()); err != nil {
+		t.Errorf("primeLayout = %v, want success: no NFS WRITE was issued", err)
+	}
+}
