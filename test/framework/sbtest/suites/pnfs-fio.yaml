@@ -75,6 +75,10 @@ components:
   nfs.conntrack:
     interval_s: 10
 
+  # Each node's NFS packet headers for the whole run: whether a call that failed across an
+  # MDS restart was sent once or twice, and what each answer was.
+  nfs.capture: {}
+
   # Every pNFS namespace's NVMe reservation before and after the run, so a registration left
   # over from an earlier metadata server boot is caught rather than guessed at.
   nvme.reservations: true

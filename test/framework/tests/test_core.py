@@ -1426,3 +1426,63 @@ class ParallelCollection(unittest.TestCase):
                         got[f] = fh.read()
         self.assertGreater(peak[0], 1)
         self.assertEqual(got, {f"csi-node-{n}.txt": f"log of grab-{n}\n" for n in ("w1", "w2", "w3")})
+
+
+class NfsCapture(unittest.TestCase):
+    """`nfs.capture` records every node's NFS traffic, headers only, so a call that fails
+    across an MDS restart can be read off the wire: whether the request went out once or
+    twice and what each answer was. pnfs-1791711824 had a mkdir fail with EEXIST that the
+    drain should have kept from reaching the server, and nothing in the run could say why."""
+
+    PODS = [kube.Pod(name="simplyblock-csi-node-a", namespace="sb-op", node="worker-1",
+                     containers=("csi-node",), phase="Running"),
+            kube.Pod(name="simplyblock-csi-node-b", namespace="sb-op", node="worker-2",
+                     containers=("csi-node",), phase="Running")]
+
+    def ctx(self, d: str) -> RunContext:
+        return RunContext(run_id="r1", outdir=d, log=Logger(None), operator_namespace="sb-op",
+                          cluster_namespace="sb-cluster", test_namespace="sb-test")
+
+    def test_a_helper_on_each_client_node_captures_nfs_headers(self):
+        from sbtest.components import capture
+
+        applied: list[dict] = []
+        c = capture.NfsCapture()
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(kube, "list_pods", lambda *a, **k: list(self.PODS)), \
+                mock.patch.object(kube, "apply_each", lambda ns, docs, **k: applied.extend(docs)):
+            ctx = self.ctx(d)
+            c.bind_namespaces(ctx)
+            c.setup(ctx)
+        self.assertEqual(sorted(p["spec"]["nodeName"] for p in applied), ["worker-1", "worker-2"])
+        for p in applied:
+            spec = p["spec"]
+            self.assertTrue(spec["hostNetwork"])
+            container = spec["containers"][0]
+            self.assertTrue(container["securityContext"]["privileged"])
+            cmd = " ".join(container["command"])
+            self.assertIn("tcpdump", cmd)
+            self.assertIn("port 2049", cmd)
+            self.assertIn("-s 512", cmd)
+
+    def test_collect_stops_each_capture_and_saves_its_files(self):
+        from sbtest.components import capture
+
+        def run(args: list[str], **_: object):
+            import subprocess
+            out = "nfs.pcap0\nnfs.pcap1\n" if "ls" in " ".join(args) else ""
+            return subprocess.CompletedProcess(args, 0, out, "")
+
+        c = capture.NfsCapture()
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(kube, "list_pods", lambda *a, **k: list(self.PODS)), \
+                mock.patch.object(kube, "apply_each", lambda *a, **k: None), \
+                mock.patch.object(kube, "run", run), \
+                mock.patch.object(kube, "run_bytes", lambda args, **k: b"\xd4\xc3\xb2\xa1pcap"):
+            ctx = self.ctx(d)
+            c.bind_namespaces(ctx)
+            c.setup(ctx)
+            c.collect(ctx)
+            saved = sorted(f for f in os.listdir(d) if f.endswith(".pcap"))
+        self.assertEqual(saved, ["nfs-capture-worker-1-0.pcap", "nfs-capture-worker-1-1.pcap",
+                                 "nfs-capture-worker-2-0.pcap", "nfs-capture-worker-2-1.pcap"])
