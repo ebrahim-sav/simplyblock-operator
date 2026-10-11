@@ -635,6 +635,57 @@ class ChurnGoneTiming(unittest.TestCase):
         self.assertIsNone(r.gone_s)
 
 
+class ChurnSharedVolumeSpace(unittest.TestCase):
+    """A churn pod that joins a shared volume writes a file of its own there. Left behind,
+    an hour of churn filled the main pods' volumes, and later joiners could not lay out
+    their files (pnfs-1791662135, churn-84 and churn-105)."""
+
+    def _workload(self):  # noqa: ANN202
+        from sbtest.components.workloads import churn
+        return churn, churn.ChurnWorkload(namespace="default")
+
+    def test_a_pod_that_joined_a_shared_volume_removes_its_file_before_it_goes(self):
+        """Regression: 2026-10-11-churn-files-fill-shared-volumes (pnfs-1791662135)."""
+        churn, w = self._workload()
+        inst = fio.FioInstance(pod="run1-churn-7", container="fio-0",
+                               filename="/data/run1-churn-7.fio", logdir="/logs/c0",
+                               evidence="run1-fio-churn-7")
+        r = churn._Record(pod=inst.pod, claim="run1-pnfs-shared-0", own_volume=False,
+                          created=datetime.now(UTC))
+        calls: list[str] = []
+        fake = _FakeKube()
+
+        def exec_sh(ns: str, pod: str, script: str, container: str | None = None,
+                    timeout: int = 300) -> str:
+            calls.append(f"exec {pod} {script}")
+            return ""
+
+        def run(args: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+            calls.append(" ".join(args))
+            return fake.run(args, **kw)  # type: ignore[arg-type]
+
+        with _Ctx() as ctx, mock.patch.object(kube, "exec_sh", exec_sh), \
+                mock.patch.object(kube, "run", run):
+            w._leave(ctx, "default", inst, r)
+        removes = [i for i, c in enumerate(calls) if "rm -f /data/run1-churn-7.fio" in c]
+        deletes = [i for i, c in enumerate(calls) if c.startswith("-n default delete pod")]
+        self.assertTrue(removes, f"the file was not removed: {calls}")
+        self.assertTrue(deletes and removes[0] < deletes[0], f"removed after the pod: {calls}")
+
+    def test_a_join_without_room_for_the_file_is_refused_with_a_reason(self):
+        churn, w = self._workload()
+        with mock.patch.object(kube, "pod_mounting", lambda ns, claim: ("run1-pnfs-0", "fio-0")), \
+                mock.patch.object(kube, "exec_sh", lambda *a, **k: str(512 * 1024)):  # KiB free
+            reason = w._no_room(None, "default", "run1-pnfs-shared-0")
+        self.assertIn("run1-pnfs-shared-0", reason)
+
+    def test_a_join_with_room_is_let_through(self):
+        churn, w = self._workload()
+        with mock.patch.object(kube, "pod_mounting", lambda ns, claim: ("run1-pnfs-0", "fio-0")), \
+                mock.patch.object(kube, "exec_sh", lambda *a, **k: str(4 * 1024 * 1024)):
+            self.assertEqual(w._no_room(None, "default", "run1-pnfs-shared-0"), "")
+
+
 #: What the reservation script prints on a pNFS client, captured on lab-talos: a namespace
 #: under the MDS's reservation with one client registered, the MDS's own state disk, which
 #: carries no reservation at all, and a device whose report produced nothing.

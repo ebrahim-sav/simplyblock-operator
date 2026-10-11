@@ -51,6 +51,9 @@ class Arrival:
     lifetime_s: float
 
 
+#: Room a shared volume keeps beyond a joining pod's file, for the run's own writers.
+JOIN_HEADROOM_BYTES = 256 << 20
+
 #: How often the watcher looks for deleted own volumes that are gone.
 GONE_WATCH_INTERVAL_S = 5.0
 
@@ -142,6 +145,7 @@ class ChurnWorkload(Component):
         self._loop: threading.Thread | None = None
         self._watcher: threading.Thread | None = None
         self._watch_stop = threading.Event()
+        self._skipped = 0
         self._seed = 0
 
     # ── the flow ─────────────────────────────────────────────────────────────────────
@@ -200,11 +204,20 @@ class ChurnWorkload(Component):
         """One churn pod's whole life: claim, pod, I/O, evidence, deletion."""
         ns = str(self.opt("namespace"))
         with self._lock:
-            n = len(self._records) + 1
             shared = list(ctx.shared.get("pnfs.claims") or [])
             reuse = arrival.reuse and bool(shared)
+            joined = rng.choice(shared) if reuse else ""
+        if reuse:
+            reason = self._no_room(ctx, ns, joined)
+            if reason:
+                with self._lock:
+                    self._skipped += 1
+                ctx.log.info(f"{self.name}: not joining: {reason}")
+                return
+        with self._lock:
+            n = len(self._records) + 1
             name = f"{ctx.run_id}-churn-{n}"
-            claim = rng.choice(shared) if reuse else name
+            claim = joined or name
             record = _Record(pod=name, claim=claim, own_volume=not reuse,
                              created=datetime.now(UTC))
             self._records.append(record)
@@ -262,7 +275,11 @@ class ChurnWorkload(Component):
     def _leave(self, ctx: RunContext, ns: str, inst: fio.FioInstance, record: _Record) -> None:
         """Delete the pod, and an own volume's claim after it, recording when each delete
         succeeded. A pod whose delete failed is still running and still holds its slot, and
-        a claim whose delete failed starts no cleanup clock."""
+        a claim whose delete failed starts no cleanup clock. A pod that joined a shared volume
+        removes its file there first: left behind, an hour of churn fills the volume."""
+        if not record.own_volume:
+            kube.exec_sh(ns, inst.pod, f"rm -f {inst.filename}", container=inst.container,
+                         timeout=60)
         cp = kube.run(["-n", ns, "delete", "pod", inst.pod, "--ignore-not-found",
                        "--grace-period=5", "--timeout=120s"], check=False, timeout=150)
         if cp.returncode != 0:
@@ -279,6 +296,24 @@ class ChurnWorkload(Component):
             return
         record.pvc_deleted = datetime.now(UTC)
         ctx.log.info(f"{self.name}: {inst.pod} left, deleting its volume {record.claim}")
+
+    def _no_room(self, ctx: RunContext | None, ns: str, claim: str) -> str:
+        """Why a pod cannot join claim, or "" when it can: the volume has no room for the file
+        it would lay out. A volume no running pod mounts cannot be measured and is let
+        through."""
+        client = kube.pod_mounting(ns, claim)
+        if client is None:
+            return ""
+        out = kube.exec_sh(ns, client[0], f"df -kP {MOUNT} | awk 'NR==2{{print $4}}'",
+                           container=client[1], timeout=30).strip()
+        if not out.isdigit():
+            return ""
+        free = int(out) * 1024
+        need = int(self.opt("file_size_gb")) << 30
+        if free < need + JOIN_HEADROOM_BYTES:
+            return (f"{claim} has {free / 2**30:.2f} GiB free, and a joining pod lays out "
+                    f"{need / 2**30:.0f} GiB")
+        return ""
 
     def _delete_failed(self, ctx: RunContext, record: _Record, what: str,
                        cp: subprocess.CompletedProcess[str]) -> None:
@@ -359,7 +394,8 @@ class ChurnWorkload(Component):
             "error": r.error} for r in records]})
         own = sum(1 for r in records if r.own_volume)
         ctx.log.info(f"{self.name}: {len(records)} pod(s) joined and left, {own} with a "
-                     f"volume of their own (seed {self._seed})")
+                     f"volume of their own, {self._skipped} join(s) skipped for lack of room "
+                     f"(seed {self._seed})")
 
     def _watch_once(self, ctx: RunContext) -> None:
         """Look once at every deleted own volume not yet seen gone. The watcher runs this
