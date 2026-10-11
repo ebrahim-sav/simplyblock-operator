@@ -165,6 +165,12 @@ func (g Guest) Args() ([]string, error) {
 	return args, nil
 }
 
+// exportRestoreSeconds is how long after nfsd starts the guest answers a request
+// for an export it does not have yet with a retry rather than STALE (pnfs-os
+// 0007). Grace ends as soon as every client has reclaimed, which can be before
+// the operator has reassembled every export, so this window covers the rest.
+const exportRestoreSeconds = 60
+
 // sshKeysFwCfg is the fw_cfg item the guest reads its debug SSH key from, at
 // /sys/firmware/qemu_fw_cfg/by_name/<this>/raw.
 const sshKeysFwCfg = "opt/io.simplyblock/ssh_authorized_keys"
@@ -192,6 +198,7 @@ func (g Guest) KernelCmdline() string {
 			g.Address.Addr(), g.Gateway, netmask(g.Address), g.Hostname),
 		"nfsd.pnfs_probe_name=" + export.LayoutProbeName,
 		fmt.Sprintf("nfsd.pnfs_layout_hold=%d", layoutHoldSeconds),
+		fmt.Sprintf("nfsd.pnfs_export_restore=%d", exportRestoreSeconds),
 		"xfs.pnfs_zeroed_layouts=" + boolParam(g.ZeroedLayouts),
 	}
 	if g.SSHAuthorizedKeysPath != "" {

@@ -164,11 +164,16 @@ func driveID(drive string) string {
 	return ""
 }
 
+// Regression: 2026-10-11-mds-grace-ends-before-exports (pnfs-1791662135). Grace
+// ended 12.5s after nfsd started, while exports were still being restored, and
+// requests for the late ones got STALE. nfsd.pnfs_export_restore (pnfs-os 0007)
+// keeps answering them with a retry for a minute after nfsd starts.
 func TestKernelCmdlineCarriesTheStaticAddress(t *testing.T) {
 	want := []string{
 		"root=/dev/vda", "ro", "console=hvc0", "panic=-1",
 		"ip=169.254.100.2::169.254.100.1:255.255.255.252:pnfs-mds-0:eth0:off",
 		"nfsd.pnfs_probe_name=" + export.LayoutProbeName, "nfsd.pnfs_layout_hold=60",
+		"nfsd.pnfs_export_restore=60",
 		"xfs.pnfs_zeroed_layouts=0",
 	}
 	cmdline := strings.Fields(validGuest(ArchAMD64).KernelCmdline())
