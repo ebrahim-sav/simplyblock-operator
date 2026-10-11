@@ -563,3 +563,16 @@ def time_base(ctx: RunContext, pod: str, d: str) -> datetime | None:
     ctx.log.warn(f"fio: {pod}: result.json carries no job_start; falling back to the run's "
                  "start, which leads each pod's real fio start")
     return run_start
+
+
+def avoid_nodes(spec: dict[str, Any], nodes: list[str]) -> None:
+    """Keep a pod spec off `nodes` with a required node affinity, alongside any pod
+    affinity it already has. The pNFS workloads use it to leave chaos.fence an idle
+    victim: nfsd fences a node's NFS client for a volume, so every pod on that node
+    using the volume would be fenced with the fence's probe."""
+    if not nodes:
+        return
+    spec.setdefault("affinity", {})["nodeAffinity"] = {
+        "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{
+            "matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "NotIn",
+                                  "values": sorted(nodes)}]}]}}

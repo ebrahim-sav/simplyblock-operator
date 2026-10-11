@@ -1652,3 +1652,76 @@ class _patch:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkloadIdleNodes(unittest.TestCase):
+    """chaos.fence cuts a node off from the MDS, and nfsd fences that node's NFS client for
+    the volume, so every workload pod on it would be fenced with the probe. With every
+    node busy it found no victim (pnfs-1791743002). idle_nodes keeps the pNFS workloads,
+    churn included, off that many nodes, so the fence always has a clean victim."""
+
+    NODES = ["control-plane", "worker-1", "worker-2", "worker-3", "worker-4"]
+
+    def _plugins(self, *_: object, **__: object) -> list[kube.Pod]:
+        return [kube.Pod(name=f"simplyblock-csi-node-{i}", namespace="simplyblock", node=n,
+                         containers=("csi-node",), phase="Running")
+                for i, n in enumerate(self.NODES)]
+
+    @staticmethod
+    def _excluded(doc: dict) -> list[str]:
+        terms = (doc["spec"].get("affinity", {}).get("nodeAffinity", {})
+                 .get("requiredDuringSchedulingIgnoredDuringExecution", {})
+                 .get("nodeSelectorTerms", []))
+        return sorted(v for t in terms for e in t.get("matchExpressions", [])
+                      if e.get("key") == "kubernetes.io/hostname" and e.get("operator") == "NotIn"
+                      for v in e.get("values", []))
+
+    def test_every_pod_avoids_the_idle_nodes_and_they_are_published(self):
+        w = pnfs_rwx.PnfsRwxWorkload(shared_volumes=1, pods_per_shared=3, solo_pods=1,
+                                     cross_readers=1, idle_nodes=1)
+        with _Ctx() as ctx, mock.patch.object(kube, "list_pods", self._plugins):
+            docs = w._documents(ctx, "sc-pnfs")
+            idle = ctx.shared.get("pnfs.idle_nodes")
+        self.assertEqual(idle, ["worker-4"])
+        pods = [d for d in docs if d["kind"] == "Pod"]
+        self.assertTrue(pods)
+        for pod in pods:
+            self.assertEqual(self._excluded(pod), ["worker-4"], pod["metadata"]["name"])
+
+    def test_the_spread_anti_affinity_is_kept(self):
+        w = pnfs_rwx.PnfsRwxWorkload(shared_volumes=1, pods_per_shared=3, solo_pods=0,
+                                     idle_nodes=1)
+        with _Ctx() as ctx, mock.patch.object(kube, "list_pods", self._plugins):
+            docs = w._documents(ctx, "sc-pnfs")
+        pod = next(d for d in docs if d["kind"] == "Pod")
+        self.assertIn("podAntiAffinity", pod["spec"]["affinity"])
+
+    def test_no_idle_nodes_by_default_and_no_lookup(self):
+        w = pnfs_rwx.PnfsRwxWorkload(shared_volumes=1, pods_per_shared=2, solo_pods=1)
+        with _Ctx() as ctx, mock.patch.object(kube, "list_pods",
+                                               side_effect=AssertionError("listed nodes")):
+            docs = w._documents(ctx, "sc-pnfs")
+            self.assertEqual(ctx.shared.get("pnfs.idle_nodes", []), [])
+        for pod in [d for d in docs if d["kind"] == "Pod"]:
+            self.assertEqual(self._excluded(pod), [])
+
+    def test_too_few_nodes_keeps_none_idle(self):
+        """A pNFS volume needs a client node and the fence a second one to recall from."""
+        w = pnfs_rwx.PnfsRwxWorkload(shared_volumes=1, pods_per_shared=2, solo_pods=0,
+                                     idle_nodes=4)
+        with _Ctx() as ctx, mock.patch.object(kube, "list_pods", self._plugins):
+            docs = w._documents(ctx, "sc-pnfs")
+            self.assertEqual(ctx.shared.get("pnfs.idle_nodes", []), [])
+        for pod in [d for d in docs if d["kind"] == "Pod"]:
+            self.assertEqual(self._excluded(pod), [])
+
+    def test_churn_pods_avoid_the_idle_nodes(self):
+        from sbtest.components.workloads import churn
+        w = churn.ChurnWorkload()
+        inst = fio.FioInstance(pod="run1-churn-1", container="fio-0",
+                               filename="/data/run1-churn-1.fio", logdir="/logs/c0",
+                               evidence="run1-fio-churn-1")
+        with _Ctx() as ctx:
+            ctx.shared["pnfs.idle_nodes"] = ["worker-4"]
+            doc = w._pod(ctx, inst, "run1-pnfs-shared-0", 90.0)
+        self.assertEqual(self._excluded(doc), ["worker-4"])

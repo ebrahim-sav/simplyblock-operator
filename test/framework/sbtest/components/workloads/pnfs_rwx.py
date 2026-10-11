@@ -38,6 +38,8 @@ from .. import kube, nfs
 from . import fio
 from .base import FioWorkload
 
+_CSI_NODE_PREFIX = "simplyblock-csi-node-"
+
 PARAM_FSTYPE = "csi.storage.k8s.io/fstype"
 FSTYPE_PNFS = "pnfs"
 MOUNT = "/data"
@@ -76,6 +78,9 @@ class PnfsRwxWorkload(FioWorkload):
             # How long a reader waits for the next round before logging a timeout. Below
             # stop_timeout_s, so a reader has exited before stop() gives up on it.
             "round_wait_s": 120,
+            # Nodes running a node plugin that no pod of this workload or of
+            # workload.pnfs-churn is placed on, so chaos.fence finds an idle victim.
+            "idle_nodes": 0,
         }
 
     def __init__(self, **options: Any) -> None:
@@ -202,7 +207,29 @@ class PnfsRwxWorkload(FioWorkload):
             docs.append(self._pod(ctx, pod, i, claim, is_shared, containers, file_gb))
         for v in range(shared if readers else 0):
             docs += self._round_pods(ctx, v, f"{ctx.run_id}-pnfs-shared-{v}", readers)
+        idle = self._idle_nodes(ctx)
+        ctx.shared["pnfs.idle_nodes"] = idle
+        for doc in docs:
+            if doc["kind"] == "Pod":
+                fio.avoid_nodes(doc["spec"], idle)
         return docs
+
+    def _idle_nodes(self, ctx: RunContext) -> list[str]:
+        """The last `idle_nodes` of the nodes running a node plugin, or none when that
+        would leave fewer than two: a volume needs a client node, and chaos.fence a
+        second node to recall the victim's layout from."""
+        want = int(self.opt("idle_nodes"))
+        if want <= 0:
+            return []
+        nodes = sorted({p.node for p in kube.list_pods(ctx.operator_namespace,
+                                                       [_CSI_NODE_PREFIX])
+                        if p.name.startswith(_CSI_NODE_PREFIX) and p.phase == "Running"
+                        and p.node})
+        if len(nodes) - want < 2:
+            ctx.log.warn(f"{self.name}: {len(nodes)} node(s) with a node plugin leave no room "
+                         f"for {want} idle; every node stays usable")
+            return []
+        return nodes[-want:]
 
     def _claim(self, ctx: RunContext, claim: str, sc: str, shared: bool) -> dict:
         return {

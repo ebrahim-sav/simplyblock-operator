@@ -341,7 +341,7 @@ class ChurnWorkload(Component):
         opts = {**self.options, "runtime_s": int(lifetime_s)}
         args = fio.fio_args(opts, filename=inst.filename,
                             size_gb=int(self.opt("file_size_gb")), logdir=inst.logdir)
-        return {
+        doc: dict[str, Any] = {
             "apiVersion": "v1", "kind": "Pod",
             # No app=fio: workload.pnfs finds its own pods by that label.
             "metadata": {"name": inst.pod, "labels": self._labels(ctx)},
@@ -360,6 +360,8 @@ class ChurnWorkload(Component):
                             {"name": "logs", "emptyDir": {}}],
             },
         }
+        fio.avoid_nodes(doc["spec"], list(ctx.shared.get("pnfs.idle_nodes") or []))
+        return doc
 
     # ── the end of the run ───────────────────────────────────────────────────────────
 
