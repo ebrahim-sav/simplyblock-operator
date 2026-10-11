@@ -2074,3 +2074,51 @@ class ConntrackPinned(unittest.TestCase):
         with self.assertRaises(SkipDetector):
             self.found([])
 
+
+
+class NodeAgentPollGaps(unittest.TestCase):
+    """The node-agent log is collected whole, so it starts hours before the run. A gap in
+    the liveness polling that ended before the run began is history this run inherited
+    (pnfs-1791711824 reported an overnight 27711s gap that ended three hours before it
+    started as its own warning), while a gap the run overlaps is the run's."""
+
+    START = datetime(2026, 10, 11, 9, 43, 44, tzinfo=UTC)
+    END = datetime(2026, 10, 11, 10, 48, 32, tzinfo=UTC)
+
+    @staticmethod
+    def poll(at: datetime) -> str:
+        return (f"{at:%Y-%m-%dT%H:%M:%S}.000000000Z stderr F {at:%Y-%m-%d %H:%M:%S},000: 1: "
+                f'INFO: 192.168.10.144 - - [x] "GET /snode/check HTTP/1.1" 200 -')
+
+    def polls(self, *spans: tuple[datetime, datetime]) -> list[str]:
+        out = []
+        for a, b in spans:
+            t = a
+            while t <= b:
+                out.append(self.poll(t))
+                t += timedelta(seconds=5)
+        return out
+
+    def found(self, lines: list[str]) -> list[Finding]:
+        ev = FakeEvidence(logs={"snode-api-worker-1": lines}, window=(self.START, self.END))
+        return list(build_detector("control.node-agent").detect(ev))
+
+    def test_a_gap_that_ended_before_the_run_is_pre_existing(self):
+        night = datetime(2026, 10, 10, 23, 7, 39, tzinfo=UTC)
+        lines = self.polls((night - timedelta(minutes=5), night),
+                           (datetime(2026, 10, 11, 6, 49, 30, tzinfo=UTC), self.END))
+        found = self.found(lines)
+        self.assertEqual([f.attribution for f in found], [Attribution.PRE_EXISTING], found)
+
+    def test_a_gap_inside_the_run_is_the_runs(self):
+        mid = self.START + timedelta(minutes=20)
+        lines = self.polls((self.START - timedelta(minutes=5), mid),
+                           (mid + timedelta(minutes=3), self.END))
+        found = self.found(lines)
+        self.assertEqual([f.attribution for f in found], [Attribution.RUN], found)
+
+    def test_a_gap_the_run_started_in_is_the_runs(self):
+        lines = self.polls((self.START - timedelta(minutes=10), self.START - timedelta(minutes=2)),
+                           (self.START + timedelta(minutes=2), self.END))
+        found = self.found(lines)
+        self.assertEqual([f.attribution for f in found], [Attribution.RUN], found)
