@@ -145,6 +145,10 @@ class Restarter(Component):
         self._seed = 0
 
     def start(self, ctx: RunContext) -> None:
+        # Another component may ask for a restart at a moment that matters to it, as
+        # chaos.fence does to restart the MDS while its victim is cut off. It runs and is
+        # recorded like a scheduled one.
+        ctx.shared["chaos.restart.request"] = lambda target: self._spawn(ctx, target)
         duration = float(ctx.shared.get("run.duration_s") or 0)
         if duration <= 0:
             ctx.log.warn(f"{self.name}: the run has no duration, so nothing is restarted")
@@ -170,15 +174,20 @@ class Restarter(Component):
             tick = float(self.opt("tick_s"))
             while not self._stop.is_set() and not ctx.stopping.is_set():
                 for target in plan.due(time.monotonic(), self._in_flight()):
-                    worker = threading.Thread(target=self._restart, args=(ctx, target),
-                                              name=f"chaos-{target}", daemon=True)
-                    with self._lock:
-                        self._workers.append(worker)
-                    worker.start()
+                    self._spawn(ctx, target)
                 self._stop.wait(tick)
 
         self._loop = threading.Thread(target=loop, name="chaos-restart", daemon=True)
         self._loop.start()
+
+    def _spawn(self, ctx: RunContext, target: str) -> None:
+        if target not in _TARGETS:
+            raise ValueError(f"{self.name}: unknown target {target!r}; known: {sorted(_TARGETS)}")
+        worker = threading.Thread(target=self._restart, args=(ctx, target),
+                                  name=f"chaos-{target}", daemon=True)
+        with self._lock:
+            self._workers.append(worker)
+        worker.start()
 
     def _guaranteed_targets(self) -> list[str]:
         targets = [str(t) for t in self.opt("guaranteed_targets") or []]

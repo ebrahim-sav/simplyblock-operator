@@ -247,3 +247,73 @@ class FenceHeal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FenceRestartsTheMds(unittest.TestCase):
+    """An MDS restart while the victim is cut off is a case of its own: the new server has
+    no layout state for the victim, so only a fence of earlier-boot keys stops its writes
+    (pnfs-1791745445). restart_mds_during asks chaos.restart for that restart right after
+    the truncate is issued, so the case is reached on purpose rather than by chance."""
+
+    def truncate(self, requests: list[str] | None, **opts: object) -> tuple[dict, str]:
+        def run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, 0, "1791525621000 1791525622000 0 \n", "")
+
+        f = fence.Fencer(restart_mds_after_s=0, **opts)
+        rec = {"file": "/data/r1-fence.probe", "recaller_node": "w2", "recaller_pod": "r1-rec"}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(kube, "run", run):
+            log = os.path.join(d, "run.log")
+            ctx = RunContext(run_id="r1", outdir=d, log=Logger(log))
+            if requests is not None:
+                ctx.shared["chaos.restart.request"] = requests.append
+            f.bind_namespaces(ctx)
+            f._truncate(ctx, rec)
+            f._join_mds_restart()
+            ctx.log.close()
+            with open(log) as fh:
+                text = fh.read()
+        return rec, text
+
+    def test_it_asks_chaos_restart_to_restart_the_mds_and_records_when(self):
+        requests: list[str] = []
+        rec, _ = self.truncate(requests, restart_mds_during=True)
+        self.assertEqual(requests, ["mds"])
+        self.assertIn("mds_restart_requested", rec)
+
+    def test_without_chaos_restart_it_says_so_and_records_why(self):
+        rec, text = self.truncate(None, restart_mds_during=True)
+        self.assertIn("chaos.restart", rec.get("mds_restart_error", ""))
+        self.assertIn("chaos.restart", text)
+
+    def test_off_by_default(self):
+        requests: list[str] = []
+        rec, _ = self.truncate(requests)
+        self.assertEqual(requests, [])
+        self.assertNotIn("mds_restart_requested", rec)
+
+
+class RestarterTakesRequests(unittest.TestCase):
+    """chaos.restart restarts on request as it does on its schedule, so a requested
+    restart is recorded in restarts.json and the recovery detectors attribute it."""
+
+    def test_a_requested_restart_runs_through_restart(self):
+        import threading
+
+        from sbtest.components import chaos
+
+        done = threading.Event()
+        seen: list[str] = []
+        r = chaos.Restarter()
+
+        def fake_restart(ctx: RunContext, target: str) -> None:
+            seen.append(target)
+            done.set()
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(r, "_restart", fake_restart):
+            ctx = RunContext(run_id="r1", outdir=d, log=Logger(None))
+            r.bind_namespaces(ctx)
+            r.start(ctx)
+            ctx.shared["chaos.restart.request"]("mds")
+            self.assertTrue(done.wait(5))
+            r.stop(ctx)
+        self.assertEqual(seen, ["mds"])

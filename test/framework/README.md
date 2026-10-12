@@ -730,7 +730,10 @@ The victim keeps writing for `after_s`, then the partition heals. The victim is 
 where no workload pod mounts a volume, because every pNFS mount on it loses the server too.
 `workload.pnfs` `idle_nodes` keeps that many nodes free of its pods and of
 `workload.pnfs-churn`'s, so there always is one. `allow_busy_victim` lifts the restriction
-instead, and the victim node's workload pods are then fenced with the probe. Teardown removes exactly the rules it recorded, the helper
+instead, and the victim node's workload pods are then fenced with the probe.
+`restart_mds_during` asks `chaos.restart` to restart the MDS `restart_mds_after_s` after the
+truncate is issued, so the new server has to fence a victim it holds no layout state for;
+the restart is recorded in `restarts.json` like a scheduled one. Teardown removes exactly the rules it recorded, the helper
 removes them when it is terminated or after `max_partition_s`, and a rule that cannot be
 removed is logged as an error with the command that removes it. `pnfs.fence` reads
 `fence.json`: a write that succeeded between the truncate's return and the heal is critical.

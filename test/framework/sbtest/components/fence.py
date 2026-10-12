@@ -195,6 +195,10 @@ class Fencer(Component):
             "heal_tail_s": 20.0,        # writes recorded after the heal
             "max_partition_s": 900.0,   # the helper heals by itself after this
             "allow_busy_victim": False,
+            # Ask chaos.restart to restart the MDS this long after the truncate is issued,
+            # while the victim is cut off and its layout is being recalled.
+            "restart_mds_during": False,
+            "restart_mds_after_s": 3.0,
             "grow_mb": 64,              # the truncate's new size
             "write_interval_s": 0.5,
             "image": "alpine:3.20",
@@ -411,6 +415,8 @@ class Fencer(Component):
         script = (f"s=$(date +%s%3N); timeout -k 5 {bound} truncate -s {size} {rec['file']} "
                   "2>/tmp/terr; rc=$?; e=$(date +%s%3N); echo \"$s $e $rc $(head -n1 /tmp/terr)\"")
         ctx.log.event(f"{self.name}: truncating {rec['file']} from {rec['recaller_node']}")
+        if self.opt("restart_mds_during"):
+            self._request_mds_restart(ctx, rec)
         try:
             out = kube.run(["-n", str(self.opt("namespace")), "exec", rec["recaller_pod"], "--",
                             "sh", "-c", script], timeout=bound + 60, check=False).stdout
@@ -429,6 +435,30 @@ class Fencer(Component):
         ctx.log.event(f"{self.name}: truncate returned "
                       f"{rec.get('truncate_returned') or 'never'}"
                       + (f" ({rec['truncate_error']})" if rec.get("truncate_error") else ""))
+
+    def _request_mds_restart(self, ctx: RunContext, rec: dict[str, Any]) -> None:
+        """Ask chaos.restart to restart the MDS after restart_mds_after_s, without holding
+        up the truncate, which blocks until nfsd lets it through."""
+        request = ctx.shared.get("chaos.restart.request")
+        if request is None:
+            rec["mds_restart_error"] = "chaos.restart is not enabled, so nothing restarted the MDS"
+            ctx.log.warn(f"{self.name}: restart_mds_during is set, but {rec['mds_restart_error']}")
+            return
+
+        def fire() -> None:
+            rec["mds_restart_requested"] = _iso(datetime.now(UTC))
+            ctx.log.event(f"{self.name}: restarting the MDS while {rec.get('victim_node', 'the victim')} "
+                          "is cut off")
+            request("mds")
+
+        self._mds_timer = threading.Timer(float(self.opt("restart_mds_after_s")), fire)
+        self._mds_timer.daemon = True
+        self._mds_timer.start()
+
+    def _join_mds_restart(self) -> None:
+        timer = getattr(self, "_mds_timer", None)
+        if timer is not None:
+            timer.join()
 
     def _end(self, ctx: RunContext) -> None:
         """Heal, stop the writer, and read its log. Runs however the scenario ended."""
