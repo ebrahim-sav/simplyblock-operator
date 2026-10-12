@@ -48,9 +48,10 @@ def _cp(stdout: str = "", rc: int = 0) -> subprocess.CompletedProcess[str]:
 
 
 def _nodes_json(*specs: tuple[str, str, str]) -> str:
-    """specs: (uuid, k8s host, status)."""
+    """specs: (UUID, Kubernetes host, status). Each node is named after its host, in namespace sb."""
     return json.dumps({"items": [
-        {"spec": {"workerNode": host}, "status": {"uuid": uuid, "status": status}}
+        {"metadata": {"namespace": "sb", "name": f"node-{host}"},
+         "spec": {"workerNode": host}, "status": {"uuid": uuid, "status": status}}
         for uuid, host, status in specs]})
 
 
@@ -188,32 +189,45 @@ class Grouping(unittest.TestCase):
 
 class PollLoop(unittest.TestCase):
     def test_terminal_phase_ends_the_wait(self):
-        fake = _FakeKube({"get volumemigration": json.dumps(
-            {"status": {"phase": "Completed", "sourceNodeUUID": "uuid-real"}})})
+        fake = _FakeKube({"get persistentvolumeops": json.dumps(
+            {"status": {"phase": "Succeeded",
+                        "migration": {"sourceNodeUUID": "uuid-real"}}})})
         with _Ctx() as ctx, _patch(kube, "run", fake.run):
-            d = migration.MigrationDriver(poll_s=0.01)
-            d.bind_namespaces(ctx)
+            d = migration.MigrationDriver(poll_s=0.01, timeout_s=2.0)
             rec = Migration(name="m1", start=datetime.now(UTC), pv="pv1", source="uuid-guess")
             d._await_terminal(ctx, rec, "m1", sampler=None)
-        self.assertEqual(rec.phase, "Completed")
+        self.assertEqual(rec.phase, "Succeeded")
+        self.assertEqual(rec.error, "")
         self.assertIsNotNone(rec.end)
         # The operator's resolved source overrides the driver's guess.
         self.assertEqual(rec.source, "uuid-real")
+        # Cluster-scoped: the get carries no namespace.
+        self.assertNotIn("-n", fake.calls[0])
+
+    def test_a_failed_operation_records_its_message(self):
+        fake = _FakeKube({"get persistentvolumeops": json.dumps(
+            {"status": {"phase": "Failed", "message": "target node is offline"}})})
+        with _Ctx() as ctx, _patch(kube, "run", fake.run):
+            d = migration.MigrationDriver(poll_s=0.01, timeout_s=2.0)
+            rec = Migration(name="m1", start=datetime.now(UTC), pv="pv1")
+            d._await_terminal(ctx, rec, "m1", sampler=None)
+        self.assertEqual(rec.phase, "Failed")
+        self.assertEqual(rec.error, "target node is offline")
 
     def test_never_reaching_a_terminal_phase_is_a_timeout_not_a_failure(self):
         """A rejected migration and one that never finished are different defects, and only
         one of them has an error to read."""
-        fake = _FakeKube({"get volumemigration": json.dumps(
-            {"status": {"phase": "Migrating"}})})
+        fake = _FakeKube({"get persistentvolumeops": json.dumps(
+            {"status": {"phase": "Running", "step": {"state": "Migrating"}}})})
         with _Ctx() as ctx, _patch(kube, "run", fake.run):
             d = migration.MigrationDriver(poll_s=0.01, timeout_s=0.05)
-            d.bind_namespaces(ctx)
             rec = Migration(name="m1", start=datetime.now(UTC), pv="pv1")
             d._await_terminal(ctx, rec, "m1", sampler=None)
         self.assertEqual(rec.phase, "TIMEOUT")
         self.assertEqual(rec.error, "")
 
-    def test_phase_changes_reach_the_sampler_and_the_timeline(self):
+    def test_steps_and_phases_reach_the_sampler_and_the_timeline(self):
+        """A running operation is reported by its step, which is what says where it is."""
         class Sampler:
             def __init__(self) -> None:
                 self.phases: list[str] = []
@@ -221,8 +235,12 @@ class PollLoop(unittest.TestCase):
             def set_phase(self, p: str) -> None:
                 self.phases.append(p)
 
-        seq = [json.dumps({"status": {"phase": p}})
-               for p in ("Preparing", "Preparing", "Cutover", "Completed")]
+        seq = [json.dumps({"status": st}) for st in (
+            {"phase": "Pending"},
+            {"phase": "Running", "step": {"state": "Validating"}},
+            {"phase": "Running", "step": {"state": "Validating"}},
+            {"phase": "Running", "step": {"state": "Migrating"}},
+            {"phase": "Succeeded", "step": {"state": "Verifying"}})]
 
         def run(args: list[str], timeout: int = 60, check: bool = True,
                 stdin: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -230,23 +248,46 @@ class PollLoop(unittest.TestCase):
 
         s = Sampler()
         with _Ctx() as ctx, _patch(kube, "run", run):
-            d = migration.MigrationDriver(poll_s=0.01)
-            d.bind_namespaces(ctx)
+            d = migration.MigrationDriver(poll_s=0.01, timeout_s=2.0)
             rec = Migration(name="m1", start=datetime.now(UTC), pv="pv1")
             d._await_terminal(ctx, rec, "m1", sampler=s)
         # Deduplicated: only transitions, not every poll.
-        self.assertEqual(s.phases, ["Preparing", "Cutover", "Completed"])
+        want = ["Pending", "Validating", "Migrating", "Succeeded"]
+        self.assertEqual(s.phases, want)
         self.assertEqual([e.data["phase"] for e in ctx.timeline.of_kind("migration.phase")],
-                         ["Preparing", "Cutover", "Completed"])
+                         want)
+        self.assertEqual(rec.phase, "Succeeded")
 
 
 class Manifest(unittest.TestCase):
-    def test_the_cr_carries_the_run_label_so_teardown_can_find_it(self):
-        d = migration.MigrationDriver(namespace="default")
-        m = json.loads(d._manifest("run1-mig-3", "pvc-abc", "uuid-b"))
-        self.assertEqual(m["kind"], "VolumeMigration")
-        self.assertEqual(m["spec"], {"pvName": "pvc-abc", "targetNodeUUID": "uuid-b"})
+    def test_the_cr_is_a_migrate_pvops_naming_the_target_node_object(self):
+        d = migration.MigrationDriver()
+        d._node_ref = {"uuid-b": {"namespace": "sb", "name": "node-vm03"}}
+        m = json.loads(d._manifest("run1", "run1-mig-3", "pvc-abc", "uuid-b"))
+        self.assertEqual(m["apiVersion"], "storage.simplyblock.io/v1alpha2")
+        self.assertEqual(m["kind"], "PersistentVolumeOps")
+        self.assertNotIn("namespace", m["metadata"])
+        self.assertEqual(m["spec"], {
+            "persistentVolumeName": "pvc-abc", "action": "Migrate",
+            "migrate": {"targetNodeRef": {"namespace": "sb", "name": "node-vm03"}}})
+
+    def test_the_cr_carries_the_run_labels_so_teardown_can_find_it(self):
+        d = migration.MigrationDriver()
+        d._node_ref = {"uuid-b": {"namespace": "sb", "name": "node-vm03"}}
+        m = json.loads(d._manifest("run1", "run1-mig-3", "pvc-abc", "uuid-b"))
         self.assertEqual(m["metadata"]["labels"]["sbtest-run"], "true")
+        self.assertEqual(m["metadata"]["labels"]["sbtest-run-id"], "run1")
+
+    def test_teardown_deletes_only_this_runs_operations(self):
+        """The kind is cluster-scoped, so a run label alone would reach other runs' CRs."""
+        fake = _FakeKube()
+        with _Ctx() as ctx, _patch(kube, "run", fake.run):
+            migration.MigrationDriver().teardown(ctx)
+        self.assertEqual(len(fake.calls), 1)
+        call = fake.calls[0]
+        self.assertEqual(call[:2], ["delete", "persistentvolumeops"])
+        self.assertIn("sbtest-run=true,sbtest-run-id=run1", call)
+        self.assertNotIn("-n", call)
 
     def test_online_nodes_only(self):
         """Migrating to an offline node is a rejected request, not a test."""
@@ -254,9 +295,10 @@ class Manifest(unittest.TestCase):
             ("uuid-a", "vm02", "online"), ("uuid-b", "vm03", "offline"),
             ("uuid-c", "vm04", "online"))})
         with _patch(kube, "run", fake.run):
-            uuids, hosts = migration.MigrationDriver()._storage_nodes()
+            uuids, hosts, refs = migration.MigrationDriver()._storage_nodes()
         self.assertEqual(uuids, ["uuid-a", "uuid-c"])
         self.assertEqual(hosts["uuid-c"], "vm04")
+        self.assertEqual(refs["uuid-c"], {"namespace": "sb", "name": "node-vm04"})
 
 
 class SetupGuards(unittest.TestCase):

@@ -204,7 +204,8 @@ class UnservedAfterCutover(Detector):
     summary = "after a Completed migration, a live target controller serves only some namespaces"
 
     def defaults(self) -> dict:
-        return {"completed_phases": ["Completed"]}
+        # Completed covers archived runs that migrated through the VolumeMigration kind.
+        return {"completed_phases": ["Succeeded", "Completed"]}
 
     def detect(self, ev: Evidence) -> Iterable[Finding]:
         migs = [m for m in ev.migrations() if m.phase in set(self.opt("completed_phases"))]

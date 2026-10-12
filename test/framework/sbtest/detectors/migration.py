@@ -26,7 +26,9 @@ class Outcomes(Detector):
     def defaults(self) -> dict:
         return {"min_completed_fraction": 0.8,
                 "max_timeout_fraction": 0.1,
-                "completed_phases": ["Completed"],
+                # Succeeded is the PersistentVolumeOps phase. Completed is what archived runs on
+                # the VolumeMigration kind recorded, kept so they can still be judged.
+                "completed_phases": ["Succeeded", "Completed"],
                 "timeout_phases": ["TIMEOUT", "Timeout"]}
 
     def detect(self, ev: Evidence) -> Iterable[Finding]:

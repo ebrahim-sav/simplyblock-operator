@@ -46,7 +46,7 @@ make analyze-all SUITE=corruption-hunt
 # collect from a live cluster for 10 minutes, then judge
 make collect OUT=./runs/my-run SUITE=migration-soak DURATION=600
 
-# drive a full migration run — volumes, fio, VolumeMigration CRs — then judge it
+# drive a full migration run — volumes, fio, PersistentVolumeOps CRs — then judge it
 make run SUITE=migration-full DURATION=7200 KEEP=1
 
 # pNFS under concurrent load: shared and private RWX volumes, fio in every container
@@ -393,7 +393,7 @@ Three things are load-bearing and worth knowing:
 | `nvme.snapshot`          | Fabric snapshot before *and* after the run — "did the last run leave a mess?" is a real question, because a leaked controller breaks the *next* run.                                                                                                                                                                                                        |
 | `ana.sample`             | Per-namespace ANA state on every consuming node, on an interval, written per migration in the layout `ArchiveEvidence` reads. Needs a driver to tell it which migration is in flight.                                                                                                                                                                       |
 | `workload.fio`           | Provisions volumes from two StorageClasses (single-namespace and packed) and drives continuous md5-verified fio against them. `required`.                                                                                                                                                                                                                   |
-| `migration.driver`       | Creates `VolumeMigration` CRs in a loop, one at a time, and records what each one did. `required`.                                                                                                                                                                                                                                                          |
+| `migration.driver`       | Creates `PersistentVolumeOps` migrations in a loop, one at a time, and records what each one did. `required`.                                                                                                                                                                                                                                               |
 | `workload.pnfs`          | Provisions pNFS volumes some pods share and some own, and runs verified fio in every container, each instance with a data file of its own. Pods sharing a volume are spread across nodes. `required`. `cross_readers` adds readers on other nodes that verify a shared volume's rounds, and `idle_nodes` keeps nodes free for `chaos.fence`.                |
 | `nvme.iostat`            | Samples every node's NVMe namespace I/O counters (sysfs `stat`, head devices only) on an interval, for `pnfs.device-io`. Finds a replaced node plugin and keeps reading through it.                                                                                                                                                                         |
 | `chaos.restart`          | Restarts the metadata server, a pNFS client's node plugin, or the CSI controller during the timed run: `guaranteed` times at seeded random moments, and otherwise with a low `chance` per tick. Records each restart and its recovery in `restarts.json`, and the victim's log through its shutdown in `restart-<n>-<target>-<pod>.txt`.                    |
@@ -572,8 +572,8 @@ produced a wrong answer that *looked* right:
 * **Which volumes move together.** A migration moves the whole NVMe subsystem, so its blast
   radius is the volume's *group*. The control plane decides the packing and a previous
   migration can change it, so the group is re-read before each one.
-* **What the migration actually did.** `status.sourceNodeUUID` is the operator's own resolved
-  answer, so it overwrites the driver's guess in the record.
+* **What the migration actually did.** `status.migration.sourceNodeUUID` is the operator's own
+  resolved answer, so it overwrites the driver's guess in the record.
 
 The driver also feeds `ana.sample`: `begin()` when a migration starts, `set_phase()` on each
 phase transition, `end()` when it finishes. Sampling is worthless unattributed — a freeze
