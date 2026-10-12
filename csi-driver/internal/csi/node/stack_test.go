@@ -947,3 +947,99 @@ func TestExpandOfAPNFSVolumeReportsALayoutItCouldNotPrime(t *testing.T) {
 		t.Errorf("error = %v, want it to name the layout it could not take", err)
 	}
 }
+
+// pnfsExpand runs NodeExpandVolume on a staged pNFS volume asking for required
+// bytes, and reports whether it took the layout. The staging path is a real
+// directory, so the size compared is that of the filesystem the test runs on.
+func pnfsExpand(t *testing.T, required int64) (bool, error) {
+	t.Helper()
+	runner := newRecordingRunner()
+	ns, _ := newStackedServer(t, runner)
+
+	vc := stagedContext()
+	vc[csicommon.CtxAccessProtocol] = csicommon.AccessProtocolNFS
+	parent := stashedAt(t, vc)
+	if err := os.MkdirAll(filepath.Join(parent, pvcTestHandle), 0o755); err != nil {
+		t.Fatalf("create the staging path: %v", err)
+	}
+
+	primed := false
+	open := openProbe
+	openProbe = func(name string, flag int, perm os.FileMode) (*os.File, error) {
+		primed = true
+		return open(name, flag, perm)
+	}
+	t.Cleanup(func() { openProbe = open })
+
+	_, err := ns.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
+		VolumeId:          pvcTestHandle,
+		StagingTargetPath: parent,
+		VolumePath:        filepath.Join(parent, pvcTestHandle),
+		VolumeCapability:  mountCapability(),
+		CapacityRange:     &csi.CapacityRange{RequiredBytes: required},
+	})
+	return primed, err
+}
+
+// The controller only records the new size, and the metadata server grows the
+// filesystem afterward, asynchronously. A prime taken before that resolves
+// the device ID the grow is about to replace, so the pods resolve the new one
+// themselves, in a namespace without disk/by-id (pnfs-1791796138: one node
+// primed 4 s before the grow). Until the mount shows the size asked for, the
+// expansion is not done here yet: it says so with an error kubelet retries, and
+// takes no layout.
+func TestExpandOfAPNFSVolumeWaitsForTheGrowToReachTheClient(t *testing.T) {
+	primed, err := pnfsExpand(t, 1<<50) // 1 PiB, more than any test filesystem
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("NodeExpandVolume = %v, want Unavailable, which kubelet retries", err)
+	}
+	if primed {
+		t.Error("took the layout before the grow reached the client, on the device ID the grow replaces")
+	}
+}
+
+// Once the mount shows the size asked for, the expansion primes as before.
+func TestExpandOfAPNFSVolumePrimesOnceTheGrowArrived(t *testing.T) {
+	primed, err := pnfsExpand(t, 1)
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if !primed {
+		t.Error("the grow had arrived and the layout was not taken")
+	}
+}
+
+// Without a size to wait for there is nothing to compare, and the expansion
+// primes as it always did.
+func TestExpandOfAPNFSVolumeWithoutARequiredSizePrimesAtOnce(t *testing.T) {
+	primed, err := pnfsExpand(t, 0)
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if !primed {
+		t.Error("no size was asked for and the layout was not taken")
+	}
+}
+
+// statfs reports an XFS filesystem's size without its internal log, so a grown
+// export reads a little below the volume size; the tolerance absorbs that and
+// nothing larger. A filesystem still at the size before a 1 GiB grow is short.
+func TestPNFSGrowArrived(t *testing.T) {
+	const gib = int64(1) << 30
+	for _, tc := range []struct {
+		name           string
+		have, required int64
+		want           bool
+	}{
+		{"grown, less the log", 21*gib - 10<<20, 21 * gib, true},
+		{"exactly the size", 21 * gib, 21 * gib, true},
+		{"still before a 1 GiB grow", 20*gib - 10<<20, 21 * gib, false},
+		{"large volume, less a 2 GiB log", 10<<40 - 2038<<20, 10 << 40, true},
+		{"large volume before a 10 GiB grow", 10<<40 - 10*gib, 10 << 40, false},
+		{"nothing asked for", 0, 0, true},
+	} {
+		if got := pnfsGrowArrived(tc.have, tc.required); got != tc.want {
+			t.Errorf("%s: pnfsGrowArrived(%d, %d) = %v, want %v", tc.name, tc.have, tc.required, got, tc.want)
+		}
+	}
+}
