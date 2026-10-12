@@ -466,6 +466,11 @@ func main() {
 	// that opens it is also what registers the namespace its objects belong in.
 	backupSubscription := subscriptions.NewBackupSubscription()
 	backupScopes := cpSubscriptions.AddSubscription(backupSubscription)
+	// A backup request snapshots a volume and follows the snapshot and then the
+	// copy, so it reads the snapshot stream too. That one is per pool, and the
+	// pool's controller opens it.
+	snapshotSubscription := subscriptions.NewSnapshotSubscription()
+	snapshotScopes := cpSubscriptions.AddSubscription(snapshotSubscription)
 	backupPolicySubscription := subscriptions.NewBackupPolicySubscription()
 	backupPolicyScopes := cpSubscriptions.AddSubscription(backupPolicySubscription)
 	// How full a node is exists only in the metrics the control plane exports,
@@ -647,6 +652,7 @@ func main() {
 		Scheme:           mgr.GetScheme(),
 		Recorder:         mgr.GetEventRecorder("storagepool-controller"),
 		VolumeScopes:     volumeScopes,
+		SnapshotScopes:   snapshotScopes,
 		EndpointResolver: controlPlaneEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "StoragePool")
@@ -689,6 +695,17 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackup")
 		os.Exit(1)
 	}
+	if err := (&backupcontrollers.StorageBackupRequestReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("storagebackuprequest-controller"),
+		API:       backupAPI,
+		Snapshots: snapshotSubscription,
+		Backups:   backupSubscription,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupRequest")
+		os.Exit(1)
+	}
 	if err := (&backupcontrollers.StorageBackupPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -698,7 +715,18 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupPolicy")
 		os.Exit(1)
 	}
-	if err := (&backupcontrollers.StorageBackupOpsReconciler{
+	// An operation stored with string references cannot be decoded, and a cache
+	// that cannot list it never syncs, which would exit the whole manager. The
+	// controller is skipped instead, and the rest of the operator runs.
+	legacyOps, err := backupcontrollers.LegacyBackupOps(context.Background(), mgr.GetAPIReader())
+	if err != nil {
+		setupLog.Error(err, "unable to check for StorageBackupOps in the old format; starting the controller anyway")
+	}
+	if len(legacyOps) > 0 {
+		setupLog.Error(nil, "StorageBackupOps controller not started: these operations use the old string "+
+			"spec.backupRef and spec.clusterRef. Delete them and restart the operator",
+			"operations", legacyOps)
+	} else if err := (&backupcontrollers.StorageBackupOpsReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("storagebackupops-controller"),
@@ -707,7 +735,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupOps")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupRestoreReconciler{
+	if err := (&backupcontrollers.BackupRestoreReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backuprestore-controller"),
@@ -715,7 +743,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupRestore")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupPolicyReconciler{
+	if err := (&backupcontrollers.BackupPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backuppolicy-controller"),
@@ -723,7 +751,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupPolicy")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupImportReconciler{
+	if err := (&backupcontrollers.BackupImportReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backupimport-controller"),
