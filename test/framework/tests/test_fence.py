@@ -91,19 +91,34 @@ class PartitionRules(unittest.TestCase):
 
     def test_both_directions_for_every_address_each_tagged(self):
         rules = fence.partition_rules("sbtest-fence-r1", ["10.244.3.7", "10.96.4.4"])
-        self.assertEqual(len(rules), 4)
+        self.assertEqual(len(rules), 8)
         for r in rules:
             self.assertIn("2049", r)
             self.assertEqual(r[-2:], ["-j", "DROP"])
             self.assertIn("sbtest-fence-r1", r)
-        self.assertEqual(sorted(r[0] for r in rules), ["INPUT", "INPUT", "OUTPUT", "OUTPUT"])
+        self.assertEqual(sorted(r[0] for r in rules), ["INPUT"] * 4 + ["OUTPUT"] * 4)
         out = [r for r in rules if r[0] == "OUTPUT"]
-        self.assertTrue(all("--dport" in r and "-d" in r for r in out))
+        self.assertTrue(all("--dport" in r and ("-d" in r or "--ctorigdst" in r) for r in out))
         inp = [r for r in rules if r[0] == "INPUT"]
-        self.assertTrue(all("--sport" in r and "-s" in r for r in inp))
+        self.assertTrue(all("--sport" in r and ("-s" in r or "--ctorigdst" in r) for r in inp))
 
-    def test_an_address_listed_twice_gets_one_pair(self):
-        self.assertEqual(len(fence.partition_rules("t", ["10.0.0.1", "10.0.0.1"])), 2)
+    def test_an_address_listed_twice_gets_one_set(self):
+        self.assertEqual(len(fence.partition_rules("t", ["10.0.0.1", "10.0.0.1"])),
+                         len(fence.partition_rules("t", ["10.0.0.1"])))
+
+    def test_a_service_stays_cut_off_whichever_pod_it_translates_to(self):
+        """Rules on the translated address only cover the pods known when the partition
+        went up. After an MDS restart the Service pointed at a new pod IP and the victim
+        reconnected through it (pnfs-1791793255). A match on the connection's original
+        destination holds for any pod behind the Service, in both directions."""
+        rules = fence.partition_rules("t", ["10.96.4.4"])
+        for chain, port in (("OUTPUT", "--dport"), ("INPUT", "--sport")):
+            orig = [r for r in rules if r[0] == chain and "--ctorigdst" in r]
+            self.assertEqual(len(orig), 1, rules)
+            r = orig[0]
+            self.assertEqual(r[r.index("--ctorigdst") + 1], "10.96.4.4")
+            self.assertIn(port, r)
+            self.assertEqual(r[-2:], ["-j", "DROP"])
 
 
 class Direct(unittest.TestCase):

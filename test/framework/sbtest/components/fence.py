@@ -78,13 +78,22 @@ def partition_rules(tag: str, addresses: list[str]) -> list[list[str]]:
     """iptables rule specifications, without the -I or -D, that drop NFS to and from each
     address. Outgoing packets are matched after the ClusterIP is translated, and replies
     before it is translated back, so a Service needs both its ClusterIP and its backends
-    listed."""
+    listed.
+
+    The backends are only those known when the partition goes up. A restarted MDS comes
+    back on a new pod IP the Service then translates to, and the victim reconnected
+    through it (pnfs-1791793255). So each address is also matched as the connection's
+    original destination, which holds whichever pod the Service picks."""
     out: list[list[str]] = []
     for a in dict.fromkeys(addresses):
         tail = ["-p", "tcp"]
         out.append(["OUTPUT", "-d", a, *tail, "--dport", NFS_PORT,
                     "-m", "comment", "--comment", tag, "-j", "DROP"])
         out.append(["INPUT", "-s", a, *tail, "--sport", NFS_PORT,
+                    "-m", "comment", "--comment", tag, "-j", "DROP"])
+        out.append(["OUTPUT", *tail, "--dport", NFS_PORT, "-m", "conntrack", "--ctorigdst", a,
+                    "-m", "comment", "--comment", tag, "-j", "DROP"])
+        out.append(["INPUT", *tail, "--sport", NFS_PORT, "-m", "conntrack", "--ctorigdst", a,
                     "-m", "comment", "--comment", tag, "-j", "DROP"])
     return out
 
