@@ -162,6 +162,11 @@ func stagePNFS(
 		klog.Warningf(
 			"pnfs: could not take the block layout for %s, so I/O will route through "+
 				"the metadata server instead of going direct: %v", stagingPath, err)
+		return nil
+	}
+	// The size this prime was taken at, which an expansion waits to see exceeded.
+	if err := recordPrime(stagingPath, 0); err != nil {
+		klog.Warningf("pnfs: could not record the prime of %s: %v", stagingPath, err)
 	}
 	return nil
 }

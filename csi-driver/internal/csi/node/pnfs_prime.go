@@ -20,6 +20,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -227,4 +228,45 @@ func KeepLayoutsPrimed(ctx context.Context, driverName string) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// primedSizeFileName is where a staging mount's last prime is recorded, next
+// to the volume context in the staging parent.
+const primedSizeFileName = "pnfs-primed-size.json"
+
+// primedSize is what a staging mount looked like when this node last took its
+// layout: the size statfs reported, and the size the expansion asked for, zero
+// for a prime at stage.
+type primedSize struct {
+	Size     int64 `json:"size"`
+	Required int64 `json:"required"`
+}
+
+// stashPrimedSize records a prime of the mount at stagingPath.
+func stashPrimedSize(stagingPath string, p primedSize) error {
+	return stashContext(p, filepath.Dir(stagingPath), primedSizeFileName)
+}
+
+// lookupPrimedSize returns the last prime recorded for the mount at
+// stagingPath, and false when there is none.
+func lookupPrimedSize(stagingPath string) (*primedSize, bool) {
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(stagingPath), primedSizeFileName))
+	if err != nil {
+		return nil, false
+	}
+	var p primedSize
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, false
+	}
+	return &p, true
+}
+
+// recordPrime records a prime of the mount at stagingPath just taken, at the
+// size the mount shows now, for an expansion to required bytes (zero at stage).
+func recordPrime(stagingPath string, required int64) error {
+	size, err := mountSize(stagingPath)
+	if err != nil {
+		return err
+	}
+	return stashPrimedSize(stagingPath, primedSize{Size: size, Required: required})
 }

@@ -5,6 +5,7 @@ package node
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"golang.org/x/sys/unix"
@@ -47,25 +48,30 @@ func (ns *Server) NodeExpandVolume(
 	// The controller only recorded the new size, and the metadata server grows
 	// the filesystem afterward, on its own time. A prime taken before that
 	// resolves the device ID the grow is about to replace, and the pods then
-	// resolve the new one themselves. So the prime waits until this mount shows
-	// the size asked for, and until then the expansion is not done here: an
-	// Unavailable error, which kubelet retries.
+	// resolve the new one themselves. So the prime waits until the grow has
+	// reached this mount, and until then the expansion is not done here: an
+	// Unavailable error, which kubelet retries. See pnfsGrowPending.
 	if isPNFSVolume(volumeContext) {
 		stagingTargetPath := getStagingTargetPath(req)
-		if required := req.GetCapacityRange().GetRequiredBytes(); required > 0 {
+		required := req.GetCapacityRange().GetRequiredBytes()
+		if required > 0 {
 			have, err := mountSize(stagingTargetPath)
 			if err != nil {
 				return nil, status.Errorf(codes.Internal, "failed to read the size of volume %s's mount: %v", volumeID, err)
 			}
-			if !pnfsGrowArrived(have, required) {
+			if pending, why := pnfsGrowPending(stagingTargetPath, have, required); pending {
 				return nil, status.Errorf(codes.Unavailable,
-					"volume %s's mount shows %d bytes, not yet the %d asked for: the export has not grown yet",
-					volumeID, have, required)
+					"volume %s's export has not grown on this node yet: %s", volumeID, why)
 			}
 		}
 		if err := primeLayout(ctx, stagingTargetPath); err != nil {
 			return nil, status.Errorf(codes.Internal,
 				"failed to re-prime the layout of volume %s after its expansion: %v", volumeID, err)
+		}
+		// Only after a prime that succeeded, so a failed one is waited for again.
+		if err := recordPrime(stagingTargetPath, required); err != nil {
+			klog.Warningf("pnfs: could not record the prime of %s, so the next expansion waits by size "+
+				"alone: %v", stagingTargetPath, err)
 		}
 		klog.Infof("volume %s is served by an export: grew nothing, and re-took its layout", volumeID)
 		return &csi.NodeExpandVolumeResponse{}, nil
@@ -100,6 +106,32 @@ func mountSize(path string) (int64, error) {
 	}
 	// In uint64 and converted once: Bsize is int64 on Linux and uint32 on darwin.
 	return int64(s.Blocks * uint64(s.Bsize)), nil
+}
+
+// pnfsGrowPending reports whether the grow an expansion to required bytes is
+// about has yet to reach a pNFS mount that shows have bytes, and why.
+//
+// With the mount's last prime on record, the grow has arrived once the mount
+// shows more than it did then, however small the grow: a size tolerance would
+// take a grow smaller than itself as there before it is. A request for a size
+// already primed for is kubelet asking again, and is answered. The caller
+// asks only with a size to wait for.
+//
+// Without a record, which is a volume staged before the record existed or one
+// whose prime at stage failed, the mount is compared with the size asked for,
+// less a tolerance. That takes a grow smaller than the tolerance as arrived
+// early, and is kept only so those volumes expand at all.
+func pnfsGrowPending(stagingPath string, have, required int64) (bool, string) {
+	if last, ok := lookupPrimedSize(stagingPath); ok {
+		if last.Required >= required || have > last.Size {
+			return false, ""
+		}
+		return true, fmt.Sprintf("the mount shows %d bytes, no more than at its last prime", have)
+	}
+	if pnfsGrowArrived(have, required) {
+		return false, ""
+	}
+	return true, fmt.Sprintf("the mount shows %d bytes, not yet the %d asked for", have, required)
 }
 
 // pnfsGrowArrived reports whether a pNFS mount showing have bytes has reached

@@ -184,6 +184,10 @@ func (ns *Server) NodeUnstageVolume(
 			klog.Errorf("failed to clean up pNFS volume context, volumeID: %s err: %v", volumeID, err)
 			return nil, status.Error(codes.Internal, err.Error())
 		}
+		if err := cleanUpContext(stagingParentPath, primedSizeFileName); err != nil {
+			klog.Errorf("failed to clean up the pNFS prime record, volumeID: %s err: %v", volumeID, err)
+			return nil, status.Error(codes.Internal, err.Error())
+		}
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 

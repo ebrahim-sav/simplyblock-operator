@@ -953,6 +953,17 @@ func TestExpandOfAPNFSVolumeReportsALayoutItCouldNotPrime(t *testing.T) {
 // directory, so the size compared is that of the filesystem the test runs on.
 func pnfsExpand(t *testing.T, required int64) (bool, error) {
 	t.Helper()
+	primed, _, err := pnfsExpandRecorded(t, required, nil)
+	return primed, err
+}
+
+// pnfsExpandRecorded is pnfsExpand on a volume whose last prime was recorded:
+// record, given the mount's current statfs size, returns what to stash, or nil
+// for none. It also returns the record found afterward, before the error.
+func pnfsExpandRecorded(
+	t *testing.T, required int64, record func(have int64) *primedSize,
+) (bool, *primedSize, error) {
+	t.Helper()
 	runner := newRecordingRunner()
 	ns, _ := newStackedServer(t, runner)
 
@@ -961,6 +972,19 @@ func pnfsExpand(t *testing.T, required int64) (bool, error) {
 	parent := stashedAt(t, vc)
 	if err := os.MkdirAll(filepath.Join(parent, pvcTestHandle), 0o755); err != nil {
 		t.Fatalf("create the staging path: %v", err)
+	}
+
+	staging := filepath.Join(parent, pvcTestHandle)
+	if record != nil {
+		have, err := mountSize(staging)
+		if err != nil {
+			t.Fatalf("statfs the staging path: %v", err)
+		}
+		if r := record(have); r != nil {
+			if err := stashPrimedSize(staging, *r); err != nil {
+				t.Fatalf("stash the primed size: %v", err)
+			}
+		}
 	}
 
 	primed := false
@@ -978,7 +1002,8 @@ func pnfsExpand(t *testing.T, required int64) (bool, error) {
 		VolumeCapability:  mountCapability(),
 		CapacityRange:     &csi.CapacityRange{RequiredBytes: required},
 	})
-	return primed, err
+	after, _ := lookupPrimedSize(staging)
+	return primed, after, err
 }
 
 // The controller only records the new size, and the metadata server grows the
@@ -1041,5 +1066,107 @@ func TestPNFSGrowArrived(t *testing.T) {
 		if got := pnfsGrowArrived(tc.have, tc.required); got != tc.want {
 			t.Errorf("%s: pnfsGrowArrived(%d, %d) = %v, want %v", tc.name, tc.have, tc.required, got, tc.want)
 		}
+	}
+}
+
+// A grow smaller than the size tolerance reads as arrived before it is there.
+// With the size the node last primed at on record, the expansion waits for the
+// mount to grow past it instead, however small the grow: a prime taken early is
+// one the re-armed layout hold does not count, and with pnfs-os 0006 gone the
+// pods then look the new device up in their own namespace.
+func TestExpandOfAPNFSVolumeWaitsForASmallGrowPastTheRecordedSize(t *testing.T) {
+	var have int64
+	record := func(h int64) *primedSize {
+		have = h
+		return &primedSize{Size: h}
+	}
+	// A first expansion only to learn the mount's size.
+	primed, _, err := pnfsExpandRecorded(t, 0, record)
+	if err != nil || !primed {
+		t.Fatalf("baseline expansion without a size: primed %v, %v", primed, err)
+	}
+	// A 100 MiB grow, below the tolerance of any filesystem a test runs on.
+	primed, _, err = pnfsExpandRecorded(t, have+100<<20, func(h int64) *primedSize {
+		return &primedSize{Size: h}
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("NodeExpandVolume = %v, want Unavailable until the mount grows past the recorded size", err)
+	}
+	if primed {
+		t.Error("took the layout before a grow smaller than the tolerance reached the mount")
+	}
+}
+
+// A grow that reached the mount before the first call is past the recorded
+// size already, so the expansion primes, and records the size it primed at with
+// the size asked for.
+func TestExpandOfAPNFSVolumePrimesAGrowPastTheRecordedSize(t *testing.T) {
+	const required = int64(1) << 50
+	primed, after, err := pnfsExpandRecorded(t, required, func(h int64) *primedSize {
+		return &primedSize{Size: h - 1<<20}
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume: %v", err)
+	}
+	if !primed {
+		t.Error("the mount had grown past the recorded size and the layout was not taken")
+	}
+	if after == nil || after.Required != required {
+		t.Errorf("record after the prime = %+v, want the size asked for, %d", after, required)
+	}
+}
+
+// kubelet can ask again for a size it was already answered for. The mount has
+// not grown past the record then, and need not: the size was primed for.
+func TestExpandOfAPNFSVolumeAnswersARepeatedRequestForASizePrimedFor(t *testing.T) {
+	const required = int64(1) << 50
+	primed, _, err := pnfsExpandRecorded(t, required, func(h int64) *primedSize {
+		return &primedSize{Size: h, Required: required}
+	})
+	if err != nil {
+		t.Fatalf("NodeExpandVolume for a size already primed for: %v", err)
+	}
+	if !primed {
+		t.Error("a repeated request was answered without the layout taken again")
+	}
+}
+
+// A failed prime leaves the record as it was, so the next call waits for the
+// same grow again rather than taking it as primed.
+func TestExpandOfAPNFSVolumeKeepsTheRecordWhenThePrimeFails(t *testing.T) {
+	open := openProbe
+	openProbe = func(string, int, os.FileMode) (*os.File, error) { return nil, errors.New("no probe") }
+	t.Cleanup(func() { openProbe = open })
+
+	var before int64
+	_, after, err := pnfsExpandRecorded(t, 1<<50, func(h int64) *primedSize {
+		before = h - 1<<20
+		return &primedSize{Size: before}
+	})
+	if err == nil {
+		t.Fatal("NodeExpandVolume reported success without priming the layout")
+	}
+	if after == nil || after.Size != before || after.Required != 0 {
+		t.Errorf("record after a failed prime = %+v, want it unchanged at size %d", after, before)
+	}
+}
+
+// A prime at stage is recorded at the size the mount shows, with no size asked
+// for, which is what the first expansion waits to see exceeded.
+func TestAPrimeAtStageRecordsTheMountSize(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), pvcTestHandle)
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatalf("create the staging path: %v", err)
+	}
+	if err := recordPrime(staging, 0); err != nil {
+		t.Fatalf("recordPrime: %v", err)
+	}
+	have, err := mountSize(staging)
+	if err != nil {
+		t.Fatalf("statfs: %v", err)
+	}
+	got, ok := lookupPrimedSize(staging)
+	if !ok || got.Size != have || got.Required != 0 {
+		t.Errorf("record = %+v (found %v), want size %d and no size asked for", got, ok, have)
 	}
 }
