@@ -17,6 +17,13 @@ Options:
                            or \$HELM_RELEASE)
       --csi-driver NAME    CSI driver name whose PVs are cleaned up
                            (default: csi.simplyblock.io, or \$CSI_DRIVER)
+      --purge-all          Also remove what lives outside NAMESPACE: simplyblock CRs
+                           in other namespaces, pods and claims on CSI driver
+                           volumes, and every StorageClass of the CSI driver.
+                           Without it those are reported and left, and a CRD that
+                           still has such a CR is not deleted.
+      --delete-namespace   Delete NAMESPACE itself at the end, with everything
+                           left in it (Secrets, ConfigMaps, Services).
   -h, --help               Show this help message
 EOF
     exit 0
@@ -35,6 +42,8 @@ FORCE=false
 NAMESPACE=""
 HELM_RELEASE_ARG=""
 CSI_DRIVER_ARG=""
+PURGE_ALL=false
+DELETE_NAMESPACE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -44,6 +53,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             usage
+            ;;
+        --purge-all)
+            PURGE_ALL=true
+            shift
+            ;;
+        --delete-namespace)
+            DELETE_NAMESPACE=true
+            shift
             ;;
         --helm-release)
             require_value "$1" "${2:-}"
@@ -118,6 +135,7 @@ echo -e "  Cluster:      ${RED}${CLUSTER_NAME}${NC}"
 echo -e "  Namespace:    ${RED}${NAMESPACE}${NC}"
 echo -e "  Helm release: ${RED}${HELM_RELEASE}${NC}"
 echo -e "  CSI driver:   ${RED}${CSI_DRIVER}${NC}"
+echo -e "  Purge all namespaces: ${RED}${PURGE_ALL}${NC}   Delete namespace: ${RED}${DELETE_NAMESPACE}${NC}"
 echo ""
 
 if [[ "$FORCE" != true ]]; then
@@ -180,11 +198,11 @@ abort_before_uninstall() {
 # itself, or for a ReplicaSet the Deployment that owns it. Fails for an owner it
 # cannot stop.
 controller_of() {
-    local kind="$1" name="$2" parent
+    local kind="$1" name="$2" ns="${3:-$NAMESPACE}" parent
     case "$kind" in
         StatefulSet|DaemonSet|Job|Deployment) echo "$kind $name" ;;
         ReplicaSet)
-            parent=$($KUBECTL get replicaset "$name" -n "$NAMESPACE" -o \
+            parent=$($KUBECTL get replicaset "$name" -n "$ns" -o \
                 jsonpath='{range .metadata.ownerReferences[?(@.controller==true)]}{.kind} {.name}{end}' \
                 2>/dev/null) || return 1
             if [[ "$parent" == Deployment\ * ]]; then
@@ -334,6 +352,71 @@ else
     info "No pod in '$NAMESPACE' mounts a $CSI_DRIVER volume any more."
 fi
 
+# Prints the pods in every namespace but $NAMESPACE that mount a volume of
+# $CSI_DRIVER, one per line as `namespace name owner-kind owner-name`. Their
+# volumes are served by the node plugin, so they go before the plugin does.
+pods_on_csi_volumes_elsewhere() {
+    local pods pvcs pvs
+    pods=$($KUBECTL get pods -A -o json 2>/dev/null) || return 1
+    pvcs=$($KUBECTL get pvc -A -o json 2>/dev/null) || return 1
+    pvs=$($KUBECTL get pv -o json 2>/dev/null) || return 1
+    PODS="$pods" PVCS="$pvcs" PVS="$pvs" DRIVER="$CSI_DRIVER" NS="$NAMESPACE" python3 -c '
+import json, os
+driver, home = os.environ["DRIVER"], os.environ["NS"]
+on_driver = {p["metadata"]["name"] for p in json.loads(os.environ["PVS"])["items"]
+             if (p["spec"].get("csi") or {}).get("driver") == driver}
+claims = {(c["metadata"]["namespace"], c["metadata"]["name"])
+          for c in json.loads(os.environ["PVCS"])["items"]
+          if c["spec"].get("volumeName") in on_driver}
+for p in json.loads(os.environ["PODS"])["items"]:
+    ns = p["metadata"]["namespace"]
+    if ns == home:
+        continue
+    vols = p["spec"].get("volumes", [])
+    used = {(ns, (v.get("persistentVolumeClaim") or {}).get("claimName")) for v in vols}
+    if used & claims or any(v.get("csi", {}).get("driver") == driver for v in vols):
+        owner = next((o for o in p["metadata"].get("ownerReferences", []) if o.get("controller")), {})
+        print(ns, p["metadata"]["name"], owner.get("kind", "-"), owner.get("name", "-"))
+'
+}
+
+# ---------------------------------------------------------------------------
+# 0b. Release CSI volumes mounted in other namespaces (--purge-all)
+# ---------------------------------------------------------------------------
+section "Releasing $CSI_DRIVER volumes mounted outside '$NAMESPACE'"
+
+if ! elsewhere=$(pods_on_csi_volumes_elsewhere); then
+    abort_before_uninstall "Could not list the pods, claims, and volumes in all namespaces."
+elif [[ -z "$elsewhere" ]]; then
+    info "No pod outside '$NAMESPACE' mounts a $CSI_DRIVER volume."
+elif [[ "$PURGE_ALL" != true ]]; then
+    warn "Pods outside '$NAMESPACE' mount $CSI_DRIVER volumes; they are left and will hang"
+    warn "in Terminating once the node plugin is gone. Re-run with --purge-all to remove them:"
+    while read -r ns pod _; do warn "  $ns/$pod"; done <<< "$elsewhere"
+else
+    controllers=""
+    while read -r ns pod kind owner; do
+        controller=$(controller_of "$kind" "$owner" "$ns") || \
+            abort_before_uninstall "Pod $ns/$pod is owned by $kind $owner, which this script cannot stop."
+        [[ -n "$controller" ]] && controllers+="$ns $controller"$'\n'
+    done <<< "$elsewhere"
+    while read -r ns kind name; do
+        [[ -z "$kind" ]] && continue
+        info "Deleting $kind $ns/$name, whose pods mount $CSI_DRIVER volumes..."
+        $KUBECTL delete "$kind" "$name" -n "$ns" --ignore-not-found \
+            --wait=false >/dev/null 2>&1 || abort_before_uninstall "Could not delete $kind $ns/$name."
+    done <<< "$(echo "$controllers" | sort -u)"
+    while read -r ns pod _; do
+        $KUBECTL delete pod "$pod" -n "$ns" --ignore-not-found \
+            --wait=false >/dev/null 2>&1 || abort_before_uninstall "Could not delete pod $ns/$pod."
+    done <<< "$elsewhere"
+    while read -r ns pod _; do
+        $KUBECTL wait pod "$pod" -n "$ns" --for=delete --timeout=180s >/dev/null 2>&1 || \
+            abort_before_uninstall "Pod $ns/$pod still exists after 180s."
+    done <<< "$elsewhere"
+    info "Pods outside '$NAMESPACE' on $CSI_DRIVER volumes are gone."
+fi
+
 # ---------------------------------------------------------------------------
 # 1. Helm uninstall
 # ---------------------------------------------------------------------------
@@ -353,6 +436,23 @@ fi
 section "Removing CRs and finalizers"
 
 CRDS=$($KUBECTL get crd -o name 2>/dev/null | grep "$CRD_GROUP" | sed 's|customresourcedefinition.apiextensions.k8s.io/||')
+
+# CRs in other namespaces keep their CRD from being deleted in step 5, and with
+# the operator gone nothing clears their finalizers.
+if [[ "$PURGE_ALL" == true ]]; then
+    for crd in $CRDS; do
+        $KUBECTL get "$crd" -A --ignore-not-found --no-headers \
+            -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name 2>/dev/null | \
+        while read -r ns name; do
+            [[ -z "$name" || "$ns" == "$NAMESPACE" || "$ns" == "<none>" ]] && continue
+            info "  Deleting $crd/$name in namespace $ns..."
+            $KUBECTL patch "$crd" "$name" -n "$ns" --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+            $KUBECTL delete "$crd" "$name" -n "$ns" --ignore-not-found --timeout=30s \
+                >/dev/null 2>&1 || warn "  Could not delete $crd/$name in $ns"
+        done
+    done
+fi
 
 for crd in $CRDS; do
     resources=$($KUBECTL get "$crd" -n "$NAMESPACE" --ignore-not-found -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
@@ -608,6 +708,29 @@ else
     done
 fi
 
+if [[ "$PURGE_ALL" == true ]]; then
+    info "Purging every $CSI_DRIVER PVC, PV, and StorageClass in the cluster..."
+    for pv in $($KUBECTL get pv -o jsonpath="{range .items[?(@.spec.csi.driver==\"${CSI_DRIVER}\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null); do
+        claim=$($KUBECTL get pv "$pv" -o jsonpath='{.spec.claimRef.namespace}/{.spec.claimRef.name}' 2>/dev/null || true)
+        if [[ "$claim" != "/" && -n "$claim" ]]; then
+            $KUBECTL patch pvc "${claim#*/}" -n "${claim%%/*}" --type=merge \
+                -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+            $KUBECTL delete pvc "${claim#*/}" -n "${claim%%/*}" --ignore-not-found --timeout=30s >/dev/null 2>&1 || true
+        fi
+        info "  Deleting PV $pv (claim ${claim:-none})..."
+        $KUBECTL patch pv "$pv" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        $KUBECTL delete pv "$pv" --ignore-not-found --timeout=30s >/dev/null 2>&1 || warn "  Could not delete PV $pv"
+    done
+    for sc in $($KUBECTL get storageclass -o jsonpath="{range .items[?(@.provisioner==\"${CSI_DRIVER}\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null); do
+        info "  Deleting StorageClass $sc..."
+        $KUBECTL delete storageclass "$sc" --ignore-not-found --timeout=30s >/dev/null 2>&1 || warn "  Could not delete StorageClass $sc"
+    done
+    for va in $($KUBECTL get volumeattachments -o jsonpath="{range .items[?(@.spec.attacher==\"${CSI_DRIVER}\")]}{.metadata.name}{\"\\n\"}{end}" 2>/dev/null); do
+        $KUBECTL patch volumeattachment "$va" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+        $KUBECTL delete volumeattachment "$va" --ignore-not-found --timeout=30s >/dev/null 2>&1 || true
+    done
+fi
+
 # ---------------------------------------------------------------------------
 # 4b. Remove Deployments in kube-system owned by this Helm release
 # ---------------------------------------------------------------------------
@@ -663,8 +786,81 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6. Remove cluster-scoped and namespaced leftovers Helm does not own
+# ---------------------------------------------------------------------------
+section "Removing RBAC, CSIDriver, and certificates left behind"
+
+# The operator, not Helm, creates the control plane's and the driver's ClusterRoles
+# and ClusterRoleBindings (labeled storage.simplyblock.io/managed-by), so neither
+# `helm uninstall` nor the CRD removal reaches them. A binding belongs to this
+# install when it binds a ServiceAccount of $NAMESPACE; a role, when such a binding
+# names it or no remaining binding does.
+rbac=$( { $KUBECTL get clusterrolebinding -o json; echo '|||'; $KUBECTL get clusterrole -o json; } 2>/dev/null | \
+    NS="$NAMESPACE" python3 -c '
+import json, os, sys
+bind_doc, role_doc = sys.stdin.read().split("|||")
+ns = os.environ["NS"]
+bindings = json.loads(bind_doc)["items"]
+roles = json.loads(role_doc)["items"]
+label = "storage.simplyblock.io/managed-by"
+def ours(b):
+    return any(s.get("kind") == "ServiceAccount" and s.get("namespace") == ns
+               for s in b.get("subjects") or []) and (
+        label in (b["metadata"].get("labels") or {}) or b["metadata"]["name"].startswith("simplyblock-"))
+mine = [b for b in bindings if ours(b)]
+kept = [b for b in bindings if not ours(b)]
+still_used = {b["roleRef"]["name"] for b in kept}
+for b in mine:
+    print("clusterrolebinding", b["metadata"]["name"])
+names = {b["roleRef"]["name"] for b in mine if b["roleRef"]["name"].startswith("simplyblock-")}
+names |= {r["metadata"]["name"] for r in roles if label in (r["metadata"].get("labels") or {})}
+for n in sorted(names - still_used):
+    print("clusterrole", n)
+') || { warn "Could not list ClusterRoles and bindings; leaving them."; rbac=""; }
+while read -r kind name; do
+    [[ -z "$name" ]] && continue
+    info "Deleting $kind $name..."
+    $KUBECTL delete "$kind" "$name" --ignore-not-found --timeout=30s >/dev/null 2>&1 || \
+        warn "  Could not delete $kind $name"
+done <<< "$rbac"
+
+# The CSIDriver object outlives the node plugin and makes kubelet expect it.
+if [[ -n "$($KUBECTL get csidriver "$CSI_DRIVER" --ignore-not-found -o name 2>/dev/null)" ]]; then
+    remaining_pvs=$($KUBECTL get pv -o jsonpath="{range .items[?(@.spec.csi.driver==\"${CSI_DRIVER}\")]}{.metadata.name} {end}" 2>/dev/null || true)
+    if [[ -n "$remaining_pvs" ]]; then
+        warn "CSIDriver $CSI_DRIVER kept: PVs still use it ($remaining_pvs). Use --purge-all."
+    else
+        info "Deleting CSIDriver $CSI_DRIVER..."
+        $KUBECTL delete csidriver "$CSI_DRIVER" --ignore-not-found --timeout=30s >/dev/null 2>&1 || \
+            warn "  Could not delete CSIDriver $CSI_DRIVER"
+    fi
+fi
+
+# cert-manager reissues what a Certificate names, so the Secrets of a stale
+# Certificate are removed with it, and a fresh install starts from a new CA.
+if $KUBECTL get crd certificates.cert-manager.io >/dev/null 2>&1; then
+    for cert in $($KUBECTL get certificates.cert-manager.io -n "$NAMESPACE" -o name 2>/dev/null); do
+        secret=$($KUBECTL get "$cert" -n "$NAMESPACE" -o jsonpath='{.spec.secretName}' 2>/dev/null || true)
+        info "Deleting $cert and its Secret ${secret:-<none>}..."
+        $KUBECTL delete "$cert" -n "$NAMESPACE" --ignore-not-found --timeout=30s >/dev/null 2>&1 || true
+        [[ -n "$secret" ]] && $KUBECTL delete secret "$secret" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+    done
+    $KUBECTL delete issuers.cert-manager.io --all -n "$NAMESPACE" --ignore-not-found --timeout=30s >/dev/null 2>&1 || true
+fi
+for secret in $($KUBECTL get secret -n "$NAMESPACE" --field-selector type=kubernetes.io/tls -o name 2>/dev/null); do
+    info "Deleting TLS $secret..."
+    $KUBECTL delete "$secret" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+done
+
+# ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
+if [[ "$DELETE_NAMESPACE" == true ]]; then
+    section "Deleting namespace '$NAMESPACE'"
+    $KUBECTL delete namespace "$NAMESPACE" --ignore-not-found --timeout=120s || \
+        warn "Namespace '$NAMESPACE' did not terminate within 120s."
+fi
+
 section "Cleanup complete"
 info "Namespace: $NAMESPACE"
-info "If the namespace itself should be removed, run: $KUBECTL delete namespace $NAMESPACE"
+[[ "$DELETE_NAMESPACE" == true ]] || info "To also remove the namespace and its remaining Secrets and ConfigMaps, re-run with --delete-namespace or run: $KUBECTL delete namespace $NAMESPACE"
