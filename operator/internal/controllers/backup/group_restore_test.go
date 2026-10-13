@@ -246,8 +246,8 @@ func drainEvents(rec events.EventRecorder) []string {
 	}
 }
 
-func containsEvent(events []string, reason string) bool {
-	for _, e := range events {
+func containsEvent(seen []string, reason string) bool {
+	for _, e := range seen {
 		if strings.Contains(e, reason) {
 			return true
 		}
