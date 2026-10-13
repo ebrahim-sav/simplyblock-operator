@@ -376,6 +376,75 @@ func (c *Client) RestoreBackup(
 	return restored.LvolID, nil
 }
 
+// RestoreGroupBackupParams are the inputs for restoring a whole consistency-group
+// backup into a new consistency group.
+type RestoreGroupBackupParams struct {
+	// GroupBackupID is the control-plane group backup to restore, as a bare UUID
+	// or the "<cluster>/<UUID>" composite the group-backup-id label carries.
+	GroupBackupID string
+	// IntoGroupName is the NEW consistency group the restored volumes form. It
+	// must not already exist: a group restore always produces a new group.
+	IntoGroupName string
+	// Pool is the pool to restore every member into, by name.
+	Pool string
+	// TargetNodeID pins every restored volume to one storage node. Empty lets the
+	// control plane choose, then pins the rest of the members to the first's node.
+	TargetNodeID string
+}
+
+// RestoreGroupBackup asks the control plane to read every member of a group
+// backup out of the store into a new consistency group of logical volumes, all
+// or nothing, and returns the new group's id and the restored member volume ids.
+//
+// The call returns as soon as the restore is accepted; each member volume
+// recovers afterward and reports its own progress, the same as a single-volume
+// restore. The endpoint declares no response model, so the body is decoded here.
+func (c *Client) RestoreGroupBackup(
+	ctx context.Context, clusterID string, params RestoreGroupBackupParams,
+) (string, []string, error) {
+	cluster, err := parseUUID("cluster id", clusterID)
+	if err != nil {
+		return "", nil, err
+	}
+	// The endpoint keys on the UUID. Callers carry the id as a bare UUID or the
+	// composite the label uses, so take the last path segment before parsing.
+	id := params.GroupBackupID
+	if i := strings.LastIndex(id, "/"); i >= 0 {
+		id = id[i+1:]
+	}
+	groupBackup, err := parseUUID("group backup id", id)
+	if err != nil {
+		return "", nil, err
+	}
+
+	body := cpapi.UnderscoreGroupRestoreParams{
+		IntoGroupName: params.IntoGroupName,
+		Pool:          params.Pool,
+	}
+	if params.TargetNodeID != "" {
+		body.TargetNodeId = ptr.To(params.TargetNodeID)
+	}
+
+	what := "restore group backup " + params.GroupBackupID
+	resp, err := c.api.ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse(
+		ctx, cluster, groupBackup, body)
+	if err != nil {
+		return "", nil, fmt.Errorf("%s: %w", what, err)
+	}
+	restored, err := decodeBody[struct {
+		GroupID string   `json:"group_id"`
+		LvolIDs []string `json:"lvol_ids"`
+	}](what, resp.StatusCode(), resp.Body)
+	if err != nil {
+		return "", nil, err
+	}
+	if restored.GroupID == "" || len(restored.LvolIDs) == 0 {
+		return "", nil, fmt.Errorf(
+			"%s: the response named no restored group or volumes: %w", what, errs.ErrInvalidResponse)
+	}
+	return restored.GroupID, restored.LvolIDs, nil
+}
+
 // okOrGone accepts a success and a 404 alike, which is what makes a delete
 // idempotent: the caller asked for the resource to be absent, and it is.
 func okOrGone(what string, code int, body []byte) error {

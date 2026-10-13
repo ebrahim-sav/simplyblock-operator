@@ -67,6 +67,15 @@ func (r *StorageBackupOpsReconciler) perform(
 func (r *StorageBackupOpsReconciler) validate(
 	ctx context.Context, ops *simplyblockv1alpha2.StorageBackupOps,
 ) (bool, error) {
+	// A group restore (spec.groupBackupID) is admitted by the webhook, but its
+	// drive is not yet wired: fan out N member recoveries at Restoring, wait at
+	// AwaitingVolumes, then bind one claim per member at Binding. Fail fast with a
+	// clear reason rather than entering the single-backup path, whose BackupRef is
+	// empty for a group operation.
+	if ops.Spec.GroupBackupID != "" {
+		return false, fatalf("group restore (spec.groupBackupID %s) is not yet supported by this operator version", ops.Spec.GroupBackupID)
+	}
+
 	restore := ops.Spec.Restore
 	if restore == nil {
 		return false, fatalf("action %s needs a spec.restore block and has none", ops.Spec.Action)

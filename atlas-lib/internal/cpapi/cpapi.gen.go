@@ -598,6 +598,7 @@ const (
 	DeviceRestart         TaskDTOFunctionName = "device_restart"
 	FailedDeviceMigration TaskDTOFunctionName = "failed_device_migration"
 	FdbBackup             TaskDTOFunctionName = "fdb_backup"
+	GroupBackupCommit     TaskDTOFunctionName = "group_backup_commit"
 	JcCompResume          TaskDTOFunctionName = "jc_comp_resume"
 	LvolBatchMigration    TaskDTOFunctionName = "lvol_batch_migration"
 	LvolMigration         TaskDTOFunctionName = "lvol_migration"
@@ -633,6 +634,8 @@ func (e TaskDTOFunctionName) Valid() bool {
 	case FailedDeviceMigration:
 		return true
 	case FdbBackup:
+		return true
+	case GroupBackupCommit:
 		return true
 	case JcCompResume:
 		return true
@@ -1513,6 +1516,33 @@ type FailoverResultDTO struct {
 // FailoverResultDTOStatus defines model for FailoverResultDTO.Status.
 type FailoverResultDTOStatus string
 
+// GroupBackupDTO A consistency-group backup: the member backups of one generation as one
+// all-or-nothing unit (design §4.1).
+type GroupBackupDTO struct {
+	ClusterId            openapi_types.UUID     `json:"cluster_id"`
+	CompletedAt          int                    `json:"completed_at"`
+	ConsistencyGroupId   string                 `json:"consistency_group_id"`
+	ConsistencyGroupName string                 `json:"consistency_group_name"`
+	CreatedAt            int                    `json:"created_at"`
+	Encrypted            bool                   `json:"encrypted"`
+	ErrorMessage         *string                `json:"error_message,omitempty"`
+	GroupSeq             int                    `json:"group_seq"`
+	Id                   openapi_types.UUID     `json:"id"`
+	Members              []GroupBackupMemberDTO `json:"members"`
+	Size                 int                    `json:"size"`
+	Status               string                 `json:"status"`
+}
+
+// GroupBackupMemberDTO One member of a group backup: the source volume and its own backup.
+//
+// “backup_id“ is the member “Backup“'s composite “cluster_id/uuid“ id and
+// “lvol_id“ the source volume's id, kept as strings rather than UUIDs because
+// the member id is composite (design §4.1).
+type GroupBackupMemberDTO struct {
+	BackupId string `json:"backup_id"`
+	LvolId   string `json:"lvol_id"`
+}
+
 // GroupFailbackParams defines model for GroupFailbackParams.
 type GroupFailbackParams struct {
 	SourceClusterId *openapi_types.UUID `json:"source_cluster_id,omitempty"`
@@ -2169,6 +2199,19 @@ type CreateParamsHaType string
 // CreateParamsPriorityClass defines model for CreateParams.PriorityClass.
 type CreateParamsPriorityClass int
 
+// UnderscoreGroupBackupCreateParams defines model for _GroupBackupCreateParams.
+type UnderscoreGroupBackupCreateParams struct {
+	GroupSeq *int `json:"group_seq,omitempty"`
+}
+
+// UnderscoreGroupRestoreParams defines model for _GroupRestoreParams.
+type UnderscoreGroupRestoreParams struct {
+	IntoGroupName string         `json:"into_group_name"`
+	Pool          string         `json:"pool"`
+	S3Credentials *S3Credentials `json:"s3_credentials,omitempty"`
+	TargetNodeId  *string        `json:"target_node_id,omitempty"`
+}
+
 // UnderscoreImportFromBucket Import whatever a bucket turns out to contain.
 //
 // The disaster-recovery path: it needs a bucket and credentials for it, and
@@ -2619,6 +2662,9 @@ type ClustersBackupsImportApiV2ClustersClusterIdBackupsImportPostJSONRequestBody
 // ClustersBackupsRestoreApiV2ClustersClusterIdBackupsRestorePostJSONRequestBody defines body for ClustersBackupsRestoreApiV2ClustersClusterIdBackupsRestorePost for application/json ContentType.
 type ClustersBackupsRestoreApiV2ClustersClusterIdBackupsRestorePostJSONRequestBody = UnderscoreRestoreParams
 
+// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody defines body for ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost for application/json ContentType.
+type ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody = UnderscoreGroupBackupCreateParams
+
 // ClustersConsistencyGroupsMembersJoinApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersPostJSONRequestBody defines body for ClustersConsistencyGroupsMembersJoinApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersPost for application/json ContentType.
 type ClustersConsistencyGroupsMembersJoinApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersPostJSONRequestBody = ConsistencyGroupMemberJoinDTO
 
@@ -2636,6 +2682,9 @@ type ClustersConsistencyGroupsReplicationConfigureApiV2ClustersClusterIdConsiste
 
 // ClustersConsistencyGroupsReplicationFailbackApiV2ClustersClusterIdConsistencyGroupsGroupIdReplicationFailbackPostJSONRequestBody defines body for ClustersConsistencyGroupsReplicationFailbackApiV2ClustersClusterIdConsistencyGroupsGroupIdReplicationFailbackPost for application/json ContentType.
 type ClustersConsistencyGroupsReplicationFailbackApiV2ClustersClusterIdConsistencyGroupsGroupIdReplicationFailbackPostJSONRequestBody = GroupFailbackParams
+
+// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody defines body for ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost for application/json ContentType.
+type ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody = UnderscoreGroupRestoreParams
 
 // ClustersReplicationPoliciesCreateApiV2ClustersClusterIdReplicationPoliciesPostJSONRequestBody defines body for ClustersReplicationPoliciesCreateApiV2ClustersClusterIdReplicationPoliciesPost for application/json ContentType.
 type ClustersReplicationPoliciesCreateApiV2ClustersClusterIdReplicationPoliciesPostJSONRequestBody = PolicyParams
@@ -3363,6 +3412,30 @@ type ClientInterface interface {
 	// Corresponds with GET /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/ (the `ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGet` operationId).
 	ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGet(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
+	// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBody Clusters:Consistency-Groups:Backups:Create
+	//
+	// Back up one generation of the group to S3 as one all-or-nothing unit
+	// (design §6). Takes a fresh crash-consistent generation unless ``group_seq``
+	// names an existing one. Returns the in-progress group backup; it commits once
+	// every member backup completes.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+	ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBody(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost Clusters:Consistency-Groups:Backups:Create
+	//
+	// Back up one generation of the group to S3 as one all-or-nothing unit
+	// (design §6). Takes a fresh crash-consistent generation unless ``group_seq``
+	// names an existing one. Returns the in-progress group backup; it commits once
+	// every member backup completes.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+	ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, body ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
 	// ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGet Clusters:Consistency-Groups:Members
 	//
 	// Corresponds with GET /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/members (the `ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGet` operationId).
@@ -3610,6 +3683,48 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /api/v2/clusters/{cluster_id}/expand (the `ClustersExpandApiV2ClustersClusterIdExpandPost` operationId).
 	ClustersExpandApiV2ClustersClusterIdExpandPost(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet Clusters:Group-Backups:List
+	//
+	// List the cluster's group backups, newest first.
+	//
+	// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/ (the `ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet` operationId).
+	ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete Clusters:Group-Backups:Delete
+	//
+	// Delete a group backup: its group manifest and its record. The member
+	// backups follow per-volume retention (design §9).
+	//
+	// Corresponds with DELETE /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete` operationId).
+	ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet Clusters:Group-Backups:Detail
+	//
+	// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet` operationId).
+	ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBody Clusters:Group-Backups:Restore
+	//
+	// Restore a group backup into a NEW consistency group, all-or-nothing
+	// (design §6). Returns the restored group id and the member volume ids; each
+	// volume recovers its data asynchronously, the same as a single-volume restore.
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+	ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBody(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost Clusters:Group-Backups:Restore
+	//
+	// Restore a group backup into a NEW consistency group, all-or-nothing
+	// (design §6). Returns the restored group id and the member volume ids; each
+	// volume recovers its data asynchronously, the same as a single-volume restore.
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+	ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, body ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ClustersIostatsApiV2ClustersClusterIdIostatsGet Clusters:Iostats
 	//
@@ -5119,6 +5234,50 @@ func (c *Client) ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistenc
 	return c.Client.Do(req)
 }
 
+// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBody Clusters:Consistency-Groups:Backups:Create
+//
+// Back up one generation of the group to S3 as one all-or-nothing unit
+// (design §6). Takes a fresh crash-consistent generation unless “group_seq“
+// names an existing one. Returns the in-progress group backup; it commits once
+// every member backup completes.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+func (c *Client) ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBody(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequestWithBody(c.Server, clusterId, groupId, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost Clusters:Consistency-Groups:Backups:Create
+//
+// Back up one generation of the group to S3 as one all-or-nothing unit
+// (design §6). Takes a fresh crash-consistent generation unless “group_seq“
+// names an existing one. Returns the in-progress group backup; it commits once
+// every member backup completes.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+func (c *Client) ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, body ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequest(c.Server, clusterId, groupId, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
 // ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGet Clusters:Consistency-Groups:Members
 //
 // Corresponds with GET /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/members (the `ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGet` operationId).
@@ -5617,6 +5776,98 @@ func (c *Client) ClustersConsistencyGroupsSnapshotsDetailApiV2ClustersClusterIdC
 // Corresponds with POST /api/v2/clusters/{cluster_id}/expand (the `ClustersExpandApiV2ClustersClusterIdExpandPost` operationId).
 func (c *Client) ClustersExpandApiV2ClustersClusterIdExpandPost(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewClustersExpandApiV2ClustersClusterIdExpandPostRequest(c.Server, clusterId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet Clusters:Group-Backups:List
+//
+// List the cluster's group backups, newest first.
+//
+// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/ (the `ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet` operationId).
+func (c *Client) ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetRequest(c.Server, clusterId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete Clusters:Group-Backups:Delete
+//
+// Delete a group backup: its group manifest and its record. The member
+// backups follow per-volume retention (design §9).
+//
+// Corresponds with DELETE /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete` operationId).
+func (c *Client) ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteRequest(c.Server, clusterId, groupBackupId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet Clusters:Group-Backups:Detail
+//
+// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet` operationId).
+func (c *Client) ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetRequest(c.Server, clusterId, groupBackupId)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBody Clusters:Group-Backups:Restore
+//
+// Restore a group backup into a NEW consistency group, all-or-nothing
+// (design §6). Returns the restored group id and the member volume ids; each
+// volume recovers its data asynchronously, the same as a single-volume restore.
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+func (c *Client) ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBody(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequestWithBody(c.Server, clusterId, groupBackupId, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost Clusters:Group-Backups:Restore
+//
+// Restore a group backup into a NEW consistency group, all-or-nothing
+// (design §6). Returns the restored group id and the member volume ids; each
+// volume recovers its data asynchronously, the same as a single-volume restore.
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+func (c *Client) ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, body ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequest(c.Server, clusterId, groupBackupId, body)
 	if err != nil {
 		return nil, err
 	}
@@ -9128,6 +9379,60 @@ func NewClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGr
 	return req, nil
 }
 
+// NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequest calls the generic ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost builder with application/json body
+func NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequest(server string, clusterId openapi_types.UUID, groupId openapi_types.UUID, body ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequestWithBody(server, clusterId, groupId, "application/json", bodyReader)
+}
+
+// NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequestWithBody constructs an http.Request for the ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost method, with any body, and a specified content type
+func NewClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostRequestWithBody(server string, clusterId openapi_types.UUID, groupId openapi_types.UUID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cluster_id", clusterId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "group_id", groupId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/v2/clusters/%s/consistency-groups/%s/backups", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetRequest constructs an http.Request for the ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGet method
 func NewClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetRequest(server string, clusterId openapi_types.UUID, groupId openapi_types.UUID) (*http.Request, error) {
 	var err error
@@ -10043,6 +10348,176 @@ func NewClustersExpandApiV2ClustersClusterIdExpandPostRequest(server string, clu
 	if err != nil {
 		return nil, err
 	}
+
+	return req, nil
+}
+
+// NewClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetRequest constructs an http.Request for the ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet method
+func NewClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetRequest(server string, clusterId openapi_types.UUID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cluster_id", clusterId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/v2/clusters/%s/group-backups/", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteRequest constructs an http.Request for the ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete method
+func NewClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteRequest(server string, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cluster_id", clusterId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "group_backup_id", groupBackupId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/v2/clusters/%s/group-backups/%s/", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetRequest constructs an http.Request for the ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet method
+func NewClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetRequest(server string, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cluster_id", clusterId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "group_backup_id", groupBackupId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/v2/clusters/%s/group-backups/%s/", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequest calls the generic ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost builder with application/json body
+func NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequest(server string, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, body ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequestWithBody(server, clusterId, groupBackupId, "application/json", bodyReader)
+}
+
+// NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequestWithBody constructs an http.Request for the ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost method, with any body, and a specified content type
+func NewClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostRequestWithBody(server string, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cluster_id", clusterId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "group_backup_id", groupBackupId, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: "uuid"})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/api/v2/clusters/%s/group-backups/%s/restore", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
 
 	return req, nil
 }
@@ -16131,6 +16606,30 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with GET /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/ (the `ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGet` operationId).
 	ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGetWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGetResponse, error)
 
+	// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBodyWithResponse Clusters:Consistency-Groups:Backups:Create
+	//
+	// Back up one generation of the group to S3 as one all-or-nothing unit
+	// (design §6). Takes a fresh crash-consistent generation unless ``group_seq``
+	// names an existing one. Returns the in-progress group backup; it commits once
+	// every member backup completes.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+	ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBodyWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse, error)
+
+	// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithResponse Clusters:Consistency-Groups:Backups:Create
+	//
+	// Back up one generation of the group to S3 as one all-or-nothing unit
+	// (design §6). Takes a fresh crash-consistent generation unless ``group_seq``
+	// names an existing one. Returns the in-progress group backup; it commits once
+	// every member backup completes.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+	ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, body ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody, reqEditors ...RequestEditorFn) (*ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse, error)
+
 	// ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetWithResponse Clusters:Consistency-Groups:Members
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -16406,6 +16905,54 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /api/v2/clusters/{cluster_id}/expand (the `ClustersExpandApiV2ClustersClusterIdExpandPost` operationId).
 	ClustersExpandApiV2ClustersClusterIdExpandPostWithResponse(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersExpandApiV2ClustersClusterIdExpandPostResponse, error)
+
+	// ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetWithResponse Clusters:Group-Backups:List
+	//
+	// List the cluster's group backups, newest first.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/ (the `ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet` operationId).
+	ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetWithResponse(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse, error)
+
+	// ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteWithResponse Clusters:Group-Backups:Delete
+	//
+	// Delete a group backup: its group manifest and its record. The member
+	// backups follow per-volume retention (design §9).
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete` operationId).
+	ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse, error)
+
+	// ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetWithResponse Clusters:Group-Backups:Detail
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet` operationId).
+	ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse, error)
+
+	// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBodyWithResponse Clusters:Group-Backups:Restore
+	//
+	// Restore a group backup into a NEW consistency group, all-or-nothing
+	// (design §6). Returns the restored group id and the member volume ids; each
+	// volume recovers its data asynchronously, the same as a single-volume restore.
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+	ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBodyWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse, error)
+
+	// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse Clusters:Group-Backups:Restore
+	//
+	// Restore a group backup into a NEW consistency group, all-or-nothing
+	// (design §6). Returns the restored group id and the member volume ids; each
+	// volume recovers its data asynchronously, the same as a single-volume restore.
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+	ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, body ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse, error)
 
 	// ClustersIostatsApiV2ClustersClusterIdIostatsGetWithResponse Clusters:Iostats
 	//
@@ -18662,6 +19209,54 @@ func (r ClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGr
 	return ""
 }
 
+type ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *GroupBackupDTO
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *HTTPValidationError
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) GetJSON201() *GroupBackupDTO {
+	return r.JSON201
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) GetJSON422() *HTTPValidationError {
+	return r.JSON422
+}
+
+// GetBody returns the raw response body bytes
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 type ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
@@ -19553,6 +20148,191 @@ func (r ClustersExpandApiV2ClustersClusterIdExpandPostResponse) StatusCode() int
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ClustersExpandApiV2ClustersClusterIdExpandPostResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *[]GroupBackupDTO
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *HTTPValidationError
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) GetJSON200() *[]GroupBackupDTO {
+	return r.JSON200
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) GetJSON422() *HTTPValidationError {
+	return r.JSON422
+}
+
+// GetBody returns the raw response body bytes
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *HTTPValidationError
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse) GetJSON422() *HTTPValidationError {
+	return r.JSON422
+}
+
+// GetBody returns the raw response body bytes
+func (r ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *GroupBackupDTO
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *HTTPValidationError
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) GetJSON200() *GroupBackupDTO {
+	return r.JSON200
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) GetJSON422() *HTTPValidationError {
+	return r.JSON422
+}
+
+// GetBody returns the raw response body bytes
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+type ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON202 the response for an HTTP 202 `application/json` response
+	JSON202 *interface{}
+	// JSON422 the response for an HTTP 422 `application/json` response
+	JSON422 *HTTPValidationError
+}
+
+// GetJSON202 returns the response for an HTTP 202 `application/json` response
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) GetJSON202() *interface{} {
+	return r.JSON202
+}
+
+// GetJSON422 returns the response for an HTTP 422 `application/json` response
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) GetJSON422() *HTTPValidationError {
+	return r.JSON422
+}
+
+// GetBody returns the raw response body bytes
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -24610,6 +25390,42 @@ func (c *ClientWithResponses) ClustersConsistencyGroupsDetailApiV2ClustersCluste
 	return ParseClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroupsGroupIdGetResponse(rsp)
 }
 
+// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBodyWithResponse Clusters:Consistency-Groups:Backups:Create
+//
+// Back up one generation of the group to S3 as one all-or-nothing unit
+// (design §6). Takes a fresh crash-consistent generation unless “group_seq“
+// names an existing one. Returns the in-progress group backup; it commits once
+// every member backup completes.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+func (c *ClientWithResponses) ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBodyWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse, error) {
+	rsp, err := c.ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithBody(ctx, clusterId, groupId, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse(rsp)
+}
+
+// ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithResponse Clusters:Consistency-Groups:Backups:Create
+//
+// Back up one generation of the group to S3 as one all-or-nothing unit
+// (design §6). Takes a fresh crash-consistent generation unless “group_seq“
+// names an existing one. Returns the in-progress group backup; it commits once
+// every member backup completes.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups (the `ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost` operationId).
+func (c *ClientWithResponses) ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupId openapi_types.UUID, body ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostJSONRequestBody, reqEditors ...RequestEditorFn) (*ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse, error) {
+	rsp, err := c.ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPost(ctx, clusterId, groupId, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse(rsp)
+}
+
 // ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetWithResponse Clusters:Consistency-Groups:Members
 //
 // Returns a wrapper object for the known response body format(s).
@@ -25040,6 +25856,84 @@ func (c *ClientWithResponses) ClustersExpandApiV2ClustersClusterIdExpandPostWith
 		return nil, err
 	}
 	return ParseClustersExpandApiV2ClustersClusterIdExpandPostResponse(rsp)
+}
+
+// ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetWithResponse Clusters:Group-Backups:List
+//
+// List the cluster's group backups, newest first.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/ (the `ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet` operationId).
+func (c *ClientWithResponses) ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetWithResponse(ctx context.Context, clusterId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse, error) {
+	rsp, err := c.ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGet(ctx, clusterId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse(rsp)
+}
+
+// ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteWithResponse Clusters:Group-Backups:Delete
+//
+// Delete a group backup: its group manifest and its record. The member
+// backups follow per-volume retention (design §9).
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete` operationId).
+func (c *ClientWithResponses) ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse, error) {
+	rsp, err := c.ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDelete(ctx, clusterId, groupBackupId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse(rsp)
+}
+
+// ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetWithResponse Clusters:Group-Backups:Detail
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/ (the `ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet` operationId).
+func (c *ClientWithResponses) ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse, error) {
+	rsp, err := c.ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGet(ctx, clusterId, groupBackupId, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse(rsp)
+}
+
+// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBodyWithResponse Clusters:Group-Backups:Restore
+//
+// Restore a group backup into a NEW consistency group, all-or-nothing
+// (design §6). Returns the restored group id and the member volume ids; each
+// volume recovers its data asynchronously, the same as a single-volume restore.
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+func (c *ClientWithResponses) ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBodyWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse, error) {
+	rsp, err := c.ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithBody(ctx, clusterId, groupBackupId, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse(rsp)
+}
+
+// ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse Clusters:Group-Backups:Restore
+//
+// Restore a group backup into a NEW consistency group, all-or-nothing
+// (design §6). Returns the restored group id and the member volume ids; each
+// volume recovers its data asynchronously, the same as a single-volume restore.
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore (the `ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost` operationId).
+func (c *ClientWithResponses) ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse(ctx context.Context, clusterId openapi_types.UUID, groupBackupId openapi_types.UUID, body ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostJSONRequestBody, reqEditors ...RequestEditorFn) (*ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse, error) {
+	rsp, err := c.ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePost(ctx, clusterId, groupBackupId, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse(rsp)
 }
 
 // ClustersIostatsApiV2ClustersClusterIdIostatsGetWithResponse Clusters:Iostats
@@ -27638,6 +28532,39 @@ func ParseClustersConsistencyGroupsDetailApiV2ClustersClusterIdConsistencyGroups
 	return response, nil
 }
 
+// ParseClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse parses an HTTP response from a ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostWithResponse call
+func ParseClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse(rsp *http.Response) (*ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ClustersConsistencyGroupsBackupsCreateApiV2ClustersClusterIdConsistencyGroupsGroupIdBackupsPostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest GroupBackupDTO
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest HTTPValidationError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetResponse parses an HTTP response from a ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetWithResponse call
 func ParseClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetResponse(rsp *http.Response) (*ClustersConsistencyGroupsMembersApiV2ClustersClusterIdConsistencyGroupsGroupIdMembersGetResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -28252,6 +29179,134 @@ func ParseClustersExpandApiV2ClustersClusterIdExpandPostResponse(rsp *http.Respo
 	switch {
 	case rsp.StatusCode == 202:
 		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest HTTPValidationError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse parses an HTTP response from a ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetWithResponse call
+func ParseClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse(rsp *http.Response) (*ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ClustersGroupBackupsListApiV2ClustersClusterIdGroupBackupsGetResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest []GroupBackupDTO
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest HTTPValidationError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse parses an HTTP response from a ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteWithResponse call
+func ParseClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse(rsp *http.Response) (*ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ClustersGroupBackupsDeleteApiV2ClustersClusterIdGroupBackupsGroupBackupIdDeleteResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest HTTPValidationError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse parses an HTTP response from a ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetWithResponse call
+func ParseClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse(rsp *http.Response) (*ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ClustersGroupBackupsDetailApiV2ClustersClusterIdGroupBackupsGroupBackupIdGetResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest GroupBackupDTO
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest HTTPValidationError
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON422 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse parses an HTTP response from a ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostWithResponse call
+func ParseClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse(rsp *http.Response) (*ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ClustersGroupBackupsRestoreApiV2ClustersClusterIdGroupBackupsGroupBackupIdRestorePostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest interface{}
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
 		var dest HTTPValidationError

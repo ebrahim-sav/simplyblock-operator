@@ -467,9 +467,9 @@ The S3 object at `groups/<group_backup_id>.json`, read by discovery and restore.
   "membership": {
     "expected_lvol_ids": ["<uuid>", "..."]
   },
-  "encryption": null,
+  "encrypted": false,
   "size": 0
 }
 ```
 
-`members` names the N member backups by `backup_id`; a reader then reads each `manifests/<backup_id>.json` to assemble that member's chain. `membership.expected_lvol_ids` is the generation's membership at the take, so a reader verifies completeness (`members` covers `expected_lvol_ids`) before restore, which is the `expected` versus `present` check (`design-consistency-groups.md` §8.3) encoded in the bucket. `encryption` is a `KeyDescriptor` or null, shared by all members in the homogeneous first version (§3.4). A `schema_version` the reader does not know is refused, as the per-backup manifest does.
+`members` names the N member backups by `backup_id`; a reader then reads each `manifests/<backup_id>.json` to assemble that member's chain. `membership.expected_lvol_ids` is the generation's membership at the take, so a reader verifies completeness (`members` covers `expected_lvol_ids`) before restore, which is the `expected` versus `present` check (`design-consistency-groups.md` §8.3) encoded in the bucket. `encrypted` is the shared disposition, not a key: each member has its own DEK recorded in its own `manifests/<backup_id>.json`, because the per-member backups carry per-volume keys and there is no group-level key (§3.4). A reader resolves per-member keys before a restore. A `schema_version` the reader does not know is refused, as the per-backup manifest does.

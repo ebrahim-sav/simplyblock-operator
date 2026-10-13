@@ -6633,6 +6633,234 @@
         }
       }
     },
+    "/api/v2/clusters/{cluster_id}/group-backups/": {
+      "get": {
+        "tags": [
+          "group-backups"
+        ],
+        "summary": "Clusters:Group-Backups:List",
+        "description": "List the cluster's group backups, newest first.",
+        "operationId": "clusters_group_backups_list_api_v2_clusters__cluster_id__group_backups__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Cluster Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/GroupBackupDTO"
+                  },
+                  "title": "Response Clusters Group Backups List Api V2 Clusters  Cluster Id  Group Backups  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/": {
+      "get": {
+        "tags": [
+          "group-backups"
+        ],
+        "summary": "Clusters:Group-Backups:Detail",
+        "operationId": "clusters_group_backups_detail_api_v2_clusters__cluster_id__group_backups__group_backup_id___get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Cluster Id"
+            }
+          },
+          {
+            "name": "group_backup_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Group Backup Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupBackupDTO"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "group-backups"
+        ],
+        "summary": "Clusters:Group-Backups:Delete",
+        "description": "Delete a group backup: its group manifest and its record. The member\nbackups follow per-volume retention (design \u00a79).",
+        "operationId": "clusters_group_backups_delete_api_v2_clusters__cluster_id__group_backups__group_backup_id___delete",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Cluster Id"
+            }
+          },
+          {
+            "name": "group_backup_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Group Backup Id"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/clusters/{cluster_id}/group-backups/{group_backup_id}/restore": {
+      "post": {
+        "tags": [
+          "group-backups"
+        ],
+        "summary": "Clusters:Group-Backups:Restore",
+        "description": "Restore a group backup into a NEW consistency group, all-or-nothing\n(design \u00a76). Returns the restored group id and the member volume ids; each\nvolume recovers its data asynchronously, the same as a single-volume restore.",
+        "operationId": "clusters_group_backups_restore_api_v2_clusters__cluster_id__group_backups__group_backup_id__restore_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Cluster Id"
+            }
+          },
+          {
+            "name": "group_backup_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Group Backup Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_GroupRestoreParams"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v2/clusters/{cluster_id}/subsystems/{nqn}/migrations/": {
       "get": {
         "summary": "Clusters:Subsystems:Migrations:List",
@@ -8746,6 +8974,75 @@
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/clusters/{cluster_id}/consistency-groups/{group_id}/backups": {
+      "post": {
+        "tags": [
+          "consistency-groups"
+        ],
+        "summary": "Clusters:Consistency-Groups:Backups:Create",
+        "description": "Back up one generation of the group to S3 as one all-or-nothing unit\n(design \u00a76). Takes a fresh crash-consistent generation unless ``group_seq``\nnames an existing one. Returns the in-progress group backup; it commits once\nevery member backup completes.",
+        "operationId": "clusters_consistency_groups_backups_create_api_v2_clusters__cluster_id__consistency_groups__group_id__backups_post",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Cluster Id"
+            }
+          },
+          {
+            "name": "group_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Group Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/_GroupBackupCreateParams"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GroupBackupDTO"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -11379,6 +11676,99 @@
         ],
         "title": "FailoverResultDTO"
       },
+      "GroupBackupDTO": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "cluster_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Cluster Id"
+          },
+          "consistency_group_id": {
+            "type": "string",
+            "title": "Consistency Group Id"
+          },
+          "consistency_group_name": {
+            "type": "string",
+            "title": "Consistency Group Name"
+          },
+          "group_seq": {
+            "type": "integer",
+            "title": "Group Seq"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/GroupBackupMemberDTO"
+            },
+            "type": "array",
+            "title": "Members"
+          },
+          "encrypted": {
+            "type": "boolean",
+            "title": "Encrypted"
+          },
+          "size": {
+            "type": "integer",
+            "title": "Size"
+          },
+          "created_at": {
+            "type": "integer",
+            "title": "Created At"
+          },
+          "completed_at": {
+            "type": "integer",
+            "title": "Completed At"
+          },
+          "error_message": {
+            "type": "string",
+            "title": "Error Message",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "cluster_id",
+          "consistency_group_id",
+          "consistency_group_name",
+          "group_seq",
+          "status",
+          "members",
+          "encrypted",
+          "size",
+          "created_at",
+          "completed_at"
+        ],
+        "title": "GroupBackupDTO",
+        "description": "A consistency-group backup: the member backups of one generation as one\nall-or-nothing unit (design \u00a74.1)."
+      },
+      "GroupBackupMemberDTO": {
+        "properties": {
+          "lvol_id": {
+            "type": "string",
+            "title": "Lvol Id"
+          },
+          "backup_id": {
+            "type": "string",
+            "title": "Backup Id"
+          }
+        },
+        "type": "object",
+        "required": [
+          "lvol_id",
+          "backup_id"
+        ],
+        "title": "GroupBackupMemberDTO",
+        "description": "One member of a group backup: the source volume and its own backup.\n\n``backup_id`` is the member ``Backup``'s composite ``cluster_id/uuid`` id and\n``lvol_id`` the source volume's id, kept as strings rather than UUIDs because\nthe member id is composite (design \u00a74.1)."
+      },
       "GroupFailbackParams": {
         "properties": {
           "source_cluster_id": {
@@ -13442,6 +13832,7 @@
               "s3_backup",
               "s3_backup_restore",
               "s3_backup_merge",
+              "group_backup_commit",
               "cluster_expand",
               "replication_final",
               "fdb_backup"
@@ -14378,6 +14769,62 @@
           "size"
         ],
         "title": "_CreateParams"
+      },
+      "_GroupBackupCreateParams": {
+        "properties": {
+          "group_seq": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Group Seq"
+          }
+        },
+        "type": "object",
+        "title": "_GroupBackupCreateParams"
+      },
+      "_GroupRestoreParams": {
+        "properties": {
+          "into_group_name": {
+            "type": "string",
+            "title": "Into Group Name"
+          },
+          "pool": {
+            "type": "string",
+            "title": "Pool"
+          },
+          "target_node_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Node Id"
+          },
+          "s3_credentials": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/S3Credentials"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "into_group_name",
+          "pool"
+        ],
+        "title": "_GroupRestoreParams"
       },
       "_ImportFromBucket": {
         "properties": {

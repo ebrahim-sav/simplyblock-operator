@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -211,6 +212,58 @@ func TestClientRestoreBackup(t *testing.T) {
 	}
 	if got != restoredID {
 		t.Errorf("restored volume = %q, want %q", got, restoredID)
+	}
+}
+
+func TestClientRestoreGroupBackup(t *testing.T) {
+	const (
+		groupBackup  = "55555555-5555-5555-5555-555555555555"
+		restoredCG   = "11111111-1111-1111-1111-111111111111/99999999-9999-9999-9999-999999999999"
+		memberVolOne = "66666666-6666-6666-6666-666666666666"
+		memberVolTwo = "77777777-7777-7777-7777-777777777777"
+	)
+
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if !strings.Contains(r.URL.Path, groupBackup) {
+			t.Errorf("path = %s, want it to name the group backup uuid", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"group_id":"` + restoredCG + `","lvol_ids":["` + memberVolOne + `","` + memberVolTwo + `"]}`))
+	})
+
+	// The composite "<cluster>/<uuid>" form the label carries is accepted; the
+	// endpoint is reached by the UUID.
+	groupID, lvolIDs, err := c.RestoreGroupBackup(context.Background(), testCluster, RestoreGroupBackupParams{
+		GroupBackupID: testCluster + "/" + groupBackup, IntoGroupName: "restored-cg", Pool: "pool1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groupID != restoredCG {
+		t.Errorf("restored group = %q, want %q", groupID, restoredCG)
+	}
+	if len(lvolIDs) != 2 || lvolIDs[0] != memberVolOne || lvolIDs[1] != memberVolTwo {
+		t.Errorf("restored volumes = %v, want the two members", lvolIDs)
+	}
+}
+
+// A group restore whose response names no group or no volumes leaves the caller
+// with nothing to wait on, so it is an error rather than an empty result.
+func TestClientRestoreGroupBackupWithoutVolumesFails(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"group_id":"11111111-1111-1111-1111-111111111111/abc","lvol_ids":[]}`))
+	})
+
+	if _, _, err := c.RestoreGroupBackup(context.Background(), testCluster,
+		RestoreGroupBackupParams{GroupBackupID: "55555555-5555-5555-5555-555555555555", IntoGroupName: "restored-cg", Pool: "pool1"},
+	); !errors.Is(err, errs.ErrInvalidResponse) {
+		t.Errorf("err = %v, want ErrInvalidResponse", err)
 	}
 }
 

@@ -76,14 +76,37 @@ nodes mocked. These prove the records round-trip and the indexes resolve.
 The harness boundary: envtest with a real API server; the control-plane client is
 faked. These prove admission, the mirror grouping, and the lock.
 
-| #   | Scenario                                                                                                  | Type     | Test |
-|-----|-----------------------------------------------------------------------------------------------------------|----------|------|
-| E-1 | A `StorageBackupPolicy` with `consistencyGroupName` resolves its named group and reconciles it            | Positive | —    |
-| E-2 | A policy that sets both `claimSelector` and `consistencyGroupName`, or names an unknown group, is refused | Negative | —    |
-| E-3 | The mirror groups member `StorageBackup`s by the `group-backup-id` label                                  | Positive | —    |
-| E-4 | A `StorageBackupOps{groupBackupID}` with no matching `StorageBackup` is refused at admission              | Negative | —    |
-| E-5 | Two group restores of one generation serialize on the per-member `activeOpsRef` lock                      | Positive | —    |
-| E-6 | A group restore cannot abort after it has created a volume (IllegalTransitionError)                       | Boundary | —    |
+| #   | Scenario                                                                                                  | Type     | Test                                     |
+|-----|-----------------------------------------------------------------------------------------------------------|----------|------------------------------------------|
+| E-1 | A `StorageBackupPolicy` with `consistencyGroupName` resolves its named group and reconciles it            | Positive | —                                        |
+| E-2 | A policy that sets both `claimSelector` and `consistencyGroupName`, or names an unknown group, is refused | Negative | —                                        |
+| E-3 | The mirror groups member `StorageBackup`s by the `group-backup-id` label                                  | Positive | —                                        |
+| E-4 | A `StorageBackupOps{groupBackupID}` with no matching `StorageBackup` is refused at admission              | Negative | `TestGroupRestoreWithNoMembersIsRefused` |
+| E-5 | Two group restores of one generation serialize on the per-member `activeOpsRef` lock                      | Positive | —                                        |
+| E-6 | A group restore cannot abort after it has created a volume (IllegalTransitionError)                       | Boundary | —                                        |
+
+The `claimSelector`/`consistencyGroupName` mutual exclusion in E-2 is enforced by a CEL rule on the generated CRD, so it is rejected by the API server itself. E-2's envtest still owns the unknown-group half, which needs the validating webhook.
+
+### Group-restore admission and guard (design §7.3, §7.4, Appendix C)
+
+The harness boundary: the webhook validator runs against a fake client, no API server; the reconciler guard is a direct unit call. These prove the group-restore reference check and that an admitted group restore fails fast until its drive is wired, rather than hanging or running the single path.
+
+| #    | Scenario                                                                                                 | Type       | Test                                           |
+|------|----------------------------------------------------------------------------------------------------------|------------|------------------------------------------------|
+| E-8  | A group restore whose group backup has a failed member is refused, the member named                      | Negative   | `TestGroupRestoreWithAFailedMemberIsRefused`   |
+| E-9  | A group restore of a complete, healthy group backup is admitted                                          | Positive   | `TestGroupRestoreWithHealthyMembersIsAdmitted` |
+| E-10 | A group restore resolves only members of its own group backup, not another group's                       | Boundary   | `TestGroupRestoreIgnoresMembersOfOtherGroups`  |
+| E-11 | An admitted group restore fails fast with a clear reason while the drive is unwired, not the single path | Regression | `TestGroupRestoreFailsFastUntilTheDriveLands`  |
+
+The rule that exactly one of `backupRef` and `groupBackupID` is set, and the `groupBackupID` immutability, are CEL rules on the generated CRD, rejected by the API server. An envtest covering them is a gap (§7). The group-restore drive itself (the step machine `Restoring → AwaitingVolumes → Binding`, the backend `RestoreGroupBackup` call, and the finalizer unwind) is not yet implemented, so E-5, E-6, and U-10 through U-13 against a real drive remain `—`.
+
+### Conversion fidelity (design §7.2, Appendix B)
+
+The harness boundary: the `api/v1alpha1` conversion unit tests, no API server. The hub-only `status.source.group` has no v1alpha1 field, so a round trip through the spoke must preserve it.
+
+| #   | Scenario                                                                                                      | Type       | Test                                                          |
+|-----|---------------------------------------------------------------------------------------------------------------|------------|---------------------------------------------------------------|
+| E-7 | A group member's `status.source.group` survives a v1alpha2 → v1alpha1 → v1alpha2 round trip through the stash | Regression | `TestStorageBackupCarriesTheHubSourceGroupThroughThisVersion` |
 
 ---
 
