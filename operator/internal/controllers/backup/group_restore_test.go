@@ -22,7 +22,7 @@ import (
 
 const testGroupBackupID = testClusterID + "/gb-1"
 
-func groupRestoreOps(name, groupBackupID string) *simplyblockv1alpha2.StorageBackupOps {
+func groupRestoreOps(name string) *simplyblockv1alpha2.StorageBackupOps {
 	return &simplyblockv1alpha2.StorageBackupOps{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:       name,
@@ -32,7 +32,7 @@ func groupRestoreOps(name, groupBackupID string) *simplyblockv1alpha2.StorageBac
 		},
 		Spec: simplyblockv1alpha2.StorageBackupOpsSpec{
 			ClusterRef:    simplyblockv1alpha2.NamespacedDnsReference{Name: testClusterCR},
-			GroupBackupID: groupBackupID,
+			GroupBackupID: testGroupBackupID,
 			Action:        simplyblockv1alpha2.StorageBackupOpsActionRestore,
 			Restore: &simplyblockv1alpha2.RestoreSpec{
 				ClaimName:  "restored-claim",
@@ -42,12 +42,12 @@ func groupRestoreOps(name, groupBackupID string) *simplyblockv1alpha2.StorageBac
 	}
 }
 
-func groupMemberBackup(name, groupBackupID, memberName string) *simplyblockv1alpha2.StorageBackup {
+func groupMemberBackup(name, memberName string) *simplyblockv1alpha2.StorageBackup {
 	return &simplyblockv1alpha2.StorageBackup{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
-			Labels:    map[string]string{simplyblockv1alpha2.BackupLabelGroupBackupID: groupBackupID},
+			Labels:    map[string]string{simplyblockv1alpha2.BackupLabelGroupBackupID: testGroupBackupID},
 		},
 		Spec: simplyblockv1alpha2.StorageBackupSpec{ClusterRef: testClusterCR},
 		Status: simplyblockv1alpha2.StorageBackupStatus{
@@ -57,7 +57,7 @@ func groupMemberBackup(name, groupBackupID, memberName string) *simplyblockv1alp
 			Source: &simplyblockv1alpha2.BackupSource{
 				FSType:   "xfs",
 				LvolName: memberName,
-				Group:    &simplyblockv1alpha2.BackupGroup{GroupBackupID: groupBackupID},
+				Group:    &simplyblockv1alpha2.BackupGroup{GroupBackupID: testGroupBackupID},
 			},
 		},
 	}
@@ -85,9 +85,9 @@ func TestGroupRestoreRunsTheWholeGraphAndProducesClaims(t *testing.T) {
 	}
 	r := opsReconciler(t, api,
 		testClusterObject(), testPoolObject(),
-		groupMemberBackup("member-db", testGroupBackupID, "db"),
-		groupMemberBackup("member-data", testGroupBackupID, "data"),
-		groupRestoreOps(testOpsName, testGroupBackupID))
+		groupMemberBackup("member-db", "db"),
+		groupMemberBackup("member-data", "data"),
+		groupRestoreOps(testOpsName))
 
 	claimNames := []string{"restored-claim-db", "restored-claim-data"}
 	for range 10 {
@@ -156,12 +156,12 @@ func TestSecondGroupRestoreWaitsForTheMemberLock(t *testing.T) {
 		restoredGroupMembers: []controlplane.RestoredGroupMember{{LvolID: "lvol-db", MemberName: "db"}},
 		volumes:              map[string]lvol.Volume{},
 	}
-	first := groupRestoreOps("restore-first", testGroupBackupID)
-	second := groupRestoreOps("restore-second", testGroupBackupID)
+	first := groupRestoreOps("restore-first")
+	second := groupRestoreOps("restore-second")
 	second.Spec.Restore.ClaimName = "second-claim"
 	r := opsReconciler(t, api,
 		testClusterObject(), testPoolObject(),
-		groupMemberBackup("member-db", testGroupBackupID, "db"),
+		groupMemberBackup("member-db", "db"),
 		first, second)
 
 	// Drive the first until it holds the lock and is running.

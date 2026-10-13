@@ -38,12 +38,12 @@ func groupMember(name, groupID string, phase simplyblockv1alpha2.StorageBackupPh
 	}
 }
 
-func groupRestoreOps(groupID string) *simplyblockv1alpha2.StorageBackupOps {
+func groupRestoreOps() *simplyblockv1alpha2.StorageBackupOps {
 	return &simplyblockv1alpha2.StorageBackupOps{
 		ObjectMeta: metav1.ObjectMeta{Name: "a-group-restore", Namespace: backupOpsNamespace},
 		Spec: simplyblockv1alpha2.StorageBackupOpsSpec{
 			ClusterRef:    simplyblockv1alpha2.NamespacedDnsReference{Name: backupOpsNamespace},
-			GroupBackupID: groupID,
+			GroupBackupID: testGroupBackupID,
 			Action:        simplyblockv1alpha2.StorageBackupOpsActionRestore,
 			Restore:       &simplyblockv1alpha2.RestoreSpec{ClaimName: "restored-claim", TargetPool: "pool-1"},
 		},
@@ -74,7 +74,7 @@ func admitGroupRestore(t *testing.T, ops *simplyblockv1alpha2.StorageBackupOps, 
 }
 
 func TestGroupRestoreWithNoMembersIsRefused(t *testing.T) {
-	resp := admitGroupRestore(t, groupRestoreOps(testGroupBackupID), testCluster())
+	resp := admitGroupRestore(t, groupRestoreOps(), testCluster())
 	if resp.Allowed {
 		t.Fatal("a group restore naming a group backup with no members was admitted")
 	}
@@ -84,7 +84,7 @@ func TestGroupRestoreWithNoMembersIsRefused(t *testing.T) {
 }
 
 func TestGroupRestoreWithAFailedMemberIsRefused(t *testing.T) {
-	resp := admitGroupRestore(t, groupRestoreOps(testGroupBackupID),
+	resp := admitGroupRestore(t, groupRestoreOps(),
 		testCluster(),
 		groupMember("member-db", testGroupBackupID, simplyblockv1alpha2.StorageBackupPhaseAvailable),
 		groupMember("member-data", testGroupBackupID, simplyblockv1alpha2.StorageBackupPhaseFailed),
@@ -101,7 +101,7 @@ func TestGroupRestoreWithHealthyMembersIsAdmitted(t *testing.T) {
 	pool := &simplyblockv1alpha2.StoragePool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-1", Namespace: backupOpsNamespace},
 	}
-	resp := admitGroupRestore(t, groupRestoreOps(testGroupBackupID),
+	resp := admitGroupRestore(t, groupRestoreOps(),
 		testCluster(),
 		pool,
 		groupMember("member-db", testGroupBackupID, simplyblockv1alpha2.StorageBackupPhaseAvailable),
@@ -112,12 +112,10 @@ func TestGroupRestoreWithHealthyMembersIsAdmitted(t *testing.T) {
 	}
 }
 
-
-
 // A members-only object graph still only resolves members labeled for THIS group
 // backup. A member of a different group does not count.
 func TestGroupRestoreIgnoresMembersOfOtherGroups(t *testing.T) {
-	resp := admitGroupRestore(t, groupRestoreOps(testGroupBackupID),
+	resp := admitGroupRestore(t, groupRestoreOps(),
 		testCluster(),
 		groupMember("other-group-member", "cluster-1/gb-2", simplyblockv1alpha2.StorageBackupPhaseAvailable),
 	)
