@@ -287,6 +287,40 @@ spec:
                   once the control-plane group restore returns, so the operation says which
                   group it produced. Empty for a single-backup restore.
                 type: string
+              restoredGroupMembers:
+                description: |-
+                  RestoredGroupMembers is one entry per restored member volume of a group
+                  restore, written when the control plane accepts the restore and carrying the
+                  claim each is bound to as Binding produces them. It is how a restarted
+                  AwaitingVolumes or Binding step knows which volumes to wait on and which
+                  claims to produce. Empty for a single-backup restore.
+                items:
+                  description: |-
+                    RestoredGroupMember is one volume a group restore produced: the logical volume
+                    the control plane created, the source member it came from, and the claim it is
+                    bound to once Binding produces one.
+                  properties:
+                    claimName:
+                      description: |-
+                        ClaimName is the PersistentVolumeClaim this member was bound to, written by
+                        Binding. Empty until the claim is produced.
+                      type: string
+                    lvolID:
+                      description: LvolID is the restored logical volume's backend
+                        id.
+                      type: string
+                    memberName:
+                      description: |-
+                        MemberName is the source member's volume name, which the restored claim's
+                        name is formed from (claimName-memberName) and which tells the members apart.
+                      type: string
+                  required:
+                  - lvolID
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - lvolID
+                x-kubernetes-list-type: map
               restoredLvolID:
                 description: |-
                   RestoredLvolID is the logical volume the control plane created. It is

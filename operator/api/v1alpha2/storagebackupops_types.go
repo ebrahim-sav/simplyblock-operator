@@ -197,6 +197,25 @@ type StorageBackupOpsSpec struct {
 	Restore *RestoreSpec `json:"restore,omitempty"`
 }
 
+// RestoredGroupMember is one volume a group restore produced: the logical volume
+// the control plane created, the source member it came from, and the claim it is
+// bound to once Binding produces one.
+type RestoredGroupMember struct {
+	// LvolID is the restored logical volume's backend id.
+	// +kubebuilder:validation:Required
+	LvolID string `json:"lvolID"`
+
+	// MemberName is the source member's volume name, which the restored claim's
+	// name is formed from (claimName-memberName) and which tells the members apart.
+	// +optional
+	MemberName string `json:"memberName,omitempty"`
+
+	// ClaimName is the PersistentVolumeClaim this member was bound to, written by
+	// Binding. Empty until the claim is produced.
+	// +optional
+	ClaimName string `json:"claimName,omitempty"`
+}
+
 // StorageBackupOpsStatus is the observed state of one backup operation.
 type StorageBackupOpsStatus struct {
 	// Phase is the operation's own progress.
@@ -232,6 +251,16 @@ type StorageBackupOpsStatus struct {
 	// group it produced. Empty for a single-backup restore.
 	// +optional
 	RestoredGroupID string `json:"restoredGroupID,omitempty"`
+
+	// RestoredGroupMembers is one entry per restored member volume of a group
+	// restore, written when the control plane accepts the restore and carrying the
+	// claim each is bound to as Binding produces them. It is how a restarted
+	// AwaitingVolumes or Binding step knows which volumes to wait on and which
+	// claims to produce. Empty for a single-backup restore.
+	// +optional
+	// +listType=map
+	// +listMapKey=lvolID
+	RestoredGroupMembers []RestoredGroupMember `json:"restoredGroupMembers,omitempty"`
 
 	// PoolUUID is the backend identifier of spec.restore.targetPool, resolved
 	// once at Validating.

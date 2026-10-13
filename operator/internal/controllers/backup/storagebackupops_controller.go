@@ -94,6 +94,7 @@ type StorageBackupOpsReconciler struct {
 // restore needs is the operator's question rather than the client's.
 type RestoreClient interface {
 	RestoreBackup(ctx context.Context, clusterID string, params controlplane.RestoreBackupParams) (string, error)
+	RestoreGroupBackup(ctx context.Context, clusterID string, params controlplane.RestoreGroupBackupParams) (string, []controlplane.RestoredGroupMember, error)
 	Volume(ctx context.Context, handle lvol.VolumeHandle) (lvol.Volume, error)
 	Connection(ctx context.Context, handle lvol.VolumeHandle, opts ...lvol.ConnectionOption) (lvol.Connection, error)
 
@@ -253,7 +254,7 @@ func (r *StorageBackupOpsReconciler) advance(
 			fmt.Sprintf("The backup was restored into claim %s", ops.Status.ClaimName))
 	}
 
-	next := firstSuccessor(machine)
+	next := r.nextStep(ops, machine)
 	// Write-ahead: the step is recorded before it is entered, so a crash between
 	// the two leaves a record that the step was attempted rather than a record
 	// that it was not.
@@ -337,6 +338,12 @@ func (r *StorageBackupOpsReconciler) unwind(
 func (r *StorageBackupOpsReconciler) discardRestoredVolume(
 	ctx context.Context, ops *simplyblockv1alpha2.StorageBackupOps,
 ) error {
+	// A group restore produced N volumes, tracked per member. An abort at
+	// Restoring takes them all back.
+	if ops.Spec.GroupBackupID != "" {
+		return r.discardRestoredGroup(ctx, ops)
+	}
+
 	volumeID := ops.Status.RestoredLvolID
 	if volumeID == "" {
 		recovered, err := r.restoredVolumeByName(ctx, ops)
@@ -401,15 +408,36 @@ func (r *StorageBackupOpsReconciler) waitOn(machine *statemachine.Machine[step])
 	return ctrl.Result{RequeueAfter: opsRetry}
 }
 
-// firstSuccessor is the step that follows the current one. Every graph in this
-// package is a line rather than a tree, so the first edge is the only edge, and
-// a graph that grows a branch will need the choice made here rather than in the
-// caller.
+// firstSuccessor is the step that follows the current one on a line. It is used
+// where the current step has one outgoing edge; Restoring has two, and nextStep
+// chooses between them.
 func firstSuccessor(machine *statemachine.Machine[step]) step {
 	for next := range machine.AllowedTransitions() {
 		return next
 	}
 	return machine.CurrentState()
+}
+
+// nextStep is the step that follows the current one, choosing the right edge
+// where the graph branches. The only branch is Restoring, which goes to
+// AwaitingVolumes for a group restore and AwaitingVolume for a single one; the
+// edges are indistinguishable to firstSuccessor's map walk, so the choice is made
+// here from spec.groupBackupID. Everywhere else the line has one edge.
+func (r *StorageBackupOpsReconciler) nextStep(
+	ops *simplyblockv1alpha2.StorageBackupOps, machine *statemachine.Machine[step],
+) step {
+	if machine.CurrentState() == stepRestoring {
+		want := stepAwaitingVolume
+		if ops.Spec.GroupBackupID != "" {
+			want = stepAwaitingVolumes
+		}
+		for next := range machine.AllowedTransitions() {
+			if next == want {
+				return want
+			}
+		}
+	}
+	return firstSuccessor(machine)
 }
 
 // finish writes a terminal phase, releases the target's lock, and records what
@@ -516,6 +544,12 @@ func (r *StorageBackupOpsReconciler) teardown(
 func (r *StorageBackupOpsReconciler) acquireLock(
 	ctx context.Context, ops *simplyblockv1alpha2.StorageBackupOps,
 ) (bool, error) {
+	// A group restore names no single backup; it takes the lock on every member
+	// of the group, so two group restores of one generation serialize (§7.3).
+	if ops.Spec.GroupBackupID != "" {
+		return r.acquireGroupLock(ctx, ops)
+	}
+
 	var backup simplyblockv1alpha2.StorageBackup
 	err := r.Get(ctx, backupKey(ops), &backup)
 	if apierrors.IsNotFound(err) {
@@ -574,6 +608,10 @@ func (r *StorageBackupOpsReconciler) acquireLock(
 func (r *StorageBackupOpsReconciler) releaseLock(
 	ctx context.Context, ops *simplyblockv1alpha2.StorageBackupOps,
 ) error {
+	if ops.Spec.GroupBackupID != "" {
+		return r.releaseGroupLock(ctx, ops)
+	}
+
 	var backup simplyblockv1alpha2.StorageBackup
 	err := r.Get(ctx, backupKey(ops), &backup)
 	if apierrors.IsNotFound(err) {
