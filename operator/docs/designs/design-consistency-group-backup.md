@@ -291,7 +291,9 @@ A group restore cannot be aborted once it has created a logical volume, the same
 
 ### 7.4 Reference validation at creation
 
-Every added reference is validated at admission, the group rule (`design-storagebackup.md` §7). A `StorageBackupOps` with a `groupBackupID` is rejected when no `StorageBackup` carries that id. A `StorageBackupPolicy` with a `consistencyGroupName` is rejected when it also sets `claimSelector`, and when no consistency group of that name exists in the cluster (resolved through the operator's `GetConsistencyGroupByName`). The references are immutable, so admission is the only place they can be wrong.
+Every added reference is validated at admission, the group rule (`design-storagebackup.md` §7), with one exception stated below. A `StorageBackupOps` with a `groupBackupID` is rejected when no `StorageBackup` carries that id: the id is immutable, so a group backup that is not there at creation will never be, and the restore's whole purpose is gone. A `StorageBackupPolicy` with a `consistencyGroupName` is rejected when it also sets `claimSelector` (a CEL rule), because the two are alternatives.
+
+The exception is the policy's `consistencyGroupName` itself: it is **not** rejected when no group of that name exists yet. A consistency group is born from its first labeled member volume (`design-consistency-groups.md` §4.1), so a policy that declares how a group is backed up is routinely applied before the group exists — a GitOps bundle that creates the policy and the first member together, in any order, is the common case. Requiring the group at admission would reject exactly that bundle. Instead, the policy reconciler resolves the group by name each pass (`ConsistencyGroupByName`) and holds the policy in `Pending` with a message naming the group it waits for, attaching it the moment the group appears. This is the `api-design` rule that existence is admission's only when the referent cannot legitimately arrive later; here it can, so readiness is the controller's.
 
 ---
 

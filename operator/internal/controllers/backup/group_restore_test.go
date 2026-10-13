@@ -7,11 +7,13 @@ package backup
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/simplyblock/atlas/controlplane"
@@ -182,4 +184,73 @@ func TestSecondGroupRestoreWaitsForTheMemberLock(t *testing.T) {
 	if secondOps.Status.Phase == simplyblockv1alpha2.StorageBackupOpsPhaseRunning {
 		t.Errorf("the second group restore is Running, want it waiting for the member lock")
 	}
+}
+
+// A group restore reports its own start and success as events on the operation,
+// so a group drive is legible as one unit rather than a generic operation.
+func TestGroupRestoreEmitsItsOwnEvents(t *testing.T) {
+	const lvolDB = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	handleDB := lvol.NewVolumeHandle(testClusterID, testPoolID, lvolDB)
+	api := &fakeControlPlane{
+		restoredGroupID:      testClusterID + "/restored-cg",
+		restoredGroupMembers: []controlplane.RestoredGroupMember{{LvolID: lvolDB, MemberName: "db"}},
+		volumes:              map[string]lvol.Volume{string(handleDB): {Status: cpVolumeOnline}},
+		connection: lvol.Connection{
+			NQN:       "nqn.2023-01.io.simplyblock:lvol",
+			Endpoints: []lvol.Endpoint{{Transport: "tcp", Address: "10.0.0.1", Port: 4420}},
+		},
+	}
+	rec := events.NewFakeRecorder(128)
+	r := &StorageBackupOpsReconciler{
+		Client: testClient(t, testClusterObject(), testPoolObject(),
+			groupMemberBackup("member-db", "db"), groupRestoreOps(testOpsName)),
+		Scheme:   testScheme(t),
+		Recorder: rec,
+		API:      api,
+	}
+
+	for range 10 {
+		if _, err := r.Reconcile(context.Background(), opsRequest(testOpsName)); err != nil {
+			t.Fatalf("Reconcile: %v", err)
+		}
+		var claim corev1.PersistentVolumeClaim
+		if err := r.Get(context.Background(),
+			client.ObjectKey{Name: "restored-claim-db", Namespace: testNamespace}, &claim); err == nil &&
+			claim.Status.Phase != corev1.ClaimBound {
+			claim.Status.Phase = corev1.ClaimBound
+			if err := r.Status().Update(context.Background(), &claim); err != nil {
+				t.Fatalf("bind the claim: %v", err)
+			}
+		}
+	}
+	reconcileUntilSettled(t, r)
+
+	seen := drainEvents(rec)
+	for _, reason := range []string{ReasonGroupRestoreStarted, ReasonGroupRestored} {
+		if !containsEvent(seen, reason) {
+			t.Errorf("events %v, want one carrying %s", seen, reason)
+		}
+	}
+}
+
+func drainEvents(rec events.EventRecorder) []string {
+	f := rec.(*events.FakeRecorder)
+	var out []string
+	for {
+		select {
+		case e := <-f.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
+}
+
+func containsEvent(events []string, reason string) bool {
+	for _, e := range events {
+		if strings.Contains(e, reason) {
+			return true
+		}
+	}
+	return false
 }

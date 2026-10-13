@@ -457,13 +457,22 @@ func (r *StorageBackupOpsReconciler) finish(
 		return ctrl.Result{}, err
 	}
 
+	// A group restore reports its own terminal reason, so a group drive is one
+	// legible unit rather than a generic operation.
+	group := ops.Spec.GroupBackupID != ""
 	switch phase {
 	case simplyblockv1alpha2.StorageBackupOpsPhaseSucceeded:
-		r.Recorder.Eventf(ops, nil, corev1.EventTypeNormal,
-			ReasonOperationSucceeded, ReasonOperationSucceeded, "%s", message)
+		reason := ReasonOperationSucceeded
+		if group {
+			reason = ReasonGroupRestored
+		}
+		r.Recorder.Eventf(ops, nil, corev1.EventTypeNormal, reason, reason, "%s", message)
 	case simplyblockv1alpha2.StorageBackupOpsPhaseFailed:
-		r.Recorder.Eventf(ops, nil, corev1.EventTypeWarning,
-			ReasonOperationFailed, ReasonOperationFailed, "%s", message)
+		reason := ReasonOperationFailed
+		if group {
+			reason = ReasonGroupRestoreFailed
+		}
+		r.Recorder.Eventf(ops, nil, corev1.EventTypeWarning, reason, reason, "%s", message)
 	}
 
 	r.observeOperation(ops, phase)
@@ -480,8 +489,13 @@ func (r *StorageBackupOpsReconciler) observeOperation(
 	backupOperationsTotal.WithLabelValues(ops.Spec.ClusterRef.Name, action, resultOf(phase)).Inc()
 
 	if started := ops.Status.StartedAt; started != nil {
-		backupOperationDurationSeconds.WithLabelValues(ops.Spec.ClusterRef.Name, action).
-			Observe(time.Since(started.Time).Seconds())
+		elapsed := time.Since(started.Time).Seconds()
+		backupOperationDurationSeconds.WithLabelValues(ops.Spec.ClusterRef.Name, action).Observe(elapsed)
+		// A group restore also lands in its own histogram, so a disaster-recovery
+		// drill reports the cost of getting a whole group back on its own.
+		if ops.Spec.GroupBackupID != "" && phase == simplyblockv1alpha2.StorageBackupOpsPhaseSucceeded {
+			groupRestoreDurationSeconds.WithLabelValues(ops.Spec.ClusterRef.Name).Observe(elapsed)
+		}
 	}
 }
 

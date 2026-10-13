@@ -191,6 +191,10 @@ func (r *StorageBackupOpsReconciler) startGroupRestore(
 	for i, m := range members {
 		recorded[i] = simplyblockv1alpha2.RestoredGroupMember{LvolID: m.LvolID, MemberName: m.MemberName}
 	}
+	r.Recorder.Eventf(ops, nil, corev1.EventTypeNormal,
+		ReasonGroupRestoreStarted, ReasonGroupRestoreStarted,
+		"The control plane accepted the restore of group backup %s and is filling %d volume(s)",
+		ops.Spec.GroupBackupID, len(recorded))
 	return true, r.writeStatus(ctx, ops, func(status *simplyblockv1alpha2.StorageBackupOpsStatus) {
 		status.RestoredGroupID = groupID
 		status.RestoredGroupMembers = recorded
