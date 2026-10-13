@@ -478,3 +478,75 @@ func TestStorageClusterCELReadsAnUnstatedHalfAsTheDefault(t *testing.T) {
 		}
 	}
 }
+
+// clusterMode takes one of three values and defaults to Standard. Single is
+// fixed on the control plane when the cluster is created, so a change to or
+// from it is refused; Dual and Standard may be exchanged.
+func TestStorageClusterClusterModeRules(t *testing.T) {
+	apiClient := apiServer(t)
+	base := func(mode simplyblockv1alpha2.ClusterMode) *simplyblockv1alpha2.StorageCluster {
+		return &simplyblockv1alpha2.StorageCluster{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "mode-", Namespace: "default"},
+			Spec: simplyblockv1alpha2.StorageClusterSpec{
+				MaxSubsystemCount: ptr.To(int32(10)),
+				VCPUCount:         ptr.To(int32(6)),
+				ClusterMode:       mode,
+			},
+		}
+	}
+
+	unknown := base("Triple")
+	if err := apiClient.Create(context.Background(), unknown); err == nil {
+		_ = apiClient.Delete(context.Background(), unknown)
+		t.Errorf("an unknown clusterMode was accepted")
+	}
+
+	defaulted := base("")
+	if err := apiClient.Create(context.Background(), defaulted); err != nil {
+		t.Fatalf("creating a cluster without clusterMode: %v", err)
+	}
+	if defaulted.Spec.ClusterMode != simplyblockv1alpha2.ClusterModeStandard {
+		t.Errorf("an unstated clusterMode reads %q, want Standard", defaulted.Spec.ClusterMode)
+	}
+	_ = apiClient.Delete(context.Background(), defaulted)
+
+	for _, tc := range []struct {
+		name        string
+		initial     simplyblockv1alpha2.ClusterMode
+		changed     simplyblockv1alpha2.ClusterMode
+		wantRefused bool
+	}{
+		{"Single to Standard", simplyblockv1alpha2.ClusterModeSingle, simplyblockv1alpha2.ClusterModeStandard, true},
+		{"Single to Dual", simplyblockv1alpha2.ClusterModeSingle, simplyblockv1alpha2.ClusterModeDual, true},
+		{"Standard to Single", simplyblockv1alpha2.ClusterModeStandard, simplyblockv1alpha2.ClusterModeSingle, true},
+		{"Dual to Single", simplyblockv1alpha2.ClusterModeDual, simplyblockv1alpha2.ClusterModeSingle, true},
+		{"Dual to Standard", simplyblockv1alpha2.ClusterModeDual, simplyblockv1alpha2.ClusterModeStandard, false},
+		{"Standard to Dual", simplyblockv1alpha2.ClusterModeStandard, simplyblockv1alpha2.ClusterModeDual, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cluster := base(tc.initial)
+			if err := apiClient.Create(context.Background(), cluster); err != nil {
+				t.Fatalf("creating: %v", err)
+			}
+			defer func() { _ = apiClient.Delete(context.Background(), cluster) }()
+			cluster.Spec.ClusterMode = tc.changed
+			err := apiClient.Update(context.Background(), cluster)
+			switch {
+			case tc.wantRefused && (err == nil || !strings.Contains(err.Error(), "cannot be changed to or from Single")):
+				t.Fatalf("got %v, want the Single immutability refusal", err)
+			case !tc.wantRefused && err != nil:
+				t.Fatalf("the change was refused: %v", err)
+			}
+		})
+	}
+
+	same := base(simplyblockv1alpha2.ClusterModeSingle)
+	if err := apiClient.Create(context.Background(), same); err != nil {
+		t.Fatalf("creating a single-node cluster: %v", err)
+	}
+	same.Spec.MaxSubsystemCount = ptr.To(int32(12))
+	if err := apiClient.Update(context.Background(), same); err != nil {
+		t.Errorf("an unrelated update of a single-node cluster was refused: %v", err)
+	}
+	_ = apiClient.Delete(context.Background(), same)
+}

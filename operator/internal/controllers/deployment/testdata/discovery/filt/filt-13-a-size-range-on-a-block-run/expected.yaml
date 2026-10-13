@@ -9,6 +9,7 @@ metadata:
 spec:
   approved: false
   cluster:
+    clusterMode: Single
     enableDriveFormat: true
     enableJournalDevice: true
     maxSubsystemCount: 30
@@ -16,7 +17,7 @@ spec:
     name: discovered-discover-filt-13-cluster
     stripe:
       dataChunks: 1
-      parityChunks: 0
+      parityChunks: 1
     vcpuCount: 16
   environment: K3s
   hostOS:

@@ -9,13 +9,14 @@ metadata:
 spec:
   approved: false
   cluster:
+    clusterMode: Single
     enableDriveFormat: true
     maxSubsystemCount: 30
     minHugePagesSize: 16G
     name: discovered-discover-numa-10-cluster
     stripe:
       dataChunks: 1
-      parityChunks: 0
+      parityChunks: 1
     vcpuCount: 8
   environment: K3s
   hostOS:

@@ -9,6 +9,7 @@ metadata:
 spec:
   approved: false
   cluster:
+    clusterMode: Single
     enableDriveFormat: true
     enableJournalDevice: true
     maxSubsystemCount: 30
