@@ -76,14 +76,14 @@ nodes mocked. These prove the records round-trip and the indexes resolve.
 The harness boundary: envtest with a real API server; the control-plane client is
 faked. These prove admission, the mirror grouping, and the lock.
 
-| #   | Scenario                                                                                              | Type     | Test |
-|-----|-------------------------------------------------------------------------------------------------------|----------|------|
-| E-1 | A `StorageBackupPolicy` with `consistencyGroupSelector` attaches to matching groups, not loose claims | Positive | —    |
-| E-2 | A policy that sets both `claimSelector` and `consistencyGroupSelector` is refused at admission        | Negative | —    |
-| E-3 | The mirror groups member `StorageBackup`s by the `group-backup-id` label                              | Positive | —    |
-| E-4 | A `StorageBackupOps{groupBackupID}` with no matching `StorageBackup` is refused at admission          | Negative | —    |
-| E-5 | Two group restores of one generation serialize on the per-member `activeOpsRef` lock                  | Positive | —    |
-| E-6 | A group restore cannot abort after it has created a volume (IllegalTransitionError)                   | Boundary | —    |
+| #   | Scenario                                                                                                  | Type     | Test |
+|-----|-----------------------------------------------------------------------------------------------------------|----------|------|
+| E-1 | A `StorageBackupPolicy` with `consistencyGroupName` resolves its named group and reconciles it            | Positive | —    |
+| E-2 | A policy that sets both `claimSelector` and `consistencyGroupName`, or names an unknown group, is refused | Negative | —    |
+| E-3 | The mirror groups member `StorageBackup`s by the `group-backup-id` label                                  | Positive | —    |
+| E-4 | A `StorageBackupOps{groupBackupID}` with no matching `StorageBackup` is refused at admission              | Negative | —    |
+| E-5 | Two group restores of one generation serialize on the per-member `activeOpsRef` lock                      | Positive | —    |
+| E-6 | A group restore cannot abort after it has created a volume (IllegalTransitionError)                       | Boundary | —    |
 
 ---
 

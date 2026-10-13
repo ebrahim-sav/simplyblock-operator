@@ -230,15 +230,18 @@ The operator covers a group backup by extending its three single-volume data-pro
 Today, a policy selects claims with a `claimSelector` and backs each up independently (`design-storagebackup.md` §4.1). A policy gains an optional consistency-group source: when set, the policy backs up the named group as a unit on its schedule, taking one generation per interval and backing it up.
 
 ```go
-// ConsistencyGroupSelector selects consistency groups this policy backs up as a
-// unit. Mutually exclusive with ClaimSelector: a policy backs up either
-// independent claims or whole groups, not both, so the two are one choice. An
-// absent selector selects nothing, the same safe default ClaimSelector carries.
+// ConsistencyGroupName names the consistency group this policy backs up as a
+// unit, resolved against ClusterRef. The group is named rather than selected by
+// label: the membership label's key is constant and only its value, the group
+// name, varies, so a label selector would be indirection for a single string.
+// Mutually exclusive with ClaimSelector: a policy backs up either independent
+// claims or one whole group, not both.
 // +optional
-ConsistencyGroupSelector *metav1.LabelSelector `json:"consistencyGroupSelector,omitempty"`
+// +kubebuilder:validation:MaxLength=63
+ConsistencyGroupName string `json:"consistencyGroupName,omitempty"`
 ```
 
-The selector matches on the consistency-group membership label `storage.simplyblock.io/consistency-group` (`design-consistency-groups.md` §3), resolving to the groups whose members carry it. `status.attachedGroups` records which groups are covered, parallel to `status.attachedClaims`. The schedule and retention fields are unchanged and apply per generation (§9). A CEL rule admits at most one of `claimSelector` and `consistencyGroupSelector`.
+The group is named directly rather than selected by label. The membership label `storage.simplyblock.io/consistency-group` (`design-consistency-groups.md` §3) has a constant key and carries the group name as its value, so the only varying part is the name, and `clusterRef` plus `consistencyGroupName` identifies the group, which is unique per cluster. The operator reconciles the policy against that named group, and `status.phase` reports whether it is active. A policy covers one group, and covering several means several policies. The schedule and retention fields are unchanged and apply per generation (§9). A CEL rule admits at most one of `claimSelector` and `consistencyGroupName`.
 
 ### 7.2 `StorageBackup` gains a group dimension
 
@@ -288,7 +291,7 @@ A group restore cannot be aborted once it has created a logical volume, the same
 
 ### 7.4 Reference validation at creation
 
-Every added reference is validated at admission, the group rule (`design-storagebackup.md` §7). A `StorageBackupOps` with a `groupBackupID` is rejected when no `StorageBackup` carries that id. A `StorageBackupPolicy` with a `consistencyGroupSelector` is rejected when it also sets `claimSelector`. The references are immutable, so admission is the only place they can be wrong.
+Every added reference is validated at admission, the group rule (`design-storagebackup.md` §7). A `StorageBackupOps` with a `groupBackupID` is rejected when no `StorageBackup` carries that id. A `StorageBackupPolicy` with a `consistencyGroupName` is rejected when it also sets `claimSelector`, and when no consistency group of that name exists in the cluster (resolved through the operator's `GetConsistencyGroupByName`). The references are immutable, so admission is the only place they can be wrong.
 
 ---
 
@@ -326,7 +329,7 @@ Scheduling is Phase 4. Until then a group backup is taken on demand through the 
 
 | Reason                  | Object                | When                                                                                               |
 |-------------------------|-----------------------|----------------------------------------------------------------------------------------------------|
-| `GroupBackupCreated`    | `StorageBackupPolicy` | A policy with a `consistencyGroupSelector` took a generation and started its backup                |
+| `GroupBackupCreated`    | `StorageBackupPolicy` | A policy with a `consistencyGroupName` took a generation and started its backup                    |
 | `GroupBackupAvailable`  | `StorageBackup`       | Every member of a generation completed and the group manifest was published                        |
 | `GroupBackupIncomplete` | `StorageBackupPolicy` | A generation's backup could not complete within its deadline; the members that completed are named |
 | `GroupRestoreStarted`   | `StorageBackupOps`    | A group restore began driving member recoveries                                                    |
@@ -354,7 +357,7 @@ The test plan is [`test-plan-consistency-group-backup.md`](../tests/test-plan-co
 
 - **Control-plane unit tests** prove the commit barrier and the group record: a group backup is not `completed` and its group manifest is not written until every member backup is `completed`; a member failure holds the group in `in_progress` and then fails it as a whole; the group manifest lists exactly the generation's members; and group restore unwinds on a member failure. These ride the existing backup unit harness (`tests/unit/backup/`, `tests/integration/backup/`) and the consistency-group harness, mocking the data plane. The all-or-nothing barrier is where the risk concentrates, and it is where a mocked member failure must leave no group manifest.
 - **Control-plane integration tests** (real FoundationDB, mocked nodes) prove the records round-trip: a `GroupBackup` and its member `Backup`s persist and read back, the indexes resolve "members of a group backup" and "group backups of a group," and import preserves the group ids all-or-nothing.
-- **Operator envtest** proves the CRD extensions: a policy with a `consistencyGroupSelector` attaches to a group and not to loose claims; the mirror groups member `StorageBackup`s by `group-backup-id`; a `StorageBackupOps{groupBackupID}` serializes against the per-member lock and cannot abort after creating a volume.
+- **Operator envtest** proves the CRD extensions: a policy with a `consistencyGroupName` resolves its named group and is refused for an unknown name or a `claimSelector` set alongside it; the mirror groups member `StorageBackup`s by `group-backup-id`; a `StorageBackupOps{groupBackupID}` serializes against the per-member lock and cannot abort after creating a volume.
 - **Live cluster** proves the end-to-end crash-consistency: back up a group under load, restore it on another cluster, and verify every member restores to the same generation boundary, which is the group analog of the single-volume restore verification and is only provable against real SPDK and real S3.
 
 The regression focus is the barrier and the unwind: a group backup that commits while a member is still uploading, or a group restore that leaves a half-group, are the two failures that would make the feature silently lossy, and both get a red-first regression test.
@@ -375,26 +378,21 @@ The regression focus is the barrier and the unwind: a group backup that commits 
 
 ## Appendix A: `storagebackuppolicy_types.go` additions
 
-The base type is `design-storagebackup.md` Appendix A and is unchanged; these are the additions. `ConsistencyGroupSelector` joins `ClaimSelector` in `StorageBackupPolicySpec`, and the two are mutually exclusive.
+The base type is `design-storagebackup.md` Appendix A and is unchanged; this is the addition. `ConsistencyGroupName` joins `ClaimSelector` in `StorageBackupPolicySpec`, and the two are mutually exclusive.
 
 ```go
-// StorageBackupPolicySpec additions (full type in design-storagebackup.md Appendix A).
+// StorageBackupPolicySpec addition (full type in design-storagebackup.md Appendix A).
 
-// ConsistencyGroupSelector selects consistency groups this policy backs up as a
-// unit, matching the membership label storage.simplyblock.io/consistency-group.
-// Mutually exclusive with ClaimSelector. An absent selector selects nothing.
+// ConsistencyGroupName names the consistency group this policy backs up as a
+// unit, resolved against ClusterRef. The group is named rather than selected by
+// label because the membership label's key is constant and only its value, the
+// group name, varies. Mutually exclusive with ClaimSelector.
 // +optional
-ConsistencyGroupSelector *metav1.LabelSelector `json:"consistencyGroupSelector,omitempty"`
-
-// StorageBackupPolicyStatus addition:
-
-// AttachedGroups is the consistency groups currently covered by this policy,
-// parallel to AttachedClaims.
-// +optional
-AttachedGroups []string `json:"attachedGroups,omitempty"`
+// +kubebuilder:validation:MaxLength=63
+ConsistencyGroupName string `json:"consistencyGroupName,omitempty"`
 ```
 
-Admission (`StorageBackupPolicyValidator`) rejects a policy that sets both selectors.
+A named group needs no dynamic attach list in status, so `StorageBackupPolicyStatus` gains no `attachedGroups` field: `status.phase` reports whether the policy is active against the named group. Admission (`StorageBackupPolicyValidator`) rejects a policy that sets both `claimSelector` and `consistencyGroupName`, and one that names a consistency group that does not exist.
 
 ## Appendix B: `storagebackup_types.go` additions
 
