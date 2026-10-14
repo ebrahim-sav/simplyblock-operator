@@ -22,12 +22,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - endpoints/restricted
-  verbs:
-  - create
-- apiGroups:
-  - ""
-  resources:
   - namespaces
   - pods/log
   verbs:
@@ -246,6 +240,12 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices/restricted
+  verbs:
+  - create
 - apiGroups:
   - groupsnapshot.storage.k8s.io
   resources:

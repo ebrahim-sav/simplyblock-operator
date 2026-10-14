@@ -142,13 +142,14 @@ type FlowForgetter interface {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch
 // rbac-justified: the export's EndpointSlice points at the metadata server's
-// pod IP. OpenShift's RestrictedEndpointsAdmission refuses an EndpointSlice or
-// Endpoints address inside the cluster or service network unless its writer may
-// create endpoints/restricted. The subresource is virtual and only that
-// admission plugin checks it; elsewhere the grant is inert. Cluster-scoped
-// because exports live in any namespace and their slice names are derived per
-// export.
-// +kubebuilder:rbac:groups="",resources=endpoints/restricted,verbs=create
+// pod IP. OpenShift's RestrictedEndpointsAdmission refuses an EndpointSlice
+// address inside the cluster or service network unless its writer may create
+// endpointslices/restricted in discovery.k8s.io; endpoints/restricted covers
+// only the core Endpoints API, which nothing here writes. The subresource is
+// virtual and only that admission plugin checks it; elsewhere the grant is
+// inert. Cluster-scoped because exports live in any namespace and their slice
+// names are derived per export.
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices/restricted,verbs=create
 // The metadata server pod an export is bound to: read to bind an export to it,
 // and to tell a restarting pod from a gone one at teardown.
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
