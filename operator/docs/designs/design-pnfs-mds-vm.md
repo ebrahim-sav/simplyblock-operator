@@ -166,7 +166,7 @@ The type's full text is in Appendix A. The `MDS` printcolumn shows `mdsPodName`.
 MDS *DriverPNFSMDS `json:"mds,omitempty"`
 ```
 
-`DriverPNFSMDS` carries the image, resources, scheduling constraints, the state volume's size and class, and the optional storage data network the pod is attached to (§8.4). Its full text is in Appendix B. `MDS` is the only field of `DriverPNFS`. With it unset, an export waits in `Pending` with a `NoMetadataServer` event.
+`DriverPNFSMDS` carries the image, resources, scheduling constraints, the state volume's size and class, and the optional storage data network the pod is attached to (§8.4). Its full text is in Appendix B. `MDS` is the only field of `DriverPNFS`. With it unset, an export waits in `Pending` with a `NoMetadataServer` event. The chart renders `mds: {}` on the SimplyblockDriver it creates (`driver.pnfs.mds.enabled`, on by default), and carries the scheduling, resources, state size, and data network under `driver.pnfs.mds`, so a chart install exports pNFS volumes without configuring the driver afterward.
 
 ---
 
