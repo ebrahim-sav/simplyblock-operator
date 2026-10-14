@@ -78,7 +78,7 @@ func patchVolumeReplicationToSite(
 	ctx context.Context, dyn dynamic.Interface, vr kube.VolumeReplicationRef, className string,
 ) error {
 	patch := []byte(fmt.Sprintf(
-		`{"spec":{"volumeReplicationClassName":%q,"replicationState":%q}}`,
+		`{"spec":{"volumeReplicationClass":%q,"replicationState":%q}}`,
 		className, replicationStatePrimary))
 	_, err := dyn.Resource(kube.VolumeReplicationGVR).Namespace(vr.Namespace).
 		Patch(ctx, vr.Name, types.MergePatchType, patch, metav1.PatchOptions{})

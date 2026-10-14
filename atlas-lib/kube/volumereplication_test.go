@@ -22,7 +22,7 @@ func vrUnstructured(name, ns, claim, class, state string) *unstructured.Unstruct
 		"kind":       "VolumeReplication",
 		"metadata":   map[string]interface{}{"name": name, "namespace": ns},
 		"spec": map[string]interface{}{
-			"volumeReplicationClassName": class,
+			"volumeReplicationClass": class,
 			"replicationState":           state,
 			"dataSource": map[string]interface{}{
 				"kind": "PersistentVolumeClaim", "name": claim, "apiGroup": "",

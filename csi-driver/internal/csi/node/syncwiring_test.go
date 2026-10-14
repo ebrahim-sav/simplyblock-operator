@@ -35,7 +35,7 @@ func TestPatchVolumeReplicationToSite(t *testing.T) {
 		"kind":       "VolumeReplication",
 		"metadata":   map[string]interface{}{"name": "vr1", "namespace": "app"},
 		"spec": map[string]interface{}{
-			"volumeReplicationClassName": "sb-sync-b",
+			"volumeReplicationClass": "sb-sync-b",
 			"replicationState":           "secondary",
 			"dataSource":                 map[string]interface{}{"kind": "PersistentVolumeClaim", "name": "claim1"},
 		},
@@ -54,7 +54,7 @@ func TestPatchVolumeReplicationToSite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	class, _, _ := unstructured.NestedString(got.Object, "spec", "volumeReplicationClassName")
+	class, _, _ := unstructured.NestedString(got.Object, "spec", "volumeReplicationClass")
 	state, _, _ := unstructured.NestedString(got.Object, "spec", "replicationState")
 	if class != "sb-sync-a" || state != "primary" {
 		t.Errorf("after patch: class=%q state=%q, want sb-sync-a/primary", class, state)

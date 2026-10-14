@@ -34,7 +34,7 @@ var VolumeReplicationGVR = schema.GroupVersionResource{
 type VolumeReplicationRef struct {
 	Name             string
 	Namespace        string
-	ClassName        string // spec.volumeReplicationClassName
+	ClassName        string // spec.volumeReplicationClass
 	ReplicationState string // spec.replicationState (primary|secondary)
 	// ObservedState and Completed are the status the node plugin's gate reads: a
 	// promote on this node's site is done when the volume is Primary and the
@@ -49,7 +49,7 @@ func VolumeReplicationRefFrom(u *unstructured.Unstructured) VolumeReplicationRef
 	if u == nil {
 		return VolumeReplicationRef{}
 	}
-	class, _, _ := unstructured.NestedString(u.Object, "spec", "volumeReplicationClassName")
+	class, _, _ := unstructured.NestedString(u.Object, "spec", "volumeReplicationClass")
 	state, _, _ := unstructured.NestedString(u.Object, "spec", "replicationState")
 	observed, _, _ := unstructured.NestedString(u.Object, "status", "state")
 	return VolumeReplicationRef{

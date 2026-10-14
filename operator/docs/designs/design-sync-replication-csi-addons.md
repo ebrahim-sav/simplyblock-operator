@@ -137,7 +137,7 @@ There is also no second cluster, so there is no orchestrator above the driver. T
 │      │   1. volume is sync? (method=sync + cluster sync)      (§6.6)         │
 │      │   2. read this node's site label  ─► site B           (§6.1)         │
 │      │   3. correlate volume ─► its VolumeReplication         (§6.2)         │
-│      │   4. patch VR.spec.volumeReplicationClassName = <site-B class>, primary│
+│      │   4. patch VR.spec.volumeReplicationClass = <site-B class>, primary    │
 │      │   5. wait until VR reports promoted-on-B               (§6.4)  ◄─┐    │
 │      │   6. GET V/connect (led site = B now) ─► attach, mount              │    │
 │      ▼                                                                  │    │
@@ -238,9 +238,9 @@ With the node's site in hand, the node plugin finds the volume's `VolumeReplicat
 
 1. **Correlate the volume to its `VolumeReplication`.** From the volume handle, find the `PersistentVolume` whose `csi.volumeHandle` matches, read its `claimRef` to the `PersistentVolumeClaim`, and find the `VolumeReplication` in the PVC's namespace whose `spec.dataSource` names that PVC. For a group member, the `VolumeGroupReplication` whose selector matches the PVC (§14). The correlation uses the `atlas-lib` helpers (§4).
 2. **Select the site's class.** Among the `VolumeReplicationClass` objects with the simplyblock provisioner and `method: sync`, pick the one whose `site` parameter equals the node's site. If none exists, that is a misconfiguration surfaced as a staging error (§12), not a silent default.
-3. **Patch the `VolumeReplication`.** Set `spec.volumeReplicationClassName` to the selected class and `spec.replicationState` to `primary`. The patch is idempotent: when the volume is already pointed at this site's class and primary, the patch is a no-op and staging proceeds straight to the gate.
+3. **Patch the `VolumeReplication`.** Set `spec.volumeReplicationClass` (the per-volume VR field, not the group's `volumeReplicationClassName`) to the selected class and `spec.replicationState` to `primary`. The patch is idempotent: when the volume is already pointed at this site's class and primary, the patch is a no-op and staging proceeds straight to the gate.
 
-The patch is the whole signal. The administrator's `VolumeReplication` carries whatever class it was created with; the node overwrites `volumeReplicationClassName` to name the pod's site. This is the "switching of the VolumeReplicationClass" the control model centers on, and it is driven entirely by where the pod landed.
+The patch is the whole signal. The administrator's `VolumeReplication` carries whatever class it was created with; the node overwrites `volumeReplicationClass` to name the pod's site. This is the "switching of the VolumeReplicationClass" the control model centers on, and it is driven entirely by where the pod landed.
 
 ### 6.3 The controller performs the switch
 
