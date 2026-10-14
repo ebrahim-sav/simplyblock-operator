@@ -14561,6 +14561,12 @@ rules:
   - get
   - update
 - apiGroups:
+  - operator.openshift.io
+  resources:
+  - networks
+  verbs:
+  - get
+- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets

@@ -13,7 +13,12 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	simplyblockv1alpha2 "github.com/simplyblock/simplyblock-operator/api/v1alpha2"
 )
 
 // testNodeIP is the address the baseline Kubernetes node publishes, and so the
@@ -88,7 +93,7 @@ func TestClientSetAdmitsTheOVNKubernetesNodeSubnet(t *testing.T) {
 		t.Fatalf("clusterNodeAddresses: %v", err)
 	}
 	slices.Sort(got)
-	if want := []string{"10.129.2.0/23", "192.168.10.247"}; !slices.Equal(got, want) {
+	if want := []string{"10.129.2.0/23", "100.64.0.0/16", "192.168.10.247"}; !slices.Equal(got, want) {
 		t.Errorf("clients = %v, want %v", got, want)
 	}
 }
@@ -106,13 +111,14 @@ func TestClientSetPrefersSpecPodCIDRsOverTheOVNAnnotation(t *testing.T) {
 		t.Fatalf("clusterNodeAddresses: %v", err)
 	}
 	slices.Sort(got)
-	if want := []string{"10.244.1.0/24", testNodeIP}; !slices.Equal(got, want) {
+	if want := []string{"10.244.1.0/24", "100.64.0.0/16", testNodeIP}; !slices.Equal(got, want) {
 		t.Errorf("clients = %v, want %v", got, want)
 	}
 }
 
-// An annotation that does not parse admits nothing: the set never widens on an
-// input it cannot read.
+// An annotation that does not parse admits no subnet of its own: the set never
+// widens on an input it cannot read. The node is still an OVN-Kubernetes node,
+// so the join subnet is admitted.
 func TestClientSetIgnoresAMalformedOVNAnnotation(t *testing.T) {
 	node := kubeNode("vm01", testNodeIP)
 	node.Annotations = map[string]string{"k8s.ovn.org/node-subnets": `{"default":"*"}`}
@@ -122,7 +128,85 @@ func TestClientSetIgnoresAMalformedOVNAnnotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("clusterNodeAddresses: %v", err)
 	}
-	if want := []string{testNodeIP}; !slices.Equal(got, want) {
+	slices.Sort(got)
+	if want := []string{"100.64.0.0/16", testNodeIP}; !slices.Equal(got, want) {
+		t.Errorf("clients = %v, want %v", got, want)
+	}
+}
+
+// ovnNode is a node of a cluster running OVN-Kubernetes, which records its pod
+// subnet in an annotation rather than in spec.podCIDRs.
+func ovnNode(name, internalIP, subnet string) *corev1.Node {
+	node := kubeNode(name, internalIP)
+	node.Annotations = map[string]string{"k8s.ovn.org/node-subnets": `{"default":["` + subnet + `"]}`}
+	return node
+}
+
+// exportReconcilerWithOpenShiftNetwork is newExportReconciler on a cluster that
+// serves OpenShift's network operator config, with network as its object.
+func exportReconcilerWithOpenShiftNetwork(
+	t *testing.T, network *unstructured.Unstructured, objects ...client.Object,
+) *NFSExportReconciler {
+	t.Helper()
+	scheme := newTestScheme(t, corev1.AddToScheme, discoveryv1.AddToScheme)
+	scheme.AddKnownTypeWithName(openShiftNetworkGVK, &unstructured.Unstructured{})
+	scheme.AddKnownTypeWithName(openShiftNetworkGVK.GroupVersion().WithKind("NetworkList"), &unstructured.UnstructuredList{})
+	cl := newTestClient(t, scheme, []client.Object{&simplyblockv1alpha2.NFSExport{}}, append(objects, network)...)
+	return &NFSExportReconciler{Client: cl, Scheme: scheme, Recorder: &fakeRecorder{}, OperatorNamespace: testOperatorNS}
+}
+
+// Regression: pnfs-1791984348 on OpenShift. A node plugin mounts from the
+// host network through the export's ClusterIP, and OVN-Kubernetes' gateway
+// router rewrites that traffic to the node's address on the join subnet, so
+// the guest saw 100.64.0.5, .7 and .8 and refused every mount. On a cluster
+// running OVN-Kubernetes without OpenShift's network config, the join subnet
+// is OVN's default.
+func TestClientSetAdmitsTheOVNJoinSubnet(t *testing.T) {
+	r, _ := newExportReconciler(t, &fakeAssembler{}, readyExport(),
+		ovnNode("worker-1", "192.168.10.244", "10.131.0.0/23"))
+
+	got, err := r.clusterNodeAddresses(context.Background())
+	if err != nil {
+		t.Fatalf("clusterNodeAddresses: %v", err)
+	}
+	if !slices.Contains(got, "100.64.0.0/16") {
+		t.Errorf("clients = %v, want OVN's default join subnet 100.64.0.0/16", got)
+	}
+}
+
+// On OpenShift the join subnet is the one the network operator configures.
+func TestClientSetAdmitsTheConfiguredOpenShiftJoinSubnet(t *testing.T) {
+	network := &unstructured.Unstructured{Object: map[string]any{
+		"metadata": map[string]any{"name": "cluster"},
+		"spec": map[string]any{"defaultNetwork": map[string]any{"ovnKubernetesConfig": map[string]any{
+			"ipv4": map[string]any{"internalJoinSubnet": "100.66.0.0/16"},
+		}}},
+	}}
+	network.SetGroupVersionKind(openShiftNetworkGVK)
+	r := exportReconcilerWithOpenShiftNetwork(t, network, ovnNode("worker-1", "192.168.10.244", "10.131.0.0/23"))
+
+	got, err := r.clusterNodeAddresses(context.Background())
+	if err != nil {
+		t.Fatalf("clusterNodeAddresses: %v", err)
+	}
+	if !slices.Contains(got, "100.66.0.0/16") || slices.Contains(got, "100.64.0.0/16") {
+		t.Errorf("clients = %v, want the configured join subnet 100.66.0.0/16 and not the default", got)
+	}
+}
+
+// A cluster without OVN-Kubernetes, such as Talos or K3s with Flannel, has no
+// join subnet, and its client set stays the nodes and their pod subnets.
+func TestClientSetHasNoJoinSubnetWithoutOVN(t *testing.T) {
+	node := kubeNode("vm01", testNodeIP)
+	node.Spec.PodCIDRs = []string{"10.244.1.0/24"}
+	r, _ := newExportReconciler(t, &fakeAssembler{}, readyExport(), node)
+
+	got, err := r.clusterNodeAddresses(context.Background())
+	if err != nil {
+		t.Fatalf("clusterNodeAddresses: %v", err)
+	}
+	slices.Sort(got)
+	if want := []string{"10.244.1.0/24", testNodeIP}; !slices.Equal(got, want) {
 		t.Errorf("clients = %v, want %v", got, want)
 	}
 }
