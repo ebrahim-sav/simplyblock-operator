@@ -2122,3 +2122,81 @@ class NodeAgentPollGaps(unittest.TestCase):
                            (self.START + timedelta(minutes=2), self.END))
         found = self.found(lines)
         self.assertEqual([f.attribution for f in found], [Attribution.RUN], found)
+
+
+def guest_ctrl(lvol: str, addr: str, uptime: float = 100.0) -> str:
+    """A line the metadata server's guest kernel writes when a path to a volume connects."""
+    return (f"[ {uptime:.6f}] nvme nvme9: new ctrl: NQN \"nqn.2023-02.io.simplyblock:c1:lvol:{lvol}\", "
+            f"addr {addr}, hostnqn: nqn.2014-08.io.simplyblock:uuid:guest")
+
+
+def client_ctrl(node: str, lvol: str, addr: str) -> NvmeController:
+    """A path a client node holds to a volume."""
+    return NvmeController(node=node, name="nvme1", nqn=f"nqn.2023-02.io.simplyblock:c1:lvol:{lvol}",
+                          address=addr, state="live", namespaces={1: "optimized"})
+
+
+class PnfsMultipath(unittest.TestCase):
+    """The metadata server's guest reaches every path a volume has, as a client does. A
+    guest on a node that runs a storage node cannot reach that node's listener through the
+    pod network or a macvlan, and every volume with a path there is left on one path."""
+
+    CLIENTS = [client_ctrl("w1", "lv1", "10.10.10.244:4421"), client_ctrl("w1", "lv1", "10.10.10.247:4421"),
+               client_ctrl("w2", "lv2", "10.10.10.245:4433"), client_ctrl("w2", "lv2", "10.10.10.246:4433")]
+
+    def _found(self, guest: list[str], controllers: list[NvmeController] | None = None) -> list:
+        ev = FakeEvidence(logs={"mds-runner": guest},
+                          controllers=self.CLIENTS if controllers is None else controllers)
+        return list(build_detector("pnfs.multipath").detect(ev))
+
+    def test_a_guest_with_every_path_is_clean(self):
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"), guest_ctrl("lv1", "10.10.10.247:4421"),
+                 guest_ctrl("lv2", "10.10.10.245:4433"), guest_ctrl("lv2", "10.10.10.246:4433")]
+        self.assertEqual([f for f in self._found(guest) if f.severity != Severity.INFO], [])
+
+    # Regression: pnfs-1791985761 on OpenShift. The metadata server ran on worker-4, a
+    # storage node, and its guest never connected to 10.10.10.247, worker-4's own data
+    # address, while every client held a path there. On Talos it ran on the control-plane
+    # node in every run, so the case was never exercised.
+    def test_an_address_the_guest_never_reached_is_critical(self):
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"),
+                 guest_ctrl("lv2", "10.10.10.245:4433"), guest_ctrl("lv2", "10.10.10.246:4433")]
+        found = [f for f in self._found(guest) if f.severity == Severity.CRITICAL]
+        self.assertEqual([f.subject for f in found], ["10.10.10.247"])
+        self.assertIn("lv1", found[0].detail)
+
+    def test_failed_connects_are_reported_beside_complete_paths(self):
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"), guest_ctrl("lv1", "10.10.10.247:4421"),
+                 "[ 4668.566138] nvme nvme9: failed to connect socket: -110",
+                 "[ 4799.856314] nvme nvme9: failed to connect socket: -113"]
+        found = self._found(guest, self.CLIENTS[:2])
+        self.assertEqual([(f.severity, f.subject) for f in found if f.severity != Severity.INFO],
+                         [(Severity.WARNING, "connect")])
+
+    def test_a_cluster_whose_volumes_have_one_path_is_clean(self):
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"), guest_ctrl("lv2", "10.10.10.245:4433")]
+        clients = [client_ctrl("w1", "lv1", "10.10.10.244:4421"), client_ctrl("w2", "lv2", "10.10.10.245:4433")]
+        self.assertEqual([f for f in self._found(guest, clients) if f.severity != Severity.INFO], [])
+
+    # Regression: pnfs-1791985761 again. Churn volumes are deleted during the run, and
+    # with them every client's path to them, so the volumes the guest ran on one path have
+    # no client path left to compare with. The clients' paths to other volumes still show
+    # the address, and the guest's volumes still show the missing path by their count.
+    def test_single_path_volumes_are_critical_when_their_clients_are_gone(self):
+        guest = [guest_ctrl("lvA", "10.10.10.244:4421"), guest_ctrl("lvA", "10.10.10.245:4421"),
+                 guest_ctrl("lvB", "10.10.10.244:4433"), guest_ctrl("lvC", "10.10.10.246:4435")]
+        clients = [client_ctrl("w1", "lvX", "10.10.10.244:4421"), client_ctrl("w1", "lvX", "10.10.10.247:4421")]
+        found = [f for f in self._found(guest, clients) if f.severity == Severity.CRITICAL]
+        self.assertEqual([f.subject for f in found], ["10.10.10.247"])
+        self.assertIn("2 volume(s)", found[0].detail)
+
+    def test_single_path_volumes_without_a_known_address_are_still_critical(self):
+        guest = [guest_ctrl("lvA", "10.10.10.244:4421"), guest_ctrl("lvA", "10.10.10.245:4421"),
+                 guest_ctrl("lvB", "10.10.10.244:4433")]
+        found = [f for f in self._found(guest, []) if f.severity == Severity.CRITICAL]
+        self.assertEqual([f.subject for f in found], ["paths"])
+
+    def test_without_the_metadata_server_log_it_skips(self):
+        ev = FakeEvidence(controllers=self.CLIENTS)
+        with self.assertRaises(SkipDetector):
+            list(build_detector("pnfs.multipath").detect(ev))

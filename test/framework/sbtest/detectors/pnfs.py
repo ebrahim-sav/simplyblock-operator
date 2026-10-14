@@ -23,6 +23,7 @@ reached the client's namespace again.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from typing import Any
@@ -359,3 +360,91 @@ def _while_running(got: list[BlockSample], vol: PnfsVolume, node: str,
     inside = [s for s in got if start <= s.ts <= end]
     return inside if len(inside) >= 2 else got
 
+
+
+#: A path the metadata server's guest connected: its kernel's line for a new controller.
+_GUEST_CTRL = re.compile(r'new ctrl: NQN "[^"]*:lvol:(?P<lvol>[0-9a-zA-Z-]+)", addr (?P<ip>[0-9.]+):')
+
+#: A connect the guest's kernel gave up on. It names no address: which path failed is what
+#: the comparison with the clients' paths finds.
+_GUEST_CONNECT_FAILED = re.compile(r"failed to connect socket: -(?P<errno>\d+)")
+
+#: A path a client holds, by the volume in its NQN.
+_LVOL_NQN = re.compile(r":lvol:(?P<lvol>[0-9a-zA-Z-]+)$")
+
+
+@detector
+class Multipath(Detector):
+    """Whether the metadata server's guest reached every path a volume has.
+
+    The guest attaches each volume it exports over NVMe/TCP, as a client does, and needs
+    the same paths: a volume left on one path stops when that path does. Two comparisons
+    find a missing path, and neither needs the volume's clients to outlive it:
+
+    * A volume the guest attached on fewer paths than volumes have in this cluster, the
+      most any volume has in the guest or on a client.
+    * An address the clients connect to, for any volume, that the guest never connected
+      to, for any volume. It names the path the short volumes are missing.
+
+    The case that produces it is a metadata server on a node that runs a storage node: the
+    node's NVMe/TCP listeners are bound to its data interface, and neither the pod network
+    nor a macvlan delivers a connection to its own node on that interface.
+    """
+
+    name = "pnfs.multipath"
+    summary = "a volume the metadata server's guest attached on fewer paths than it has"
+
+    def defaults(self) -> dict[str, Any]:
+        return {"container_log": "mds-runner"}
+
+    def detect(self, ev: Evidence) -> Iterable[Finding]:
+        guest: dict[str, set[str]] = {}
+        failed: dict[str, int] = {}
+        any_line = False
+        for line in ev.container_log(str(self.opt("container_log"))):
+            any_line = True
+            if m := _GUEST_CTRL.search(line):
+                guest.setdefault(m["lvol"], set()).add(m["ip"])
+            elif m := _GUEST_CONNECT_FAILED.search(line):
+                failed[m["errno"]] = failed.get(m["errno"], 0) + 1
+        if not any_line:
+            raise SkipDetector("no metadata server log collected")
+        if not guest:
+            raise SkipDetector("the metadata server's guest attached no volume")
+
+        clients: dict[str, set[str]] = {}
+        for c in ev.nvme_controllers():
+            if m := _LVOL_NQN.search(c.nqn):
+                clients.setdefault(m["lvol"], set()).add(c.address.rsplit(":", 1)[0])
+
+        paths = max(len(p) for p in [*guest.values(), *clients.values()])
+        short = sorted(lvol for lvol, reached in guest.items() if len(reached) < paths)
+        reached_any = set().union(*guest.values())
+        unreached = sorted(set().union(*clients.values()) - reached_any) if clients else []
+
+        for ip in unreached:
+            yield critical(
+                self.name, f"the metadata server's guest never reached {ip}", subject=ip,
+                detail=f"{len(short)} volume(s) of {len(guest)} ran on fewer than {paths} path(s) "
+                       f"in the guest: {', '.join(short[:10])}{' ...' if len(short) > 10 else ''}",
+                note="The clients reach this address and the guest never did. A metadata "
+                     "server on the node that owns the address cannot reach it through the "
+                     "pod network or a macvlan.")
+        if short and not unreached:
+            yield critical(
+                self.name, f"{len(short)} volume(s) ran on fewer paths in the guest than volumes have",
+                subject="paths",
+                detail=f"fewer than {paths} path(s): {', '.join(short[:10])}"
+                       f"{' ...' if len(short) > 10 else ''}",
+                note="No client path names the missing address, so it is known only by the "
+                     "count.")
+        if failed:
+            total = sum(failed.values())
+            yield warning(
+                self.name, f"the guest failed {total} NVMe/TCP connect(s)", subject="connect",
+                detail=", ".join(f"-{e}: {n}" for e, n in sorted(failed.items())),
+                note="110 is a timeout and 113 an unreachable host. Every new export waits for "
+                     "these before it is served.")
+        yield info(self.name, f"{len(guest)} volume(s) attached in the guest, {paths} path(s) each "
+                   "expected", subject="coverage",
+                   detail=f"{len(guest) - len(short)} with every path, {len(short)} short")
