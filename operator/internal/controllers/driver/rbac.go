@@ -35,6 +35,7 @@ var (
 	csiaddons     = []string{"csiaddons.openshift.io"}
 	simplyblock   = []string{"storage.simplyblock.io"}
 	coordination  = []string{"coordination.k8s.io"}
+	replication   = []string{"replication.storage.openshift.io"}
 )
 
 // clusterRoleRules is the rule set of each of the five roles, keyed by the
@@ -56,6 +57,15 @@ var clusterRoleRules = map[string][]rbacv1.PolicyRule{
 		// The node reads its own export back at stage time. It never writes
 		// one: a node that could would bind an export to itself.
 		rule(simplyblock, []string{"nfsexports"}, "get", "list", "watch"),
+		// Synchronous replication: the node decides, per PVC at stage time,
+		// whether a volume is managed by a sync VolumeReplication and re-points
+		// that VolumeReplication at the class naming the pod's site
+		// (design-sync-replication-csi-addons.md §6.2, §6.6). watch backs the
+		// informer and patch is the re-point; it never creates or deletes a
+		// VolumeReplication, whose existence the administrator owns. Classes are
+		// read-only.
+		rule(replication, []string{"volumereplications"}, "get", "list", "watch", "patch"),
+		rule(replication, []string{"volumereplicationclasses"}, "get", "list", "watch"),
 	},
 	// The driver's own controller plugin, as distinct from the sidecars. It
 	// had no role until pNFS: every API-server call on that pod was a
@@ -176,7 +186,7 @@ const authDelegatorClusterRole = "system:auth-delegator"
 // by reviewing its bearer token (internal/kubernetes/token/grpc.go,
 // --enable-auth defaults to true) — confirmed against a live cluster, where
 // omitting this left every connection attempt failing with "failed to
-// review token ... is forbidden ... at the cluster scope". Binding to the
+// review token ... is forbidden ... at the cluster scope." Binding to the
 // built-in role rather than a hand-rolled ClusterRole needs no new marker on
 // the operator's own ClusterRole: the operator already holds `bind` on
 // every ClusterRole unconditionally (rbac.go's clusterroles;clusterrolebindings

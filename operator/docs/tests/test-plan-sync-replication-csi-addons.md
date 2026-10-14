@@ -2,7 +2,7 @@
 
 Related design: [`designs/design-sync-replication-csi-addons.md`](../designs/design-sync-replication-csi-addons.md)
 
-Scenario IDs are permanent. `Type` is one of `Positive`, `Negative`, `Boundary`, `Regression`. The `Test` column holds the verbatim test function, or `—` when nothing covers the scenario yet, in which case the ID reappears in [What Is Not Yet Covered](#what-is-not-yet-covered). Nothing in this design is implemented, so every row is `—` today and this plan is the coverage the implementation must deliver.
+Scenario IDs are permanent. `Type` is one of `Positive`, `Negative`, `Boundary`, `Regression`. The `Test` column holds the verbatim test function, or `—` when nothing covers the scenario yet, in which case the ID reappears in [What Is Not Yet Covered](#what-is-not-yet-covered). Parts of this design are implemented on the `sync-replication` branch (design [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status)): the method dispatch and the sync write verbs (§5, §7) and the operator provisioning (§9.4–§9.6) are built and carry the tests named below. The node path (§6), the sync status read (§5.3, §8), and most integration and end-to-end coverage are not yet built and stay `—`.
 
 Class prefixes: `U-` unit (mock backend HTTP and fake Kubernetes objects, no cluster), `I-` integration (`envtest` plus the csi-addons sidecar plus a mock backend), `E-` end-to-end (a live two-site synchronous cluster, the switch driven by pod scheduling), `M-` manual (needs orchestration not yet automated). The group scenarios (`G-`, Phase 2) are a planned block and carry no `Type` until the work is scoped (design §14).
 
@@ -18,97 +18,96 @@ Drive each replication RPC handler against an `httptest` backend, and the node-s
 
 File: `csi-driver/internal/csi/controller/replication_method_test.go`
 
-| #    | Scenario                                                                  | Type     | Test |
-|------|---------------------------------------------------------------------------|----------|------|
-| U-01 | No `method` parameter: the RPC takes the async path unchanged             | Negative | —    |
-| U-02 | `method: async` explicit: the async path                                  | Positive | —    |
-| U-03 | `method: sync`: the sync route is called                                  | Positive | —    |
-| U-04 | An unrecognized `method` value is rejected, not silently treated as async | Boundary | —    |
+| #    | Scenario                                                                  | Type     | Test              |
+|------|---------------------------------------------------------------------------|----------|-------------------|
+| U-01 | No `method` parameter: the RPC takes the async path unchanged             | Negative | TestResolveMethod |
+| U-02 | `method: async` explicit: the async path                                  | Positive | TestResolveMethod |
+| U-03 | `method: sync`: the sync route is called                                  | Positive | TestResolveMethod |
+| U-04 | An unrecognized `method` value is rejected, not silently treated as async | Boundary | TestResolveMethod |
 
 ### Site resolution (§5.1, §9.2)
 
 File: `csi-driver/internal/csi/controller/replication_method_test.go`
 
-| #    | Scenario                                                          | Type     | Test |
-|------|-------------------------------------------------------------------|----------|------|
-| U-05 | `method: sync` with `site`: the value is passed as `?site=`       | Positive | —    |
-| U-06 | `method: sync` with no `site`: `InvalidArgument`, no backend call | Negative | —    |
+| #    | Scenario                                                          | Type     | Test                       |
+|------|-------------------------------------------------------------------|----------|----------------------------|
+| U-05 | `method: sync` with `site`: the value is passed as `?site=`       | Positive | TestSyncPromoteDispatch    |
+| U-06 | `method: sync` with no `site`: `InvalidArgument`, no backend call | Negative | TestSyncPromoteMissingSite |
 
 ### Promote (§7.1, §12)
 
 File: `csi-driver/internal/csi/controller/replication_sync_promote_test.go`
 
-| #    | Scenario                                                                                                                       | Type     | Test |
-|------|--------------------------------------------------------------------------------------------------------------------------------|----------|------|
-| U-07 | Unforced `PromoteVolume` maps to `planned=true`                                                                                | Positive | —    |
-| U-08 | Forced `PromoteVolume` maps to `planned=false`                                                                                 | Positive | —    |
-| U-09 | `409` "in progress" returns a retryable code and does not escalate                                                             | Negative | —    |
-| U-10 | `200` with a `SyncPromoteResultDTO` returns success                                                                            | Positive | —    |
-| U-11 | `412` peer-site-offline on an unforced promote makes the controller auto-escalate to a forced promote (`planned=false`) (§7.1) | Boundary | —    |
-| U-12 | `409` gate refusal returns retryable and is not the escalation code                                                            | Boundary | —    |
-| U-13 | `409` forced-while-peer-live returns retryable, force does not act on a live site                                              | Negative | —    |
+| #    | Scenario                                                                                                                       | Type     | Test                                          |
+|------|--------------------------------------------------------------------------------------------------------------------------------|----------|-----------------------------------------------|
+| U-07 | Unforced `PromoteVolume` maps to `planned=true`                                                                                | Positive | TestSyncPromoteDispatch                       |
+| U-08 | Forced `PromoteVolume` maps to `planned=false`                                                                                 | Positive | TestSyncPromoteDispatch                       |
+| U-09 | `409` "in progress" returns a retryable code and does not escalate                                                             | Negative | TestSyncPromoteStatusProtocol                 |
+| U-10 | `200` with a `SyncPromoteResultDTO` returns success                                                                            | Positive | TestSyncPromoteDispatch                       |
+| U-11 | `412` peer-site-offline on an unforced promote makes the controller auto-escalate to a forced promote (`planned=false`) (§7.1) | Boundary | TestSyncPromoteStatusProtocol                 |
+| U-12 | `409` gate refusal returns retryable and is not the escalation code                                                            | Boundary | TestSyncPromoteStatusProtocol                 |
+| U-13 | `409` forced-while-peer-live returns retryable, force does not act on a live site                                              | Negative | TestSyncPromoteForcedWhilePeerLiveIsRetryable |
 
 ### Demote (§7.2)
 
 File: `csi-driver/internal/csi/controller/replication_sync_demote_test.go`
 
-| #    | Scenario                                                          | Type     | Test |
-|------|-------------------------------------------------------------------|----------|------|
-| U-14 | `204` fenced on this site returns success                         | Positive | —    |
-| U-15 | `204` not-served-here (no-op) returns success, so a retry is safe | Boundary | —    |
-| U-16 | `409` gate refusal returns retryable                              | Negative | —    |
-| U-17 | `500` ANA RPC failed returns retryable                            | Negative | —    |
+| #    | Scenario                                                          | Type     | Test                                     |
+|------|-------------------------------------------------------------------|----------|------------------------------------------|
+| U-14 | `204` fenced on this site returns success                         | Positive | TestSyncDemoteDispatch                   |
+| U-15 | `204` not-served-here (no-op) returns success, so a retry is safe | Boundary | TestSyncDemoteNotServedIsASuccessfulNoOp |
+| U-16 | `409` gate refusal returns retryable                              | Negative | TestSyncDemoteGateRefusalIsRetryable     |
+| U-17 | `500` ANA RPC failed returns retryable                            | Negative | TestSyncDemoteServerErrorIsRetryable     |
 
 ### No-op verbs (§7.3)
 
 File: `csi-driver/internal/csi/controller/replication_sync_noop_test.go`
 
-| #    | Scenario                                                                        | Type     | Test |
-|------|---------------------------------------------------------------------------------|----------|------|
-| U-18 | `EnableVolumeReplication` on a sync class returns success with no backend call  | Negative | —    |
-| U-19 | `DisableVolumeReplication` on a sync class returns success with no backend call | Negative | —    |
-| U-20 | `ResyncVolume` on a sync class returns success with no backend call             | Negative | —    |
+| #    | Scenario                                                                        | Type     | Test              |
+|------|---------------------------------------------------------------------------------|----------|-------------------|
+| U-18 | `EnableVolumeReplication` on a sync class returns success with no backend call  | Negative | TestSyncNoOpVerbs |
+| U-19 | `DisableVolumeReplication` on a sync class returns success with no backend call | Negative | TestSyncNoOpVerbs |
+| U-20 | `ResyncVolume` on a sync class returns success with no backend call             | Negative | TestSyncNoOpVerbs |
 
 ### Status mapping (§8)
 
-File: `csi-driver/internal/csi/controller/replication_sync_status_test.go`
+File: `csi-driver/internal/csi/controller/replication_test.go`
 
-| #    | Scenario                                                                                                                                                       | Type     | Test |
-|------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|------|
-| U-21 | Healthy sync status maps to `Completed` true, `Degraded` and `Resyncing` false                                                                                 | Positive | —    |
-| U-22 | A running catch-up maps to `Resyncing` true, `Completed` false                                                                                                 | Positive | —    |
-| U-23 | A behind or unknown zone maps to `Degraded` true, `Completed` false                                                                                            | Negative | —    |
-| U-24 | `role` primary maps to `source`, secondary to `secondary`                                                                                                      | Positive | —    |
-| U-25 | In-sync reports `lastSyncTime` as the read time, behind reports the real older instant; `lag_seconds`/`bytes_behind` map to `lastSyncDuration`/`lastSyncBytes` | Boundary | —    |
-| U-26 | `GetVolumeReplicationInfo` reads `replication/status` regardless of method (§5.3)                                                                              | Positive | —    |
+`GetVolumeReplicationInfo` carries no class parameters, so it reads the status route regardless of method, and the backend fills it from the sync status on a sync cluster. The vendored csi-addons response carries only `lastSyncTime`, so that is the one field the driver maps; the `Completed`/`Degraded`/`Resyncing` conditions are the csi-addons controller's, not this read's, so `U-21`–`U-24` are out of the driver's scope and are not driver test rows.
+
+| #    | Scenario                                                                                                         | Type     | Test                                                                      |
+|------|------------------------------------------------------------------------------------------------------------------|----------|---------------------------------------------------------------------------|
+| U-25 | In-sync reports `lastSyncTime` as the backend's last-in-sync instant; a never-replicated volume reports none     | Boundary | TestGetVolumeReplicationInfo, TestGetVolumeReplicationInfoNeverReplicated |
+| U-26 | `GetVolumeReplicationInfo` reads `replication/status` for a sync volume (no async relationship) without erroring | Positive | TestGetVolumeReplicationInfoServesASyncVolume                             |
 
 ### Node-stage site signaling and the gate (§6)
 
-File: `csi-driver/internal/csi/node/stage_sync_test.go`
+File: `csi-driver/internal/csi/node/stage_sync_test.go` and `syncwiring_test.go`, with the per-PVC correlation and class-by-site lookups in `atlas-lib/kube` (`volumereplication_test.go`, `volumereplicationclass_test.go`).
 
-| #    | Scenario                                                                                                             | Type       | Test |
-|------|----------------------------------------------------------------------------------------------------------------------|------------|------|
-| U-27 | The node's site is read from its `topology.kubernetes.io/zone` label (§6.1)                                          | Positive   | —    |
-| U-28 | The volume handle correlates to the `VolumeReplication` via PV `claimRef` to PVC to the referencing VR (§6.2)        | Positive   | —    |
-| U-29 | The class whose `site` parameter equals the node's site is selected; the VR is patched to it and `primary` (§6.2)    | Positive   | —    |
-| U-30 | A non-sync volume (no `method: sync` class, or no VR at all) stages with no site read, no patch, and no gate (§6.6)  | Regression | —    |
-| U-31 | The patch is idempotent: a VR already pointed at this site's class and primary is not re-patched, staging proceeds   | Boundary   | —    |
-| U-32 | The gate releases only when the VR reports `state: Primary` with `Completed` true and the class site matching (§6.4) | Positive   | —    |
-| U-33 | The gate holds with a retryable error while the promote is in progress, and the re-stage re-checks status (§6.4)     | Boundary   | —    |
-| U-34 | A `409` gate refusal or a `412` lost-peer surfaces as a staging error carrying the backend message (§6.4, §12)       | Negative   | —    |
-| U-35 | A sync volume with no `VolumeReplication` fails staging with `FailedPrecondition`, nothing patched (§12)             | Negative   | —    |
-| U-36 | No sync class exists for the node's site: staging fails with `FailedPrecondition` naming the site (§6.2, §12)        | Negative   | —    |
-| U-37 | On `NodeUnstageVolume` the old site is demoted, and a demote of a not-served volume is a `204` no-op (§6.5)          | Positive   | —    |
+| #    | Scenario                                                                                                                                                                                                      | Type       | Test                                                                                 |
+|------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------|--------------------------------------------------------------------------------------|
+| U-27 | The node's site is read from its `topology.kubernetes.io/zone` label (§6.1)                                                                                                                                   | Positive   | TestReadNodeSite                                                                     |
+| U-28 | The volume's PVC identity (from the CSI volume context) correlates to the sync `VolumeReplication` that protects it (§6.2, §6.6)                                                                              | Positive   | TestInformerResolver_SyncVolumeReplicationForClaim                                   |
+| U-29 | The class whose `site` parameter equals the node's site is selected, and the VR is patched to it as `primary` (§6.2)                                                                                          | Positive   | TestInformerResolver_VolumeReplicationClassForSite, TestPatchVolumeReplicationToSite |
+| U-30 | A volume the cache resolves to no sync `VolumeReplication` stages with no patch and no gate; an async-cluster volume is not looked up (§6.6)                                                                  | Regression | TestDetectSyncReplication                                                            |
+| U-31 | The patch is idempotent: a VR already at this site's class and `primary` is not re-patched; staging goes to the gate (§6.2)                                                                                   | Boundary   | TestEnsureSyncPromoted                                                               |
+| U-32 | The gate proceeds only when the VR reports `state: Primary` with `Completed` true (§6.4)                                                                                                                      | Positive   | TestEnsureSyncPromoted                                                               |
+| U-33 | The gate holds with a retryable error while the promote is converging, and the re-stage re-checks (§6.4)                                                                                                      | Boundary   | TestEnsureSyncPromoted                                                               |
+| U-34 | The gate never attaches on an incomplete promote: a promote the controller refuses or escalates stays non-`Completed`, so the gate keeps holding (the `409`/`412` protocol itself is U-09, U-11, U-12) (§6.4) | Negative   | TestEnsureSyncPromoted                                                               |
+| U-35 | On a sync cluster, a stage with no PVC identity in the volume context fails closed with `FailedPrecondition`: membership cannot be determined (§6.6)                                                          | Negative   | TestDetectSyncReplication                                                            |
+| U-36 | No sync class names the node's site: staging fails with `FailedPrecondition` naming the site (§6.2)                                                                                                           | Negative   | TestEnsureSyncPromoted                                                               |
+| U-37 | On `NodeUnstageVolume` a sync volume's site is demoted (best-effort, never blocking teardown); an ordinary volume is not (§6.5)                                                                               | Positive   | TestDemoteSyncOnUnstage                                                              |
+| U-41 | On a sync cluster, a stage before the VR informer has synced fails closed with a retryable error, never attaching the volume as plain on a guess (§6.6)                                                       | Boundary   | TestDetectSyncReplication                                                            |
 
 ### Misconfiguration and transport (§11, §12)
 
 File: `csi-driver/internal/csi/controller/replication_sync_errors_test.go`
 
-| #    | Scenario                                                                                              | Type     | Test |
-|------|-------------------------------------------------------------------------------------------------------|----------|------|
-| U-38 | A sync class against a non-sync cluster (`400`) returns `FailedPrecondition` with the backend message | Negative | —    |
-| U-39 | A backend transport error returns a retryable code                                                    | Negative | —    |
-| U-40 | The node plugin cannot reach the Kubernetes API to patch the VR: staging holds with a retryable error | Negative | —    |
+| #    | Scenario                                                                                                                                                                 | Type     | Test                                           |
+|------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------|------------------------------------------------|
+| U-38 | A sync write against a non-sync cluster (`400`) returns `InvalidArgument`; the backend returns 400 for both this and a bad site, so the driver does not distinguish them | Negative | TestSyncWriteOnNonSyncClusterIsInvalidArgument |
+| U-39 | A backend transport error returns a retryable code                                                                                                                       | Negative | TestSyncPromoteTransportErrorIsRetryable       |
+| U-40 | The node plugin cannot read the VolumeReplication (resolver error): staging holds with a retryable error                                                                 | Negative | TestDetectSyncReplication                      |
 
 ---
 
@@ -137,13 +136,13 @@ Run the `ClusterDeploymentConfig` expansion, the `StorageCluster` and `StorageNo
 
 File: `operator/internal/controller/*_unit_test.go` and the envtest suites
 
-| #    | Scenario                                                                                                                                          | Type     | Test |
-|------|---------------------------------------------------------------------------------------------------------------------------------------------------|----------|------|
-| I-11 | `ClusterTemplate.enableSyncReplication=true` expands to the `StorageCluster` toggle and sends `sync_replication: true` in the cluster-create body | Positive | —    |
-| I-12 | `enableSyncReplication` is immutable: the webhook rejects a change on a live `StorageCluster`                                                     | Negative | —    |
-| I-13 | A `NodeGroup.site` expands to `StorageNode.spec.config.site` and is sent as `site` in the node-add body                                           | Positive | —    |
-| I-14 | On a sync cluster, a node with no `site` is rejected before add, mirroring the failure-domain check                                               | Negative | —    |
-| I-15 | `StorageNode.spec.config.site` is immutable: the `spec.config` webhook rejects a change once set                                                  | Negative | —    |
+| #    | Scenario                                                                                                                                          | Type     | Test                                  |
+|------|---------------------------------------------------------------------------------------------------------------------------------------------------|----------|---------------------------------------|
+| I-11 | `ClusterTemplate.enableSyncReplication=true` expands to the `StorageCluster` toggle and sends `sync_replication: true` in the cluster-create body | Positive | —                                     |
+| I-12 | `enableSyncReplication` is immutable: the webhook rejects a change on a live `StorageCluster`                                                     | Negative | —                                     |
+| I-13 | A `NodeGroup.site` expands to `StorageNode.spec.config.site` and is sent as `site` in the node-add body                                           | Positive | —                                     |
+| I-14 | On a sync cluster, a node with no `site` is rejected before add, mirroring the failure-domain check                                               | Negative | TestSitesAreCheckedAgainstTheTemplate |
+| I-15 | `StorageNode.spec.config.site` is immutable: the `spec.config` webhook rejects a change once set                                                  | Negative | —                                     |
 
 ---
 
@@ -199,27 +198,25 @@ The consistency-group variant (design §14). A planned block: the type of each s
 
 | Class                 | Scenarios | Covered | Not covered |
 |-----------------------|-----------|---------|-------------|
-| Unit (`U-`)           | 40        | 0       | 40          |
-| Integration (`I-`)    | 15        | 0       | 15          |
+| Unit (`U-`)           | 37        | 37      | 0           |
+| Integration (`I-`)    | 15        | 1       | 14          |
 | End-to-end (`E-`)     | 5         | 0       | 5           |
 | Group, Phase 2 (`G-`) | 5         | 0       | 5           |
 | Manual (`M-`)         | 1         | 0       | 1           |
-| **Total**             | **66**    | **0**   | **66**      |
+| **Total**             | **63**    | **38**  | **25**      |
+
+Every unit scenario is covered: the method dispatch and sync write verbs including the edge cases (`U-01`–`U-20`), the status read (`U-25`, `U-26`), the full node-stage path with the switchover and demote-on-unstage (`U-27`–`U-37`, `U-40`, `U-41`), and the misconfiguration and transport cases (`U-38`, `U-39`). They span the controller package, the node package (`TestDetectSyncReplication`, `TestEnsureSyncPromoted`, `TestReadNodeSite`, `TestPatchVolumeReplicationToSite`, `TestDemoteSyncOnUnstage`), and the `atlas-lib/kube` resolver tests. `I-14` is the sync-site provisioning check. See the [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status) in the design.
 
 ---
 
 ## What Is Not Yet Covered
 
-Nothing is implemented: this plan defines the coverage the implementation delivers. The gaps that matter most, in the order they should land:
+Every unit scenario is covered. The gaps are the integration, end-to-end, group, and manual tiers, in the order they should land:
 
-| #                 | Gap                                                                                                           | Reason                                                                                                                                                         |
-|-------------------|---------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| U-32 through U-37 | The gate and the node-stage signal: release only on promoted-here, hold otherwise, correlate and patch the VR | The highest risk (design §6.4, §15). A gate released before the promote completes is a wrong-site attach, the one outcome the design exists to prevent.        |
-| U-09, U-11, U-12  | The `409` against `412` protocol: retryable gate refusal, the escalation trigger, in-progress poll            | Second-highest risk (design §12, §15). A `409` miscoded as escalation forces a promote that should wait; a `412` miscoded as a retry hangs a disaster promote. |
-| U-01 through U-08 | Method dispatch, site resolution, and `force` to `planned` inversion                                          | The feature does nothing correctly until the dispatch and the inversion are right.                                                                             |
-| U-14 through U-40 | Demote, the no-op verbs, status mapping, unstage demote, and misconfiguration                                 | The rest of the per-RPC and node-stage behavior.                                                                                                               |
-| I-01 through I-10 | The reconcile loop and the staging path against the sidecar, plus the node plugin RBAC                        | Proves the node-plugin-driven switch, the condition surface, and the privilege surface, which the unit tests cannot.                                           |
-| I-11 through I-15 | The operator provisioning CR fields                                                                           | The cluster toggle and node site must reach the backend create and add bodies and be enforced by admission (design §9.5, §9.6).                                |
-| E-01 through E-05 | Pod placement and movement, disaster, recovery resync, and the gate's wrong-site guard                        | Needs a two-site cluster; the only proof the gate prevents a wrong-site attach and the connection entries serve the volume.                                    |
-| G-01 through G-05 | The group variant                                                                                             | Phase 2; testable once the group RPC handlers land (design §14).                                                                                               |
-| M-01              | Shared-store blocking                                                                                         | Needs a store deliberately shared across the site boundary.                                                                                                    |
+| #                      | Gap                                                                                    | Reason                                                                                                                                                                                                       |
+|------------------------|----------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| I-01 through I-10      | The reconcile loop and the staging path against the sidecar, plus the node plugin RBAC | The node path is built and unit-tested; these prove it against a live API server and the csi-addons sidecar (the informer sync, the real patch, the RBAC), which the units cannot. Needs an envtest harness. |
+| I-11, I-12, I-13, I-15 | The operator provisioning CR fields beyond the site check                              | The cluster toggle's expansion and body, the node-site expansion, and the two immutability webhooks are wired but not yet each asserted (design §9.5, §9.6).                                                 |
+| E-01 through E-05      | Pod placement and movement, disaster, recovery resync, and the gate's wrong-site guard | Needs a two-site cluster; the only proof the gate prevents a wrong-site attach and the connection entries serve the volume.                                                                                  |
+| G-01 through G-05      | The group variant scenarios                                                            | The group dispatch is covered by `TestSyncGroupDispatch`; these scenarios (ordered demote, member resolution, split-site guard) are not yet each asserted (design §14).                                      |
+| M-01                   | Shared-store blocking                                                                  | Needs a store deliberately shared across the site boundary.                                                                                                                                                  |

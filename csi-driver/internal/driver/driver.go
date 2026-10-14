@@ -26,17 +26,22 @@ package driver
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	csiaddonsidentity "github.com/csi-addons/spec/lib/go/identity"
 	csiaddonsreplication "github.com/csi-addons/spec/lib/go/replication"
 	csiaddonsvolumegroup "github.com/csi-addons/spec/lib/go/volumegroup"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/dynamic/dynamicinformer"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 
+	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/link"
 	"github.com/simplyblock/atlas/nfsexport/nfsexportrpc"
 	"github.com/simplyblock/atlas/nvme"
@@ -123,7 +128,7 @@ func Run(conf *config.Config) {
 
 	if conf.IsNodeServer {
 		var err error
-		ns, err = startNodeServer(cd, kubeClient)
+		ns, err = startNodeServer(cd, kubeClient, dynClient)
 		if err != nil {
 			klog.Fatalf("failed to create node server: %s", err)
 		}
@@ -255,7 +260,7 @@ func startLink(ctx context.Context, conf *config.Config, kubeClient kubernetes.I
 // every poll, so a single instance means a single PV watch and a single PVC
 // watch. It serves reads from cache once synced and falls back to the API until
 // then, so neither consumer needs a fallback of its own.
-func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface) (*node.Server, error) {
+func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface, dynClient dynamic.Interface) (*node.Server, error) {
 	manager := sbkube.NewManager(kubeClient)
 	manager.Start(context.Background())
 
@@ -263,6 +268,8 @@ func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface) (
 	if err != nil {
 		return nil, err
 	}
+
+	enableSyncReplication(context.Background(), ns, kubeClient, dynClient)
 
 	nodeName := cd.GetNodeID()
 	podGuardian, err := guardian.Start(context.Background(), guardian.NewDefaultConfig(nodeName), manager)
@@ -279,6 +286,69 @@ func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface) (
 	go advertiseVDOCapability(kubeClient, nodeName)
 
 	return ns, nil
+}
+
+// enableSyncReplication turns on the node's scheduling-driven switchover when
+// the cluster carries the VolumeReplication CRD (design §6). Best-effort: with
+// no dynamic client, or on a cluster without the CRD, every volume stages on the
+// ordinary, site-unaware path, exactly as before. The informers run for the
+// process lifetime; the node's cache-synced gate holds staging of a sync volume
+// until they have synced.
+func enableSyncReplication(ctx context.Context, ns *node.Server, kubeClient kubernetes.Interface, dynClient dynamic.Interface) {
+	if dynClient == nil || kubeClient == nil {
+		return
+	}
+	if !volumeReplicationCRDPresent(kubeClient.Discovery()) {
+		klog.Info("sync replication: VolumeReplication CRD absent; node staging stays site-unaware")
+		return
+	}
+	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
+	vr := factory.ForResource(kube.VolumeReplicationGVR).Informer()
+	vrClass := factory.ForResource(kube.VolumeReplicationClassGVR).Informer()
+	resolver, err := kube.NewSyncResolver(vr, vrClass)
+	if err != nil {
+		klog.Errorf("sync replication: build resolver: %v; node staging stays site-unaware", err)
+		return
+	}
+	factory.Start(ctx.Done())
+	ns.EnableSyncReplication(resolver, func() bool { return vr.HasSynced() && vrClass.HasSynced() }, dynClient)
+	klog.Info("sync replication: node staging is site-aware for VolumeReplication-managed volumes")
+
+	// Report whether the caches actually sync, bounded, without blocking startup.
+	// The node's own gate holds staging of a sync volume until they do; a wait
+	// that never completes is almost always a missing node RBAC for
+	// volumereplications, and a loud log turns "all staging hangs" into a cause.
+	go func() {
+		wctx, cancel := context.WithTimeout(context.Background(), syncCacheSyncTimeout)
+		defer cancel()
+		if cache.WaitForCacheSync(wctx.Done(), vr.HasSynced, vrClass.HasSynced) {
+			klog.Info("sync replication: VolumeReplication caches synced; site-aware staging is ready")
+			return
+		}
+		klog.Errorf("sync replication: VolumeReplication caches did not sync within %s; "+
+			"sync-managed volumes fail closed at staging until they do "+
+			"(check the node RBAC for volumereplications and volumereplicationclasses)",
+			syncCacheSyncTimeout)
+	}()
+}
+
+// syncCacheSyncTimeout bounds the startup wait that only logs whether the sync
+// informers came up; the node's cache-synced gate is the real guard.
+const syncCacheSyncTimeout = 2 * time.Minute
+
+// volumeReplicationCRDPresent reports whether the VolumeReplication CRD is served
+// by the API server, so the node only runs the sync informers where they resolve.
+func volumeReplicationCRDPresent(disc discovery.DiscoveryInterface) bool {
+	list, err := disc.ServerResourcesForGroupVersion(kube.VolumeReplicationGVR.GroupVersion().String())
+	if err != nil {
+		return false
+	}
+	for _, r := range list.APIResources {
+		if r.Name == kube.VolumeReplicationGVR.Resource {
+			return true
+		}
+	}
+	return false
 }
 
 // advertiseVDOCapability runs once in the background, same as the guardian

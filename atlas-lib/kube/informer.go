@@ -33,6 +33,20 @@ type ResolverConfig struct {
 	// leave nil if the consumer does not resolve provisioning Properties.
 	// When nil, StorageClassByName returns errs.ErrUnsupported.
 	StorageClasses cache.SharedIndexInformer
+	// VolumeReplications is the shared informer for csi-addons VolumeReplication
+	// objects, supplied as unstructured (a dynamic informer), so this package
+	// takes no dependency on the csi-addons CRD Go types. Optional: leave nil
+	// when the consumer does not resolve sync-replication membership (the
+	// operator, or a driver build without sync support). When nil,
+	// VolumeReplicationForClaim returns errs.ErrUnsupported.
+	VolumeReplications cache.SharedIndexInformer
+	// VolumeReplicationClasses is the shared informer for csi-addons
+	// VolumeReplicationClass objects, supplied as unstructured. Optional, and
+	// paired with VolumeReplications: it is what tells whether a VolumeReplication
+	// is synchronous (its class's method parameter). When nil,
+	// VolumeReplicationClassByName and SyncVolumeReplicationForClaim return
+	// errs.ErrUnsupported.
+	VolumeReplicationClasses cache.SharedIndexInformer
 }
 
 // InformerResolver implements Resolver against client-go shared informers.
@@ -41,10 +55,12 @@ type ResolverConfig struct {
 // manager cache (operator), so both consumers share one resolution
 // implementation instead of keeping a second cache.
 type InformerResolver struct {
-	pv  cache.SharedIndexInformer
-	pvc cache.SharedIndexInformer
-	va  cache.SharedIndexInformer
-	sc  cache.SharedIndexInformer
+	pv      cache.SharedIndexInformer
+	pvc     cache.SharedIndexInformer
+	va      cache.SharedIndexInformer
+	sc      cache.SharedIndexInformer
+	vr      cache.SharedIndexInformer
+	vrClass cache.SharedIndexInformer
 }
 
 var _ Resolver = (*InformerResolver)(nil)
@@ -75,11 +91,28 @@ func NewResolver(cfg ResolverConfig) (*InformerResolver, error) {
 			return nil, fmt.Errorf("kube: add StorageClass name indexer: %w", err)
 		}
 	}
+	if cfg.VolumeReplications != nil {
+		if err := cfg.VolumeReplications.AddIndexers(cache.Indexers{
+			IndexVRByClaim: indexVRByClaim,
+		}); err != nil {
+			return nil, fmt.Errorf("kube: add VolumeReplication claim indexer: %w", err)
+		}
+	}
+	if cfg.VolumeReplicationClasses != nil {
+		if err := cfg.VolumeReplicationClasses.AddIndexers(cache.Indexers{
+			IndexVRClassByName: indexVRClassByName,
+			IndexVRClassBySite: indexVRClassBySite,
+		}); err != nil {
+			return nil, fmt.Errorf("kube: add VolumeReplicationClass indexers: %w", err)
+		}
+	}
 	return &InformerResolver{
-		pv:  cfg.PersistentVolumes,
-		pvc: cfg.PersistentVolumeClaims,
-		va:  cfg.VolumeAttachments,
-		sc:  cfg.StorageClasses,
+		pv:      cfg.PersistentVolumes,
+		pvc:     cfg.PersistentVolumeClaims,
+		va:      cfg.VolumeAttachments,
+		sc:      cfg.StorageClasses,
+		vr:      cfg.VolumeReplications,
+		vrClass: cfg.VolumeReplicationClasses,
 	}, nil
 }
 
@@ -94,8 +127,38 @@ func NewResolverFromFactory(f informers.SharedInformerFactory) (*InformerResolve
 	})
 }
 
-// PVByVolumeHandle returns the managed PV whose CSI volume handle equals h.
+// NewSyncResolver builds a resolver for the CSI node plugin's sync-replication
+// path, which needs only the VolumeReplication and VolumeReplicationClass
+// informers: it takes the PVC identity from the CSI volume context, not from a
+// PV/PVC lookup, so it runs no cluster-wide PV/PVC watch on every node. Only the
+// Sync* and VolumeReplication* methods are valid on the result; PVByVolumeHandle
+// and the other PV/PVC/attachment/class lookups return errs.ErrUnsupported. The
+// informers must not be running yet, since indexers are added here.
+func NewSyncResolver(volumeReplications, volumeReplicationClasses cache.SharedIndexInformer) (*InformerResolver, error) {
+	if volumeReplications == nil || volumeReplicationClasses == nil {
+		return nil, fmt.Errorf(
+			"kube: NewSyncResolver requires the VolumeReplication and VolumeReplicationClass informers: %w",
+			errs.ErrUnsupported)
+	}
+	if err := volumeReplications.AddIndexers(cache.Indexers{IndexVRByClaim: indexVRByClaim}); err != nil {
+		return nil, fmt.Errorf("kube: add VolumeReplication claim indexer: %w", err)
+	}
+	if err := volumeReplicationClasses.AddIndexers(cache.Indexers{
+		IndexVRClassByName: indexVRClassByName,
+		IndexVRClassBySite: indexVRClassBySite,
+	}); err != nil {
+		return nil, fmt.Errorf("kube: add VolumeReplicationClass indexers: %w", err)
+	}
+	return &InformerResolver{vr: volumeReplications, vrClass: volumeReplicationClasses}, nil
+}
+
+// PVByVolumeHandle returns the managed PV whose CSI volume handle equals h. It
+// returns errs.ErrUnsupported when the resolver was built without a PV informer
+// (e.g., a sync-only resolver from NewSyncResolver).
 func (r *InformerResolver) PVByVolumeHandle(ctx context.Context, h lvol.VolumeHandle) (*corev1.PersistentVolume, error) {
+	if r.pv == nil {
+		return nil, fmt.Errorf("kube: PersistentVolume informer not configured: %w", errs.ErrUnsupported)
+	}
 	objs, err := r.pv.GetIndexer().ByIndex(IndexPVByVolumeHandle, string(h))
 	if err != nil {
 		return nil, err
@@ -108,8 +171,13 @@ func (r *InformerResolver) PVByVolumeHandle(ctx context.Context, h lvol.VolumeHa
 	return nil, fmt.Errorf("pv for volume %q: %w", h, errs.ErrNotFound)
 }
 
-// PVForClaim returns the PV bound to the given PVC.
+// PVForClaim returns the PV bound to the given PVC. It returns
+// errs.ErrUnsupported when the resolver was built without the PV and PVC
+// informers.
 func (r *InformerResolver) PVForClaim(ctx context.Context, claim types.NamespacedName) (*corev1.PersistentVolume, error) {
+	if r.pvc == nil || r.pv == nil {
+		return nil, fmt.Errorf("kube: PV/PVC informers not configured: %w", errs.ErrUnsupported)
+	}
 	obj, exists, err := r.pvc.GetIndexer().GetByKey(claim.String())
 	if err != nil {
 		return nil, err

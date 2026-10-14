@@ -151,6 +151,87 @@ func TestSyncNoOpVerbs(t *testing.T) {
 	}
 }
 
+// U-13: a forced promote never acts on a live peer. When the other site is
+// still live the backend answers 409, which is retryable, never a terminal
+// failure that would strand the switchover.
+func TestSyncPromoteForcedWhilePeerLiveIsRetryable(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.failoverStatus = 409
+	cs := newReplicationTestServer(t, mock)
+
+	_, err := cs.PromoteVolume(context.Background(), &replication.PromoteVolumeRequest{
+		VolumeId: testReplVolID, Force: true, Parameters: syncParams("site-b"),
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (force waits, never acts on a live peer)", status.Code(err))
+	}
+}
+
+// U-15: a demote of a volume not served on the site is a 204 no-op, so a redundant
+// or retried demote succeeds rather than erroring.
+func TestSyncDemoteNotServedIsASuccessfulNoOp(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.demoteStatus = 204 // the backend's answer for a volume not served here
+	cs := newReplicationTestServer(t, mock)
+
+	if _, err := cs.DemoteVolume(context.Background(), &replication.DemoteVolumeRequest{
+		VolumeId: testReplVolID, Parameters: syncParams("site-a"),
+	}); err != nil {
+		t.Fatalf("a 204 demote must succeed (idempotent no-op): %v", err)
+	}
+}
+
+// U-17: a demote whose ANA RPC failed with nothing recorded answers 500, which
+// is retryable.
+func TestSyncDemoteServerErrorIsRetryable(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.demoteStatus = 500
+	cs := newReplicationTestServer(t, mock)
+
+	_, err := cs.DemoteVolume(context.Background(), &replication.DemoteVolumeRequest{
+		VolumeId: testReplVolID, Parameters: syncParams("site-a"),
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (a 500 is retryable)", status.Code(err))
+	}
+}
+
+// U-38: a sync write against a non-sync cluster answers 400, which the driver
+// surfaces as InvalidArgument. The backend returns 400 for both a bad/missing
+// site and a non-sync cluster, so the driver cannot distinguish them and treats
+// both as InvalidArgument (design §11); it is never the 412 escalation trigger.
+func TestSyncWriteOnNonSyncClusterIsInvalidArgument(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.failoverStatus = 400
+	cs := newReplicationTestServer(t, mock)
+
+	_, err := cs.PromoteVolume(context.Background(), &replication.PromoteVolumeRequest{
+		VolumeId: testReplVolID, Parameters: syncParams("site-b"),
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument (400 is a bad request, never the 412 escalation)", status.Code(err))
+	}
+}
+
+// U-39: a transport failure reaching the backend (here, the backend is gone) is
+// retryable, not a terminal error.
+func TestSyncPromoteTransportErrorIsRetryable(t *testing.T) {
+	mock := newMockSBCLI()
+	cs := newReplicationTestServer(t, mock)
+	mock.Close() // the backend is now unreachable
+
+	_, err := cs.PromoteVolume(context.Background(), &replication.PromoteVolumeRequest{
+		VolumeId: testReplVolID, Parameters: syncParams("site-b"),
+	})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable (a transport error is retryable)", status.Code(err))
+	}
+}
+
 // Phase 2: a sync class on a consistency-group handle drives the whole group as
 // one unit through the group routes (design §13).
 func TestSyncGroupDispatch(t *testing.T) {

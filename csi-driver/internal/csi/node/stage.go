@@ -102,6 +102,23 @@ func (ns *Server) NodeStageVolume(
 	vc["stagingParentPath"] = stagingParentPath
 	ns.refreshVolumeContext(ctx, volumeID, vc)
 
+	// A sync-managed volume follows its pod: its leadership must move to this
+	// node's site, and the connection is gated on that, so it takes a different
+	// staging path (design §6). An ordinary volume (the common case, and every
+	// volume when sync replication is not configured) falls through unchanged.
+	if vr, isSync, err := ns.detectSyncReplication(ctx, vc); err != nil {
+		return nil, err
+	} else if isSync {
+		// A sync-managed volume must be served on this node's site before it is
+		// attached. ensureSyncPromoted signals the site and gates on the promote,
+		// returning a retryable error until it is done; once it returns nil, the
+		// volume is led from this site and the ordinary attach below connects to
+		// it (design §6.2-§6.4).
+		if err := ns.ensureSyncPromoted(ctx, vr); err != nil {
+			return nil, err
+		}
+	}
+
 	plan, err := ns.attachPlan(ctx, volumeID, stagingTargetPath, vc, req.GetVolumeCapability())
 	if err != nil {
 		klog.Errorf("failed to build the stack plan, volumeID: %s err: %v", volumeID, err)
@@ -176,6 +193,10 @@ func (ns *Server) NodeUnstageVolume(
 		}
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
+
+	// A sync-managed volume's site is quiesced as its device goes away (design
+	// §6.5). Best-effort: it never blocks the teardown below.
+	ns.demoteSyncOnUnstage(cleanupCtx, volumeID, volumeContext)
 
 	plan, err := ns.teardownPlan(ctx, volumeID, stagingTargetPath, volumeContext)
 	if err != nil {

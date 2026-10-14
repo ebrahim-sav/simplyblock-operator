@@ -163,6 +163,36 @@ func TestNodeRoleCanPatchNodesForVDOCapability(t *testing.T) {
 	}
 }
 
+// Synchronous replication: the node plugin reads, per PVC at stage time,
+// whether a volume is managed by a sync VolumeReplication and re-points it at
+// the class naming the pod's site (design-sync-replication-csi-addons.md §6.2).
+// It watches and patches VolumeReplications and reads VolumeReplicationClasses;
+// it never creates or deletes a VolumeReplication, whose existence the
+// administrator owns.
+func TestNodeRoleDrivesSyncReplication(t *testing.T) {
+	verbsFor := func(resource string) []string {
+		for _, r := range clusterRoleRules[nodeComponent] {
+			if slices.Contains(r.APIGroups, "replication.storage.openshift.io") &&
+				slices.Contains(r.Resources, resource) {
+				return r.Verbs
+			}
+		}
+		return nil
+	}
+	if got := verbsFor("volumereplications"); !slices.Equal(got, []string{"get", "list", "watch", "patch"}) {
+		t.Errorf("volumereplications verbs = %v, want [get list watch patch]", got)
+	}
+	if got := verbsFor("volumereplicationclasses"); !slices.Equal(got, []string{"get", "list", "watch"}) {
+		t.Errorf("volumereplicationclasses verbs = %v, want [get list watch]", got)
+	}
+	for _, v := range verbsFor("volumereplications") {
+		switch v {
+		case "create", "update", "delete", "deletecollection":
+			t.Errorf("the node role grants %q on volumereplications; it must only get/list/watch/patch", v)
+		}
+	}
+}
+
 // No rule reaches everything. A wildcard in a CSI sidecar's role is the escalation
 // primitive that turns a sidecar compromise into cluster-admin.
 func TestNoRuleIsAWildcard(t *testing.T) {
@@ -217,7 +247,7 @@ func TestCSIAddonsRoleIsNamespacedAndBoundToTheControllerAccount(t *testing.T) {
 // --enable-auth defaults to true), which is cluster-scoped and so cannot be
 // granted by the namespaced Role above -- confirmed against a live cluster,
 // where omitting this left every connection failing with "failed to review
-// token ... is forbidden ... at the cluster scope".
+// token ... is forbidden ... at the cluster scope."
 func TestCSIAddonsSidecarCanAuthenticateIncomingCalls(t *testing.T) {
 	d := testDriver("simplyblock")
 	n := names(d)
