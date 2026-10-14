@@ -2,6 +2,13 @@
 # Copyright (c) Arm Limited and Contributors
 # Copyright (c) Intel Corporation
 ---
+# The cluster's DNS domain: the suffix after <service>.<namespace>.svc. Change
+# it only on a cluster set up with a domain other than cluster.local. Every
+# in-cluster address and certificate name the operator and this chart build
+# uses it, and so does the FoundationDB cluster file, whose coordinators do not
+# resolve under the wrong domain.
+clusterDnsDomain: cluster.local
+
 image:
   csiSnapshotterController:
     repository: quay.io/simplyblock-io/snapshot-controller
@@ -60,6 +67,13 @@ csiConfig:
   simplybk:
     uuid:
     ip:
+    # The pool volumes on this cluster are created in. Set, the chart renders a
+    # block StorageClass for the cluster and pool, named storageClassName or
+    # simplyblock-<pool>. A cluster given here has no StorageCluster or
+    # StoragePool object, so nothing else writes a class for it, and the pNFS
+    # metadata server derives its state disk's class from one.
+    pool:
+    storageClassName:
 
 # Configuration for the csiSecret
 csiSecret:
@@ -78,6 +92,9 @@ multiCluster:
   - cluster_id:
     secret:
     workers:
+    # As csiConfig.simplybk.pool and storageClassName, for this cluster.
+    pool:
+    storageClassName:
       
 deployment:
   # One of: standalone, managed, empty.
@@ -590,26 +607,7 @@ controlplane:
     key: 
     value:
 
-  csiHostpathDriver:
-    enabled: false
-    image:
-      csiProvisioner:
-        repository: quay.io/simplyblock-io/csi-provisioner
-        tag: v6.0.0
-      csiResizer:
-        repository: quay.io/simplyblock-io/csi-resizer
-        tag: v2.0.0
-      nodeDriverRegistrar:
-        repository: quay.io/simplyblock-io/csi-node-driver-registrar
-        tag: v2.12.0
-      hostpathPlugin:
-        repository: quay.io/simplyblock-io/hostpathplugin
-        tag: v1.15.0
-      livenessProbe:
-        repository: quay.io/simplyblock-io/livenessprobe
-        tag: v2.15.0
-
-  storageclass:  
+  storageclass:
     name:  
     allowedTopologyZones: []
 
@@ -1001,6 +999,9 @@ controlCenter:
   # Ramen's ops namespace on the DR hub: where discovered ProtectedApplications
   # live and where the console asks the API server what it may do.
   drNamespace: ramen-ops
+  # dr-hub's own namespace (dr-simplyblock-hub release): the discovery graph's
+  # data shards (ConfigMaps dr-graph-<site>-<n>) are read there
+  drHubNamespace: dr-simplyblock
 
   # serviceaccount | passthrough
   #

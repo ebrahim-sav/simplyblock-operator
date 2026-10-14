@@ -9,13 +9,14 @@ metadata:
 spec:
   approved: false
   cluster:
+    clusterMode: Single
     enableDriveFormat: true
     maxSubsystemCount: 30
     minHugePagesSize: 128G
     name: discovered-discover-size-04-cluster
     stripe:
       dataChunks: 1
-      parityChunks: 0
+      parityChunks: 1
     vcpuCount: 49
   environment: K3s
   hostOS:

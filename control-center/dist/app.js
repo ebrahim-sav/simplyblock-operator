@@ -265,6 +265,30 @@ const RESOURCES = {
     namespaced: true,
     dr: true
   },
+  // AI-assisted discovery (dr-hub ADR 0023): the per-site dependency graph
+  // (its data in compressed ConfigMap shards in dr-hub's namespace), the
+  // proposal bundles and the discovery runs
+  DiscoveryGraph: {
+    plural: "discoverygraphs",
+    short: "dgraph",
+    core: DR_API_GROUP,
+    namespaced: false,
+    dr: true
+  },
+  DRProposal: {
+    plural: "drproposals",
+    short: "drprop",
+    core: DR_API_GROUP,
+    namespaced: true,
+    dr: true
+  },
+  DiscoveryRun: {
+    plural: "discoveryruns",
+    short: "drun",
+    core: DR_API_GROUP,
+    namespaced: true,
+    dr: true
+  },
   // what each site's dr-agent reports, read through the view dr-hub keeps
   // of it (<cluster>/dr-agent-status): the forms' discovered choices
   ManagedClusterView: {
@@ -393,6 +417,8 @@ const RESOURCES = {
 const NS = () => SB.namespace || "simplyblock";
 // Ramen's ops namespace on the hub: where discovered ProtectedApplications live
 const DR_NS = () => SB.drNamespace || "ramen-ops";
+// dr-hub's own namespace on the hub: where it keeps the discovery graph shards
+const DR_HUB_NS = () => SB.drHubNamespace || "dr-simplyblock";
 
 // Build the API server path for a kind. Core group is /api/v1, everything else
 // /apis/<group>/<version>. A namespaced kind is scoped to the console's
@@ -638,7 +664,8 @@ Object.assign(window, {
   opsRunning,
   OPS_TERMINAL,
   NS,
-  DR_NS
+  DR_NS,
+  DR_HUB_NS
 });
 })();
 // ---- cpapi.jsx ----
@@ -6231,6 +6258,40 @@ function dhcpServersOn(disc, cluster, nad) {
   const target = d.nads.find(x => nadRef(x) === nad);
   return d.dhcpServers.filter(s => (s.nads || []).some(sn => sn.nad === nad || target && seg(d.nads.find(x => nadRef(x) === sn.nad)) === seg(target) && seg(target) !== "|"));
 }
+// The DHCP server of a path's isolated test network (DRPath
+// spec.test.dhcpServerRef), chosen among the DHCPServers registered for the
+// target cluster: those dr-agent sees serving the isolated NAD first; a
+// server on another network is marked as such. candidate is a server found
+// on the NAD that is not registered yet (offered as "Register and use").
+function testDHCPChoice(disc, servers, cluster, nad) {
+  const d = discOf(disc, cluster);
+  const found = d && d.dhcpServers || [];
+  const onNad = nad ? dhcpServersOn(disc, cluster, nad) : [];
+  const same = (x, f) => x.dnsmasq && x.dnsmasq.namespace === f.namespace && x.dnsmasq.configMap === f.hostsConfigMap;
+  const mine = (servers || []).filter(x => x.site === cluster);
+  const rows = mine.map(x => {
+    const serves = onNad.some(f => same(x, f));
+    const seen = found.find(f => same(x, f));
+    const where = seen ? (seen.nads || []).map(n => n.nad).join(", ") : "";
+    return {
+      v: x.name,
+      serves,
+      l: serves ? `${x.name} — serves ${nad} (isolated test network)` : seen ? `${x.name} — on ${where}: production network, not recommended` : `${x.name} — not seen on any network by dr-agent`
+    };
+  }).sort((a, b) => (b.serves ? 1 : 0) - (a.serves ? 1 : 0) || a.v.localeCompare(b.v));
+  const recommended = (rows.find(r => r.serves) || {}).v || "";
+  const candidate = recommended ? null : onNad.find(f => f.hostsConfigMap && !mine.some(x => same(x, f))) || null;
+  return {
+    options: rows.map(r => ({
+      v: r.v,
+      l: r.l
+    })),
+    recommended,
+    candidate
+  };
+}
+// The name a discovered server is registered under for a cluster.
+const dhcpServerName = (cluster, f) => dns63(`${cluster}-${(f.owner || f.pod).split("/").pop()}`);
 // The isolated test (bubble) networks of a site: the isolated NAD of every
 // DRPath that tests on it, and the one the site itself reports.
 function testNadsOf(disc, cluster, paths) {
@@ -6636,6 +6697,8 @@ Object.assign(window, {
   nadAddresses,
   nadSubnet,
   dhcpServersOn,
+  testDHCPChoice,
+  dhcpServerName,
   proposedReserved,
   guestRowError,
   proposeRoles,
@@ -7707,7 +7770,7 @@ const ENTITY_OPS = {
   application: ["create", "read", "update", "delete", "failover", "failback", "fence"],
   role: ["read"],
   binding: ["create", "read", "delete"],
-  drhub: ["create", "read", "update", "delete", "failover", "relocate", "restart", "test", "override", "drrestore"]
+  drhub: ["create", "read", "update", "delete", "failover", "relocate", "restart", "test", "override", "drrestore", "approve", "rollback"]
 };
 // UI kind -> the main entity whose namespace governs it
 const KIND_ENTITY = {
@@ -7757,7 +7820,11 @@ const KIND_ENTITY = {
   drconfig: "drhub",
   siteprofile: "drhub",
   dhcpserver: "drhub",
-  sitedeploy: "drhub"
+  sitedeploy: "drhub",
+  // AI-assisted discovery (ADR 0023)
+  dgraph: "drhub",
+  drprop: "drhub",
+  drun: "drhub"
 };
 // UI kind -> the CRD resource the API server checks (§3.5, the console's column)
 const KIND_RESOURCE = {
@@ -7805,7 +7872,10 @@ const KIND_RESOURCE = {
   drconfig: "drconfigs",
   siteprofile: "siteprofiles",
   dhcpserver: "dhcpservers",
-  sitedeploy: "storagesitedeployments"
+  sitedeploy: "storagesitedeployments",
+  dgraph: "discoverygraphs",
+  drprop: "drproposals",
+  drun: "discoveryruns"
 };
 // UI kind -> API group, where it is not the default simplyblock group
 const KIND_GROUP = {
@@ -7820,7 +7890,10 @@ const KIND_GROUP = {
   drconfig: "dr.simplyblock.io",
   siteprofile: "sitemap.simplyblock.io",
   dhcpserver: "sitemap.simplyblock.io",
-  sitedeploy: "storage.simplyblock.io"
+  sitedeploy: "storage.simplyblock.io",
+  dgraph: "dr.simplyblock.io",
+  drprop: "dr.simplyblock.io",
+  drun: "dr.simplyblock.io"
 };
 const ENTITY_GROUP = {
   drhub: "dr.simplyblock.io",
@@ -7856,7 +7929,10 @@ const VERB_OF = {
   restart: "create",
   test: "create",
   drrestore: "create",
-  override: "override"
+  override: "override",
+  // a bundle's fallback approval and rollback: custom verbs dr-hub's webhook checks
+  approve: "approve",
+  rollback: "rollback"
 };
 
 // ---- the store ---------------------------------------------------------------
@@ -12032,16 +12108,18 @@ function Field({
     }, /*#__PURE__*/React.createElement(Icon, {
       n: "x",
       s: 10
-    })))), /*#__PURE__*/React.createElement("select", {
+    })))), opts2.length > 0 ? /*#__PURE__*/React.createElement("select", {
       className: "finput sm chipadd",
       value: "",
       onChange: e => e.target.value && setVal(sel.concat(e.target.value))
     }, /*#__PURE__*/React.createElement("option", {
       value: ""
-    }, opts2.length ? f.addLabel || "— add —" : f.empty || "nothing more to add"), opts2.map(o => /*#__PURE__*/React.createElement("option", {
+    }, f.addLabel || "— add —"), opts2.map(o => /*#__PURE__*/React.createElement("option", {
       key: o.v,
       value: o.v
-    }, o.l)))), verr ? /*#__PURE__*/React.createElement("span", {
+    }, o.l))) : !sel.length && /*#__PURE__*/React.createElement("span", {
+      className: "rempty"
+    }, f.empty || "nothing to add")), verr ? /*#__PURE__*/React.createElement("span", {
       className: "fhint",
       style: {
         color: "var(--bad)"
@@ -12185,7 +12263,7 @@ function Field({
     // Header and rows share one grid template, so the columns line up whatever
     // a cell holds. Each column has a floor (c.min); below the sum of the
     // floors the box scrolls sideways instead of letting cells overlap.
-    const colMin = c => c.min || (c.type === "multi" ? 170 : c.type === "number" ? 72 : c.readonly ? 110 : c.type === "select" ? 130 : 110);
+    const colMin = c => c.min || (c.type === "multi" ? 130 : c.type === "number" ? 64 : c.readonly ? 90 : c.type === "select" ? 120 : 90);
     const extra = [ra ? `${ra.width || 72}px` : null, f.reorder ? "52px" : null, !fixed ? "28px" : null].filter(Boolean);
     const template = f.cols.map(c => `minmax(${colMin(c)}px, ${c.flex || 1}fr)`).concat(extra).join(" ");
     const floor = f.cols.reduce((a, c) => a + colMin(c), 0) + extra.reduce((a, x) => a + parseInt(x, 10), 0) + 6 * (f.cols.length + extra.length);
@@ -12228,17 +12306,20 @@ function Field({
           }, /*#__PURE__*/React.createElement(Icon, {
             n: "x",
             s: 9
-          })))), /*#__PURE__*/React.createElement("select", {
+          })))), rest.length > 0 ? /*#__PURE__*/React.createElement("select", {
             className: "finput sm radd",
             value: "",
-            disabled: off || !rest.length,
+            disabled: off,
+            title: c.addLabel || "add",
             onChange: e => e.target.value && set(i, c.k, cur.concat(e.target.value))
           }, /*#__PURE__*/React.createElement("option", {
             value: ""
-          }, rest.length ? c.addLabel || "+ add" : c.empty || "—"), rest.map(o => /*#__PURE__*/React.createElement("option", {
+          }, c.addLabel || "+ add"), rest.map(o => /*#__PURE__*/React.createElement("option", {
             key: o.v,
             value: o.v
-          }, o.l))));
+          }, o.l))) : !cur.length && c.empty ? /*#__PURE__*/React.createElement("span", {
+            className: "rempty"
+          }, c.empty) : null);
         }
         const cur = r[c.k] || "";
         const known = opts.some(o => o.v === cur);
@@ -12311,10 +12392,13 @@ function Field({
         className: "chip rowact",
         title: ra.title || ra.label,
         disabled: off || !!(checks[i] && checks[i].status === "busy"),
-        onClick: () => runCheck(() => ra.run(r, vals || {}, i), x => setChecks(c => Object.assign({}, c, {
+        onClick: () => runCheck(() => ra.run(r, vals || {}, i, {
+          reprepare,
+          setAll
+        }), x => setChecks(c => Object.assign({}, c, {
           [i]: x
         })))
-      }, ra.label || "Test"), f.reorder && /*#__PURE__*/React.createElement("span", {
+      }, typeof ra.label === "function" ? ra.label(r) : ra.label || "Test"), f.reorder && /*#__PURE__*/React.createElement("span", {
         className: "rmove"
       }, /*#__PURE__*/React.createElement("button", {
         type: "button",
@@ -12607,13 +12691,13 @@ function LanesField({
     className: "flabel"
   }, f.label, " ", /*#__PURE__*/React.createElement("em", null, "(", chosen.length, " of ", items.length, ")")), !items.length ? /*#__PURE__*/React.createElement("div", {
     className: "fempty"
-  }, f.empty || "Nothing to choose from.") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("select", {
+  }, f.empty || "Nothing to choose from.") : /*#__PURE__*/React.createElement(React.Fragment, null, rest.length > 0 && /*#__PURE__*/React.createElement("select", {
     className: "finput sm laneadd",
     value: "",
     onChange: e => e.target.value && put(e.target.value, Math.max(1, lanes - 1))
   }, /*#__PURE__*/React.createElement("option", {
     value: ""
-  }, rest.length ? f.addLabel || "— add —" : "everything is in a lane"), rest.map(x => /*#__PURE__*/React.createElement("option", {
+  }, f.addLabel || "— add —"), rest.map(x => /*#__PURE__*/React.createElement("option", {
     key: x.v,
     value: x.v
   }, x.l, x.sub ? ` — ${x.sub}` : ""))), /*#__PURE__*/React.createElement("div", {
@@ -29236,7 +29320,7 @@ const RECENT_OPTIONS = ["168h", "336h", "720h", "2160h"].map(x => ({
   v: x,
   l: `${x} (${Number(x.slice(0, -1)) / 24} days)`
 }));
-const pathFields = (plan, disc, paths, v, fixedSites) => {
+const pathFields = (plan, disc, paths, v, fixedSites, servers) => {
   const sites = plan ? plan.sites : [];
   const site = n => sites.find(s => s.name === n);
   const auto = v.from && v.to ? `${v.from}-to-${v.to}`.slice(0, 63) : "";
@@ -29304,7 +29388,7 @@ const pathFields = (plan, disc, paths, v, fixedSites) => {
     empty: `${v.to || "The target"} reports no NetworkAttachmentDefinition.`,
     def: prop ? prop.nad : "",
     sync: x => !x && prop && prop.nad ? prop.nad : undefined
-  }, (v.actions || []).includes("Test") && {
+  }, ...testDHCPFields(disc, servers, target, v), (v.actions || []).includes("Test") && {
     k: "cap",
     label: "Test: max clone capacity (empty: no limit)",
     type: "text",
@@ -29321,6 +29405,48 @@ const pathFields = (plan, disc, paths, v, fixedSites) => {
     label: "Announcement hand-over on move",
     type: "checkbox",
     def: false
+  }].filter(Boolean);
+};
+// The test network's DHCP server (DRPath spec.test.dhcpServerRef): a
+// registered server of the target, the one serving the isolated NAD
+// preselected; none registered there, the server found on it is offered as
+// "Register and use" (the form's choices are loaded again afterwards).
+const testDHCPFields = (disc, servers, target, v) => {
+  if (!(v.actions || []).includes("Test") || !target || !v.nad) return [];
+  const ch = testDHCPChoice(disc, servers, target.cluster, v.nad);
+  const f = ch.candidate;
+  return [ch.options.length > 0 && {
+    k: "dhcp",
+    label: `Test: DHCP server of the test network on ${v.to}`,
+    type: "select",
+    blank: "— none: the test network's DHCP serves the reservations by other means —",
+    options: ch.options,
+    def: ch.recommended,
+    sync: x => !x && ch.recommended ? ch.recommended : undefined
+  }, f && {
+    k: "dhcpReg",
+    type: "apply",
+    refresh: true,
+    label: `Test: DHCP server of the test network on ${v.to}`,
+    button: "Register and use",
+    hint: () => `${f.namespace}/${f.owner || f.pod} serves ${v.nad}; reservations in ${f.namespace}/${f.hostsConfigMap}`,
+    apply: async () => {
+      const name = dhcpServerName(target.cluster, f);
+      await drhub.createDHCPServer({
+        name,
+        site: target.cluster,
+        namespace: f.namespace,
+        configMap: f.hostsConfigMap
+      });
+      return {
+        dhcp: name
+      };
+    },
+    done: "Registered and selected as the test network's DHCP server."
+  }, !ch.options.length && !f && {
+    k: "nDhcp",
+    type: "note",
+    label: `No DHCP server is registered for ${target.cluster} or found on ${v.nad}: test copies get their reserved addresses only if the test network's DHCP serves the reservations by other means.`
   }].filter(Boolean);
 };
 const pathSpec = (plan, v) => ({
@@ -29340,6 +29466,8 @@ const pathBody = (plan, v) => Object.assign(pathSpec(plan, v), (v.actions || [])
     }
   } : {}, v.recent ? {
     recentWithin: v.recent
+  } : {}, v.dhcp ? {
+    dhcpServerRef: v.dhcp
   } : {})
 } : {});
 const newPathDialog = (plans, prefill) => ({
@@ -29347,13 +29475,14 @@ const newPathDialog = (plans, prefill) => ({
   confirm: "Create path",
   done: "DRPath created",
   desc: "A DR path is a declared direction between two sites of a plan, and the set of actions allowed along it. The fields are proposed from the plan and what its sites report.",
-  prepare: () => Promise.all([drhub.discovery(), drhub.paths()]).then(([disc, paths]) => {
+  prepare: () => Promise.all([drhub.discovery(), drhub.paths(), drhub.dhcpServers().catch(() => [])]).then(([disc, paths, servers]) => {
     window.__lastPaths = paths;
     const plan = plans.find(p => p.name === (prefill || {}).plan) || plans[0];
     const first = proposePaths(plan, disc, paths).find(x => !x.exists);
     return {
       disc,
       paths,
+      servers,
       first: Object.assign({}, first || {}, prefill || {})
     };
   }),
@@ -29361,6 +29490,7 @@ const newPathDialog = (plans, prefill) => ({
     const {
       disc,
       paths,
+      servers,
       first
     } = prep || {};
     const plan = plans.find(p => p.name === v.plan) || plans[0];
@@ -29378,7 +29508,7 @@ const newPathDialog = (plans, prefill) => ({
     }, ...pathFields(plan, disc, paths, Object.assign({
       from: (first || {}).from,
       to: (first || {}).to
-    }, v), false).map(f => f.k === "from" ? Object.assign({
+    }, v), false, servers).map(f => f.k === "from" ? Object.assign({
       def: (first || {}).from
     }, f) : f.k === "to" ? Object.assign({
       def: (first || {}).to
@@ -29401,17 +29531,26 @@ const proposePathsDialog = plans => ({
   confirm: "Create the accepted paths",
   done: "DRPaths created",
   desc: "Each ordered pair of a plan's sites is a possible direction. The proposals are prefilled from the plan and what the sites report; accept the ones you want, edit them in place, or open one in the full form.",
-  prepare: () => Promise.all([drhub.discovery(), drhub.paths()]).then(([disc, paths]) => ({
+  prepare: () => Promise.all([drhub.discovery(), drhub.paths(), drhub.dhcpServers().catch(() => [])]).then(([disc, paths, servers]) => ({
     disc,
-    paths
+    paths,
+    servers
   })),
   fields: (v, prep) => {
     const {
       disc,
-      paths
+      paths,
+      servers
     } = prep || {};
     const plan = plans.find(p => p.name === v.plan) || plans[0];
     const props = proposePaths(plan, disc, paths);
+    const clusterOfSite = to => (plan && plan.sites.find(x => x.name === to) || {}).cluster;
+    const dhcpOf = r => testDHCPChoice(disc, servers, clusterOfSite(r.to), r.nad);
+    // servers found on a proposal's test network that are not registered yet
+    const toRegister = (v.proposals || []).filter(r => r.accept === "yes" && (r.actions || []).includes("Test") && r.nad).map(r => ({
+      r,
+      c: dhcpOf(r)
+    })).filter(x => !x.c.options.length && x.c.candidate).filter((x, i, all) => all.findIndex(y => clusterOfSite(y.r.to) === clusterOfSite(x.r.to) && y.c.candidate.hostsConfigMap === x.c.candidate.hostsConfigMap) === i);
     const open = props.filter(x => !x.exists);
     const nadOpts = to => {
       const s = plan && plan.sites.find(x => x.name === to);
@@ -29450,7 +29589,8 @@ const proposePathsDialog = plans => ({
           to: o.to,
           name: o.name,
           actions: o.actions,
-          nad: o.nad
+          nad: o.nad,
+          dhcp: testDHCPChoice(disc, servers, clusterOfSite(o.to), o.nad).recommended
         });
         return JSON.stringify(want.map(key)) === JSON.stringify((x || []).map(key)) && (x || []).every(r => r.plan === (plan || {}).name) ? undefined : want;
       },
@@ -29502,6 +29642,13 @@ const proposePathsDialog = plans => ({
         blank: "— none —",
         options: r => nadOpts(r.to),
         flex: 1.4
+      }, {
+        k: "dhcp",
+        label: "Test DHCP",
+        type: "select",
+        blank: "— none —",
+        options: r => (r.actions || []).includes("Test") && r.nad ? dhcpOf(r).options : [],
+        flex: 1.4
       }],
       rowError: r => r.accept !== "yes" ? null : pathError(plan, (paths || []).concat([]), {
         from: r.from,
@@ -29529,6 +29676,33 @@ const proposePathsDialog = plans => ({
           };
         }
       }
+    }, toRegister.length > 0 && {
+      k: "dhcpReg",
+      type: "apply",
+      refresh: true,
+      label: "DHCP servers of the test networks",
+      button: "Register and use",
+      hint: () => toRegister.map(x => `${x.c.candidate.namespace}/${x.c.candidate.owner || x.c.candidate.pod} on ${x.r.nad} (${clusterOfSite(x.r.to)})`).join("; ") + " — not registered yet",
+      apply: async vv => {
+        const names = {};
+        for (const x of toRegister) {
+          const cl = clusterOfSite(x.r.to),
+            name = dhcpServerName(cl, x.c.candidate);
+          await drhub.createDHCPServer({
+            name,
+            site: cl,
+            namespace: x.c.candidate.namespace,
+            configMap: x.c.candidate.hostsConfigMap
+          });
+          names[cl + "|" + x.r.nad] = name;
+        }
+        return {
+          proposals: (vv.proposals || []).map(r => names[clusterOfSite(r.to) + "|" + r.nad] && !r.dhcp ? Object.assign({}, r, {
+            dhcp: names[clusterOfSite(r.to) + "|" + r.nad]
+          }) : r)
+        };
+      },
+      done: "Registered; each proposal testing on that network uses it."
     }].filter(Boolean);
   },
   run: async v => {
@@ -29542,6 +29716,7 @@ const proposePathsDialog = plans => ({
         to: r.to,
         actions: r.actions,
         nad: r.nad,
+        dhcp: r.dhcp,
         recent: "720h"
       })
     });
@@ -29555,14 +29730,15 @@ const tierCols = (disc, cluster, nss) => [{
   k: "name",
   label: "Tier",
   placeholder: "db",
-  flex: 0.7
+  flex: 0.6,
+  min: 70
 }, {
   k: "kinds",
   label: "Resource types",
   type: "multi",
   options: RESOURCE_TYPE_OPTIONS,
   addLabel: "+ type",
-  flex: 1.6
+  flex: 1.5
 }, {
   k: "labels",
   label: "Labels",
@@ -29570,14 +29746,14 @@ const tierCols = (disc, cluster, nss) => [{
   options: r => tierLabelOptions(disc, cluster, nss, r),
   addLabel: "+ label",
   empty: "no labels reported",
-  flex: 1.8
+  flex: 1.6
 }, {
   k: "ready",
   label: "Ready when",
   type: "multi",
   options: GATE_TYPE_OPTIONS,
   addLabel: "+ gate",
-  flex: 1.4
+  flex: 1.3
 }];
 const GATE_TEMPLATES = [{
   v: "tcp",
@@ -29821,18 +29997,25 @@ const protectAppDialogDR = (plans, cfg) => ({
       type: "text",
       required: true,
       placeholder: "shop",
-      validate: x => x && !DNS_LABEL_RE.test(x) ? "A DNS label: lower-case letters, digits and \"-\"." : x && (apps || []).some(a => a.name === x && a.namespace === (v.namespace || opsNs)) ? `${x} is protected already.` : null
-    }, {
+      validate: x => x && !DNS_LABEL_RE.test(x) ? "A DNS label: lower-case letters, digits and \"-\"." : x && (apps || []).some(a => a.name === x && a.namespace === (v.appKind === "managed" ? v.namespace : opsNs)) ? `${x} is protected already.` : null
+    },
+    // A discovered application's DR objects (ProtectedApplication, DRPC) live
+    // in the hub's Ramen operations namespace, which the hub's configuration
+    // names: no choice to make. A managed application's live next to its
+    // OCM Placement.
+    discovered ? {
+      k: "nOps",
+      type: "note",
+      icon: "check",
+      label: `Its DR objects are kept in the hub namespace ${opsNs} (Ramen operations namespace).`
+    } : {
       k: "namespace",
-      label: "Namespace of the ProtectedApplication",
-      type: discovered ? "select" : "text",
+      label: "Placement namespace — where the application's OCM Placement lives",
+      type: "text",
       required: true,
-      def: discovered ? opsNs : "",
-      options: discovered ? [{
-        v: opsNs,
-        l: `${opsNs} (Ramen's ops namespace)`
-      }] : undefined,
-      placeholder: "the Placement's namespace"
+      def: "",
+      placeholder: "the Placement's namespace",
+      validate: x => x && !DNS_LABEL_RE.test(x) ? "A namespace name." : null
     }, {
       k: "source",
       label: "Source site",
@@ -30000,9 +30183,10 @@ const protectAppDialogDR = (plans, cfg) => ({
         }
       } : {})
     });
+    const opsNs = cfg && cfg.ramen && cfg.ramen.opsNamespace || DR_NS();
     return drhub.createApp({
       name: v.name.trim(),
-      namespace: v.namespace.trim(),
+      namespace: v.appKind === "managed" ? (v.namespace || "").trim() : opsNs,
       spec
     });
   }
@@ -30111,7 +30295,7 @@ const rplanFields = (v, paths, apps, fixedPath) => {
     k: "nNs",
     type: "note",
     icon: nss.length === 1 || chosenNs.length === 1 ? "check" : "alert",
-    label: !items.length ? `No protected application is on ${path ? path.name : "the path"} yet: protect applications along it first.` : chosenNs.length === 1 ? `Namespace of the protected applications (RecoveryPlan namespace): ${chosenNs[0]}` : nss.length === 1 ? `Namespace of the protected applications (RecoveryPlan namespace): ${nss[0]}` : `The applications on this path are in ${nss.join(", ")}: a recovery plan holds applications of one namespace, which it is created in.`
+    label: !items.length ? `No protected application is on ${path ? path.name : "the path"} yet: protect applications along it first.` : chosenNs.length === 1 ? `Kept in the hub namespace of the DR objects (Ramen operations namespace): ${chosenNs[0]}` : nss.length === 1 ? `Kept in the hub namespace of the DR objects (Ramen operations namespace): ${nss[0]}` : `The applications on this path are in ${nss.join(", ")}: a recovery plan holds applications of one namespace, which it is created in.`
   }, {
     k: "apps",
     label: "Applications by priority — lane 1 moves first",
@@ -30294,323 +30478,364 @@ const dhcpAnswerOf = (st, servers, found) => {
     lines
   };
 };
-const editBindingsDialog = s => ({
-  title: `Bindings of ${s.name}`,
-  confirm: "Save",
-  done: "SiteProfile updated",
-  desc: "How this site's networks map for recovered VMs (ADR 0020): the NAD each logical role is on here, the guest subnet of each role with the host ids never handed out, and the DHCP server the reservations are rendered to. Proposals come from what the site's dr-agent reports.",
-  prepare: () => Promise.all([drhub.dhcpServers(), drhub.discovery(), drhub.siteProfiles().catch(() => []), drhub.paths().catch(() => [])]).then(([ds, disc, profiles, paths]) => ({
-    servers: ds.filter(d => d.site === s.name),
-    disc,
-    others: profiles.filter(p => p.name !== s.name),
-    paths
-  })),
-  fields: (v, prep) => {
-    const {
-      servers = [],
+const editBindingsDialog = s => {
+  // the single registered server preselected as the site default while the
+  // default field is not shown: saving uses it when no default was chosen
+  let lastOnlyOne = "";
+  return {
+    title: `Bindings of ${s.name}`,
+    confirm: "Save",
+    done: "SiteProfile updated",
+    desc: "How this site's networks map for recovered VMs (ADR 0020): the NAD each logical role is on here, the guest subnet of each role with the host ids never handed out, and the DHCP server the reservations are rendered to. Proposals come from what the site's dr-agent reports.",
+    prepare: () => Promise.all([drhub.dhcpServers(), drhub.discovery(), drhub.siteProfiles().catch(() => []), drhub.paths().catch(() => [])]).then(([ds, disc, profiles, paths]) => ({
+      servers: ds.filter(d => d.site === s.name),
       disc,
-      others = [],
-      paths = []
-    } = prep || {};
-    const d = discOf(disc, s.name);
-    const cur = srvRef((s.spec || {}).dhcpServerRef);
-    const unregistered = n => n && !servers.some(x => x.name === n);
-    // the isolated test networks of this site, and the server to propose for
-    // its guest networks: registered first, else a discovered one to register
-    const testNads = testNadsOf(disc, s.name, paths);
-    // the NADs of the roles that have a guest network (all bound roles when none has one yet)
-    // (the profile's own bindings while the form has no values yet: the defaults)
-    const gnetsNow = v.gnets || gnetRows(s.spec || {}),
-      lnetsNow = v.lnets || lnetRows(s.spec || {});
-    const guestRoles = gnetsNow.map(g => g.role).filter(Boolean);
-    const roleNads = lnetsNow.filter(l => !guestRoles.length || guestRoles.includes(l.role)).map(l => l.nad);
-    const prop = proposeDHCPServer(disc, s.name, roleNads, servers, testNads);
-    // the site default never proposes a name nothing registered
-    const dhcpDef = cur && !unregistered(cur) ? cur : prop.registered || "";
-    // every guest network already reaches a registered server: nothing to register
-    const served = gnetsNow.length > 0 && gnetsNow.every(g => g.dhcpServerRef ? !unregistered(g.dhcpServerRef) : !!((v.dhcp !== undefined ? v.dhcp : dhcpDef) && !unregistered(v.dhcp !== undefined ? v.dhcp : dhcpDef)));
-    const nadOpts = (d && d.nads || []).map(n => ({
-      v: nadRef(n),
-      l: `${nadRef(n)}${n.vlan ? ` (VLAN ${n.vlan})` : ""}${n.type ? ` ${n.type}` : ""}`
-    }));
-    const roles = uniqSorted(others.flatMap(p => ((p.spec || {}).logicalNetworks || []).map(l => l.role)).concat(((s.spec || {}).logicalNetworks || []).map(l => l.role), (v.lnets || []).map(l => l.role), ["app"]));
-    const roleNad = role => ((v.lnets || []).find(l => l.role === role) || {}).nad || "";
-    const pairs = proposeRoles(disc, s.name, others.map(p => ({
-      name: p.name,
-      spec: p.spec
-    })));
-    const found = d && d.dhcpServers || [];
-    const proposedGuest = (role, nad) => {
-      const sub = nadSubnet(disc, s.name, nad);
-      const srv = dhcpServersOn(disc, s.name, nad).map(f => servers.find(x => x.dnsmasq && x.dnsmasq.namespace === f.namespace && x.dnsmasq.configMap === f.hostsConfigMap)).find(Boolean);
-      return {
-        role,
-        cidr: sub.cidr,
-        reservedHostIDs: sub.cidr ? proposedReserved(disc, s.name, nad, sub.cidr).join(", ") : "1, 2",
-        dhcpServerRef: srv && srv.name !== dhcpDef ? srv.name : ""
+      others: profiles.filter(p => p.name !== s.name),
+      paths
+    })),
+    fields: (v, prep) => {
+      const {
+        servers = [],
+        disc,
+        others = [],
+        paths = []
+      } = prep || {};
+      const d = discOf(disc, s.name);
+      const cur = srvRef((s.spec || {}).dhcpServerRef);
+      const unregistered = n => n && !servers.some(x => x.name === n);
+      // the isolated test networks of this site, and the server to propose for
+      // its guest networks: registered first, else a discovered one to register
+      const testNads = testNadsOf(disc, s.name, paths);
+      // the NADs of the roles that have a guest network (all bound roles when none has one yet)
+      // (the profile's own bindings while the form has no values yet: the defaults)
+      const gnetsNow = v.gnets || gnetRows(s.spec || {}),
+        lnetsNow = v.lnets || lnetRows(s.spec || {});
+      const guestRoles = gnetsNow.map(g => g.role).filter(Boolean);
+      const roleNads = lnetsNow.filter(l => !guestRoles.length || guestRoles.includes(l.role)).map(l => l.nad);
+      const prop = proposeDHCPServer(disc, s.name, roleNads, servers, testNads);
+      // the site default never proposes a name nothing registered
+      const dhcpDef = cur && !unregistered(cur) ? cur : prop.registered || "";
+      // every guest network already reaches a registered server: nothing to register
+      const served = gnetsNow.length > 0 && gnetsNow.every(g => g.dhcpServerRef ? !unregistered(g.dhcpServerRef) : !!((v.dhcp !== undefined ? v.dhcp : dhcpDef) && !unregistered(v.dhcp !== undefined ? v.dhcp : dhcpDef)));
+      const nadOpts = (d && d.nads || []).map(n => ({
+        v: nadRef(n),
+        l: `${nadRef(n)}${n.vlan ? ` (VLAN ${n.vlan})` : ""}${n.type ? ` ${n.type}` : ""}`
+      }));
+      const roles = uniqSorted(others.flatMap(p => ((p.spec || {}).logicalNetworks || []).map(l => l.role)).concat(((s.spec || {}).logicalNetworks || []).map(l => l.role), (v.lnets || []).map(l => l.role), ["app"]));
+      const roleNad = role => ((v.lnets || []).find(l => l.role === role) || {}).nad || "";
+      const pairs = proposeRoles(disc, s.name, others.map(p => ({
+        name: p.name,
+        spec: p.spec
+      })));
+      const foundAll = d && d.dhcpServers || [];
+      // test-network (bubble) servers serve the isolated test network, never a
+      // guest network: not offered here
+      const found = foundAll.filter(f => !isBubbleServer(disc, s.name, f, testNads));
+      const bubbles = foundAll.length - found.length;
+      const registeredFor = f => servers.find(x => x.dnsmasq && f && x.dnsmasq.namespace === f.namespace && x.dnsmasq.configMap === f.hostsConfigMap);
+      // with one registered server on the guest networks' segment (or nothing
+      // reported to tell), that server is the site default; the default field
+      // only matters with several servers, several guest networks, or a single
+      // server that serves another segment
+      const onlyOne = servers.length === 1 && (prop.registered ? prop.registered === servers[0].name : !d) ? servers[0].name : "";
+      lastOnlyOne = onlyOne;
+      const showDefault = servers.length > 1 || gnetsNow.length > 1 || servers.length === 1 && !onlyOne;
+      const siteDefault = (v.dhcp !== undefined ? v.dhcp : dhcpDef) || onlyOne;
+      const proposedGuest = (role, nad) => {
+        const sub = nadSubnet(disc, s.name, nad);
+        const srv = dhcpServersOn(disc, s.name, nad).map(f => servers.find(x => x.dnsmasq && x.dnsmasq.namespace === f.namespace && x.dnsmasq.configMap === f.hostsConfigMap)).find(Boolean);
+        return {
+          role,
+          cidr: sub.cidr,
+          reservedHostIDs: sub.cidr ? proposedReserved(disc, s.name, nad, sub.cidr).join(", ") : "1, 2",
+          dhcpServerRef: srv && srv.name !== dhcpDef ? srv.name : ""
+        };
       };
-    };
-    return [!servers.length && {
-      k: "n0",
-      type: "note",
-      label: found.length ? `No DHCP server is registered for ${s.name}; ${found.length} found on its networks — register one below.` : `No DHCP server is registered for ${s.name}. Register one under Disaster recovery → DHCP servers; until then guest addresses are not reserved on this site.`
-    }, !d && {
-      k: "nRep",
-      type: "note",
-      label: `dr-agent on ${s.name} has not reported its networks: nothing can be proposed; bind by hand with the override.`
-    }, pairs.length > 0 && {
-      k: "pair",
-      type: "apply",
-      label: "Proposed role bindings",
-      button: "Accept the proposal",
-      hint: () => pairs.map(x => `${x.role} ← ${x.nad} (${x.why})`).join("; "),
-      apply: vv => {
-        const lnets = pairs.map(x => ({
-          role: x.role,
-          nad: x.nad
-        })).concat((vv.lnets || []).filter(l => !pairs.some(x => x.role === l.role)));
-        const gnets = pairs.map(x => (vv.gnets || []).find(g => g.role === x.role) || proposedGuest(x.role, x.nad)).concat((vv.gnets || []).filter(g => !pairs.some(x => x.role === g.role)));
-        return {
-          lnets,
-          gnets
-        };
-      },
-      done: "Accepted: the bindings below are filled in; review them before saving."
-    }, {
-      k: "bindOverride",
-      label: "Bind by hand (roles, NADs and subnets as text)",
-      type: "checkbox",
-      def: false
-    }, {
-      k: "lnets",
-      label: "Logical networks — role → NAD on this site",
-      type: "rows",
-      max: 8,
-      addLabel: "Add network",
-      def: lnetRows(s.spec || {}),
-      cols: v.bindOverride ? LNET_COLS : [{
-        k: "role",
-        label: "Role",
-        type: "select",
-        blank: "— role —",
-        options: roles.map(r => ({
-          v: r,
-          l: r
-        })),
-        flex: 0.8
-      }, {
-        k: "nad",
-        label: "NetworkAttachmentDefinition",
-        type: "select",
-        blank: "— NAD —",
-        options: nadOpts,
-        unknown: x => `${x} (not on ${s.name})`,
-        flex: 2.4
-      }],
-      add: () => ({
-        role: roles.find(r => !(v.lnets || []).some(l => l.role === r)) || "app",
-        nad: ""
-      }),
-      rowError: (r, i, rows) => rows.filter(x => x.role === r.role).length > 1 ? `Role ${r.role} is bound twice.` : !v.bindOverride && r.nad && d && !nadOpts.some(o => o.v === r.nad) ? `${r.nad} is not a NAD of ${s.name}.` : null,
-      rowsBlock: true
-    }, {
-      k: "gnets",
-      label: "Guest networks — the subnet of each role here",
-      type: "rows",
-      max: 8,
-      addLabel: "Add subnet",
-      def: gnetRows(s.spec || {}),
-      cols: v.bindOverride ? gnetCols(servers) : [{
-        k: "role",
-        label: "Role",
-        type: "select",
-        blank: "— role —",
-        options: (v.lnets || []).map(l => ({
-          v: l.role,
-          l: l.role
-        })),
-        flex: 0.7
-      }, {
-        k: "cidr",
-        label: "Guest subnet",
-        placeholder: "proposed from the NAD",
-        flex: 1.3
-      }, {
-        k: "reservedHostIDs",
-        label: "Reserved host ids",
-        placeholder: "1, 2",
-        flex: 0.9
-      }, {
-        k: "dhcpServerRef",
-        label: "DHCP server",
-        type: "select",
-        blank: "— the site's default —",
-        options: servers.map(x => ({
-          v: x.name,
-          l: x.name
-        })),
-        unknown: x => `${x} (not registered)`,
-        flex: 1.1
-      }],
-      sync: x => {
-        if (v.bindOverride || !x) return undefined;
-        let changed = false;
-        const n = x.map(g => {
-          if (g.cidr || !roleNad(g.role)) return g;
-          const p2 = proposedGuest(g.role, roleNad(g.role));
-          if (!p2.cidr) return g;
-          changed = true;
-          return Object.assign({}, g, {
-            cidr: p2.cidr,
-            reservedHostIDs: g.reservedHostIDs || p2.reservedHostIDs,
-            dhcpServerRef: g.dhcpServerRef || p2.dhcpServerRef
-          });
-        });
-        return changed ? n : undefined;
-      },
-      add: () => {
-        const role = ((v.lnets || []).find(l => !(v.gnets || []).some(g => g.role === l.role)) || {}).role || "app";
-        return proposedGuest(role, roleNad(role));
-      },
-      rowError: r => guestRowError(disc, s.name, r, roleNad(r.role), servers) || (r.cidr && !v.bindOverride && !roleNad(r.role) ? `Role ${r.role} has no NAD on ${s.name}: bind it above.` : null),
-      rowsBlock: true,
-      rowInfo: r => {
-        const ips = nadAddresses(disc, s.name, roleNad(r.role));
-        const sub = nadSubnet(disc, s.name, roleNad(r.role));
-        return sub.cidr ? `${sub.cidr} from ${sub.source}${ips.length ? `; VMs at ${ips.slice(0, 4).join(", ")}` : ""}` : null;
-      },
-      rowAction: {
-        label: "Ask",
-        title: "Ask the DHCP servers on this role's NAD for an address (a short-lived pod on the network; dr-admin)",
-        run: r => {
-          const nad = roleNad(r.role);
-          if (!nad) throw new Error(`Bind role ${r.role} to a NAD first.`);
-          return drhub.probeDHCP({
-            cluster: s.name,
-            nad
-          }).then(st => dhcpAnswerOf(st, servers, found));
-        }
-      },
-      hint: `The DHCP servers registered for ${s.name}: ${servers.map(x => x.name).join(", ") || "none"}. "Ask" finds servers outside the cluster too; those cannot take reservations from the hub.`
-    },
-    // stays after it registered the server, so its answer stays readable
-    (!prop.registered && prop.discovered && !served || v._regUsed) && {
-      k: "regUse",
-      type: "apply",
-      refresh: true,
-      label: "Proposed DHCP server",
-      button: v._regUsed ? "Registered" : "Register and use",
-      disabled: vv => !!vv._regUsed,
-      hint: () => {
-        const f = prop.discovered;
-        if (!f) return `registered as ${v._regUsed}`;
-        return `${f.namespace}/${f.owner || f.pod} on ${(f.nads || []).map(n => `${n.nad}${(n.ips || []).length ? ` @${n.ips[0]}` : ""}`).join(", ")}, reservations in ${f.namespace}/${f.hostsConfigMap}` + (unregistered(cur) ? `. It is registered as ${cur}, the name this profile already uses, so the guest networks that name it work as they are.` : ". It is registered and set as the site's DHCP server.");
-      },
-      apply: async vv => {
-        const f = prop.discovered;
-        const name = unregistered(cur) ? cur : dns63(`${s.name}-${(f.owner || f.pod).split("/").pop()}`);
-        await drhub.createDHCPServer({
-          name,
-          site: s.name,
-          namespace: f.namespace,
-          configMap: f.hostsConfigMap
-        });
-        // rows that named an unregistered server fall back to the site default
-        return {
-          _regUsed: name,
-          dhcp: name,
-          gnets: (vv.gnets || []).map(g => g.dhcpServerRef && g.dhcpServerRef !== name && unregistered(g.dhcpServerRef) ? Object.assign({}, g, {
-            dhcpServerRef: ""
-          }) : g)
-        };
-      },
-      done: "Registered and set as the site's DHCP server; review the bindings, then save."
-    }, found.length > 0 && {
-      k: "found",
-      label: `DHCP servers found on ${s.name}'s networks`,
-      type: "rows",
-      fixed: true,
-      def: found.map(f => ({
-        pod: `${f.namespace}/${f.owner || f.pod}`,
-        nad: (f.nads || []).map(n => `${n.nad}${(n.ips || []).length ? ` @${n.ips[0]}` : ""}`).join(", "),
-        ranges: (f.ranges || []).join("; "),
-        hosts: f.hostsConfigMap ? `${f.namespace}/${f.hostsConfigMap}` : "",
-        _f: f
-      })),
-      cols: [{
-        k: "pod",
-        label: "Server",
-        readonly: true,
-        flex: 1.3
-      }, {
-        k: "nad",
-        label: "On",
-        readonly: true,
-        flex: 1.6
-      }, {
-        k: "ranges",
-        label: "Ranges",
-        readonly: true,
-        flex: 1.4
-      }, {
-        k: "hosts",
-        label: "Reservations ConfigMap",
-        readonly: true,
-        flex: 1.2
-      }],
-      rowInfo: r => {
-        const reg = servers.find(x => x.dnsmasq && r._f && x.dnsmasq.namespace === r._f.namespace && x.dnsmasq.configMap === r._f.hostsConfigMap);
-        const bubble = r._f && isBubbleServer(disc, s.name, r._f, testNads) ? "test network (bubble) server: it serves the isolated test network, not a guest network" : null;
-        return [bubble, reg ? `registered as ${reg.name}` : r._f && !r._f.hostsConfigMap ? "reads no hosts file from a ConfigMap: the hub cannot render reservations to it" : null].filter(Boolean).join("; ") || null;
-      },
-      rowAction: {
-        label: "Register",
-        title: "Register this server for the site: dr-hub renders the reservations into its ConfigMap",
-        run: r => {
-          const f = r._f;
-          if (!f || !f.hostsConfigMap) throw new Error("This server reads no hosts file from a ConfigMap.");
-          if (servers.some(x => x.dnsmasq && x.dnsmasq.namespace === f.namespace && x.dnsmasq.configMap === f.hostsConfigMap)) return {
-            status: "ok",
-            text: "registered already"
+      return [!servers.length && {
+        k: "n0",
+        type: "note",
+        label: found.length ? `No DHCP server is registered for ${s.name}; ${found.length} found on its networks — register one below.` : `No DHCP server is registered for ${s.name}. Register one under Disaster recovery → DHCP servers; until then guest addresses are not reserved on this site.`
+      }, !d && {
+        k: "nRep",
+        type: "note",
+        label: `dr-agent on ${s.name} has not reported its networks: nothing can be proposed; bind by hand with the override.`
+      }, pairs.length > 0 && {
+        k: "pair",
+        type: "apply",
+        label: "Proposed role bindings",
+        button: "Accept the proposal",
+        hint: () => pairs.map(x => `${x.role} ← ${x.nad} (${x.why})`).join("; "),
+        apply: vv => {
+          const lnets = pairs.map(x => ({
+            role: x.role,
+            nad: x.nad
+          })).concat((vv.lnets || []).filter(l => !pairs.some(x => x.role === l.role)));
+          const gnets = pairs.map(x => (vv.gnets || []).find(g => g.role === x.role) || proposedGuest(x.role, x.nad)).concat((vv.gnets || []).filter(g => !pairs.some(x => x.role === g.role)));
+          return {
+            lnets,
+            gnets
           };
-          const name = dns63(`${s.name}-${(f.owner || f.pod).split("/").pop()}`);
-          return drhub.createDHCPServer({
+        },
+        done: "Accepted: the bindings below are filled in; review them before saving."
+      }, {
+        k: "bindOverride",
+        label: "Bind by hand (roles, NADs and subnets as text)",
+        type: "checkbox",
+        def: false
+      }, {
+        k: "lnets",
+        label: "Logical networks — role → NAD on this site",
+        type: "rows",
+        max: 8,
+        addLabel: "Add network",
+        def: lnetRows(s.spec || {}),
+        cols: v.bindOverride ? LNET_COLS : [{
+          k: "role",
+          label: "Role",
+          type: "select",
+          blank: "— role —",
+          options: roles.map(r => ({
+            v: r,
+            l: r
+          })),
+          flex: 0.8
+        }, {
+          k: "nad",
+          label: "NetworkAttachmentDefinition",
+          type: "select",
+          blank: "— NAD —",
+          options: nadOpts,
+          unknown: x => `${x} (not on ${s.name})`,
+          flex: 2.4
+        }],
+        add: () => ({
+          role: roles.find(r => !(v.lnets || []).some(l => l.role === r)) || "app",
+          nad: ""
+        }),
+        rowError: (r, i, rows) => rows.filter(x => x.role === r.role).length > 1 ? `Role ${r.role} is bound twice.` : !v.bindOverride && r.nad && d && !nadOpts.some(o => o.v === r.nad) ? `${r.nad} is not a NAD of ${s.name}.` : null,
+        rowsBlock: true
+      }, {
+        k: "gnets",
+        label: "Guest networks — the subnet of each role here",
+        type: "rows",
+        max: 8,
+        addLabel: "Add subnet",
+        def: gnetRows(s.spec || {}),
+        cols: v.bindOverride ? gnetCols(servers) : [{
+          k: "role",
+          label: "Role",
+          type: "select",
+          blank: "— role —",
+          options: (v.lnets || []).map(l => ({
+            v: l.role,
+            l: l.role
+          })),
+          flex: 0.7
+        }, {
+          k: "cidr",
+          label: "Guest subnet",
+          placeholder: "proposed from the NAD",
+          flex: 1.3
+        }, {
+          k: "reservedHostIDs",
+          label: "Reserved host ids",
+          placeholder: "1, 2",
+          flex: 0.9
+        }, servers.length > 0 && {
+          k: "dhcpServerRef",
+          label: "DHCP server",
+          type: "select",
+          blank: `site default (${siteDefault || "none"})`,
+          options: servers.filter(x => !(servers.length === 1 && x.name === siteDefault)).map(x => ({
+            v: x.name,
+            l: x.name
+          })),
+          unknown: x => `${x} (not registered)`,
+          flex: 1.1
+        }].filter(Boolean),
+        sync: x => {
+          if (v.bindOverride || !x) return undefined;
+          let changed = false;
+          const n = x.map(g => {
+            if (g.cidr || !roleNad(g.role)) return g;
+            const p2 = proposedGuest(g.role, roleNad(g.role));
+            if (!p2.cidr) return g;
+            changed = true;
+            return Object.assign({}, g, {
+              cidr: p2.cidr,
+              reservedHostIDs: g.reservedHostIDs || p2.reservedHostIDs,
+              dhcpServerRef: g.dhcpServerRef || p2.dhcpServerRef
+            });
+          });
+          return changed ? n : undefined;
+        },
+        add: () => {
+          const role = ((v.lnets || []).find(l => !(v.gnets || []).some(g => g.role === l.role)) || {}).role || "app";
+          return proposedGuest(role, roleNad(role));
+        },
+        rowError: r => guestRowError(disc, s.name, r, roleNad(r.role), servers) || (r.cidr && !v.bindOverride && !roleNad(r.role) ? `Role ${r.role} has no NAD on ${s.name}: bind it above.` : null),
+        rowsBlock: true,
+        rowInfo: r => {
+          const ips = nadAddresses(disc, s.name, roleNad(r.role));
+          const sub = nadSubnet(disc, s.name, roleNad(r.role));
+          return sub.cidr ? `${sub.cidr} from ${sub.source}${ips.length ? `; VMs at ${ips.slice(0, 4).join(", ")}` : ""}` : null;
+        },
+        rowAction: {
+          label: "Ask",
+          title: "Ask the DHCP servers on this role's NAD for an address (a short-lived pod on the network; dr-admin)",
+          run: r => {
+            const nad = roleNad(r.role);
+            if (!nad) throw new Error(`Bind role ${r.role} to a NAD first.`);
+            return drhub.probeDHCP({
+              cluster: s.name,
+              nad
+            }).then(st => dhcpAnswerOf(st, servers, found));
+          }
+        },
+        hint: servers.length ? `A role's own DHCP server wins over the site default. Registered for ${s.name}: ${servers.map(x => x.name).join(", ")}. "Ask" finds servers outside the cluster too; those cannot take reservations from the hub.` : `No DHCP server registered for ${s.name}: guest addresses are not reserved until one is registered and used (below). "Ask" finds servers outside the cluster too; those cannot take reservations from the hub.`
+      },
+      // stays after it registered the server, so its answer stays readable
+      (!prop.registered && prop.discovered && !served || v._regUsed) && {
+        k: "regUse",
+        type: "apply",
+        refresh: true,
+        label: "Proposed DHCP server",
+        button: v._regUsed ? "Registered" : "Register and use",
+        disabled: vv => !!vv._regUsed,
+        hint: () => {
+          const f = prop.discovered;
+          if (!f) return `registered as ${v._regUsed}`;
+          return `${f.namespace}/${f.owner || f.pod} on ${(f.nads || []).map(n => `${n.nad}${(n.ips || []).length ? ` @${n.ips[0]}` : ""}`).join(", ")}, reservations in ${f.namespace}/${f.hostsConfigMap}` + (unregistered(cur) ? `. It is registered as ${cur}, the name this profile already uses, so the guest networks that name it work as they are.` : ". It is registered and set as the site's DHCP server.");
+        },
+        apply: async vv => {
+          const f = prop.discovered;
+          const name = unregistered(cur) ? cur : dns63(`${s.name}-${(f.owner || f.pod).split("/").pop()}`);
+          await drhub.createDHCPServer({
             name,
             site: s.name,
             namespace: f.namespace,
             configMap: f.hostsConfigMap
-          }).then(() => ({
-            status: "ok",
-            text: `registered as ${name}; reopen the bindings to choose it`
-          }));
+          });
+          // rows that named an unregistered server fall back to the site default
+          return {
+            _regUsed: name,
+            dhcp: name,
+            gnets: (vv.gnets || []).map(g => g.dhcpServerRef && g.dhcpServerRef !== name && unregistered(g.dhcpServerRef) ? Object.assign({}, g, {
+              dhcpServerRef: ""
+            }) : g)
+          };
+        },
+        done: "Registered and set as the site's DHCP server; review the bindings, then save."
+      }, found.length > 0 && {
+        k: "found",
+        label: `DHCP servers found on ${s.name}'s networks${bubbles ? ` (${bubbles} test-network server${bubbles > 1 ? "s" : ""} not shown)` : ""}`,
+        type: "rows",
+        fixed: true,
+        def: found.map(f => ({
+          pod: `${f.namespace}/${f.owner || f.pod}`,
+          nad: (f.nads || []).map(n => `${n.nad}${(n.ips || []).length ? ` @${n.ips[0]}` : ""}`).join(", "),
+          ranges: (f.ranges || []).join("; "),
+          hosts: f.hostsConfigMap ? `${f.namespace}/${f.hostsConfigMap}` : "",
+          _f: f
+        })),
+        cols: [{
+          k: "pod",
+          label: "Server",
+          readonly: true,
+          flex: 1.3
+        }, {
+          k: "nad",
+          label: "On",
+          readonly: true,
+          flex: 1.6
+        }, {
+          k: "ranges",
+          label: "Ranges",
+          readonly: true,
+          flex: 1.4
+        }, {
+          k: "hosts",
+          label: "Reservations ConfigMap",
+          readonly: true,
+          flex: 1.2
+        }],
+        rowInfo: r => {
+          const reg = servers.find(x => x.dnsmasq && r._f && x.dnsmasq.namespace === r._f.namespace && x.dnsmasq.configMap === r._f.hostsConfigMap);
+          return reg ? `registered as ${reg.name}` : r._f && !r._f.hostsConfigMap ? "reads no hosts file from a ConfigMap: the hub cannot render reservations to it" : null;
+        },
+        rowAction: {
+          label: r => registeredFor(r._f) ? "Use" : "Register and use",
+          width: 118,
+          title: "Register this server for the site (dr-hub renders the reservations into its ConfigMap) and select it for the guest networks",
+          run: async (r, vv, i, ctx) => {
+            const f = r._f;
+            if (!f || !f.hostsConfigMap) throw new Error("This server reads no hosts file from a ConfigMap.");
+            const known = registeredFor(f);
+            const name = known ? known.name : dns63(`${s.name}-${(f.owner || f.pod).split("/").pop()}`);
+            if (!known) await drhub.createDHCPServer({
+              name,
+              site: s.name,
+              namespace: f.namespace,
+              configMap: f.hostsConfigMap
+            });
+            // the dialog's server list was loaded when it opened: load it again
+            // so the selects offer the new server, then select it
+            if (ctx && ctx.reprepare) await ctx.reprepare();
+            const onNads = (f.nads || []).map(n => n.nad);
+            const def = vv.dhcp || name;
+            if (ctx && ctx.setAll) ctx.setAll({
+              dhcp: def,
+              gnets: (vv.gnets || []).map(g => !g.dhcpServerRef && def !== name && onNads.includes(roleNad(g.role)) ? Object.assign({}, g, {
+                dhcpServerRef: name
+              }) : g)
+            });
+            return {
+              status: "ok",
+              text: known ? `${name} selected` : `registered as ${name} and selected`
+            };
+          }
         }
-      }
-    }, unregistered(cur) && {
-      k: "nCur",
-      type: "note",
-      label: `This profile names the DHCP server ${cur}, which is not registered for ${s.name}: its reservations are rendered nowhere. ${prop.discovered && !prop.registered ? "Register and use the proposed server above (it keeps the name " + cur + "), or choose a registered one." : "Choose a registered server, or register one."}`
-    }, {
-      k: "dhcp",
-      label: "DHCP server of the site (default for every guest network)",
-      type: "select",
-      def: dhcpDef,
-      options: [{
-        v: "",
-        l: "— none —"
-      }].concat(servers.map(x => ({
-        v: x.name,
-        l: `${x.name} (${x.target || x.type})`
-      })), unregistered(cur) ? [{
-        v: cur,
-        l: `${cur} (not registered)`
-      }] : []),
-      validate: x => unregistered(x) ? `DHCP server ${x} is not registered for ${s.name}.` : null
-    }].filter(Boolean);
-  },
-  run: v => drhub.patchSiteProfile(s, bindingsSpec(Object.assign({}, v, {
-    dhcp: v.dhcp && v.dhcp.trim() ? v.dhcp.trim() : ""
-  })))
-});
+      }, unregistered(cur) && {
+        k: "nCur",
+        type: "note",
+        label: `This profile names the DHCP server ${cur}, which is not registered for ${s.name}: its reservations are rendered nowhere. ${prop.discovered && !prop.registered ? "Register and use the proposed server above (it keeps the name " + cur + "), or choose a registered one." : "Choose a registered server, or register one."}`
+      }, !servers.length && !unregistered(cur) && {
+        k: "nNoSrv",
+        type: "note",
+        icon: "alert",
+        label: found.length ? `No DHCP server registered for ${s.name}: "Register and use" one of the servers found above.` : `No DHCP server registered for ${s.name}, and none found on its networks: register one under Disaster recovery → DHCP servers.`
+      }, servers.length > 0 && !showDefault && !unregistered(cur) && {
+        k: "nOne",
+        type: "note",
+        icon: "check",
+        label: `Guest networks without their own server use ${siteDefault}, the site's DHCP server.`
+      }, (servers.length > 0 || unregistered(cur)) && (showDefault || unregistered(cur)) && {
+        k: "dhcp",
+        label: "DHCP server of the site (default for every guest network)",
+        type: "select",
+        def: dhcpDef || onlyOne,
+        hint: "A role's own DHCP server wins over this default. Registering a server does not use it: select it here or for a role.",
+        options: [{
+          v: "",
+          l: "— none —"
+        }].concat(servers.map(x => ({
+          v: x.name,
+          l: `${x.name} (${x.target || x.type})`
+        })), unregistered(cur) ? [{
+          v: cur,
+          l: `${cur} (not registered)`
+        }] : []),
+        validate: x => unregistered(x) ? `DHCP server ${x} is not registered for ${s.name}.` : null
+      }].filter(Boolean);
+    },
+    run: v => {
+      const chosen = v.dhcp && v.dhcp.trim() ? v.dhcp.trim() : "";
+      return drhub.patchSiteProfile(s, bindingsSpec(Object.assign({}, v, {
+        dhcp: chosen || lastOnlyOne
+      })));
+    }
+  };
+};
 const newDHCPServerDialog = (sites, profiles) => ({
   title: "Register a DHCP server",
   confirm: "Create",
@@ -32130,7 +32355,11 @@ function DRPathDetail({
     rows: [["From", /*#__PURE__*/React.createElement(Mono, null, p.from)], ["To", /*#__PURE__*/React.createElement(Mono, null, p.to)], ["Plan", /*#__PURE__*/React.createElement(Ref, {
       label: p.planName,
       onClick: () => nav.openPlanByName(p.planName)
-    })], ["Actions", p.actions.join(", ")], ["Announcement hand-over", p.announcementHandover ? "yes" : "no"], p.test && ["Test mode", p.test.mode], p.test && ["Isolated NAD", /*#__PURE__*/React.createElement(Mono, null, p.test.isolatedNad)], p.test && ["Max clone capacity", /*#__PURE__*/React.createElement(Mono, null, (p.test.quotas || {}).maxCloneCapacity)], p.test && ["test-recent window", /*#__PURE__*/React.createElement(Mono, null, p.test.recentWithin || "720h")]]
+    })], ["Actions", p.actions.join(", ")], ["Announcement hand-over", p.announcementHandover ? "yes" : "no"], p.test && ["Test mode", p.test.mode], p.test && ["Isolated NAD", /*#__PURE__*/React.createElement(Mono, null, p.test.isolatedNad)], p.test && ["Test DHCP server", p.test.dhcpServerRef ? /*#__PURE__*/React.createElement(Mono, null, p.test.dhcpServerRef) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim)"
+      }
+    }, "none \u2014 the test network serves the reservations by other means")], p.test && ["Max clone capacity", /*#__PURE__*/React.createElement(Mono, null, (p.test.quotas || {}).maxCloneCapacity)], p.test && ["test-recent window", /*#__PURE__*/React.createElement(Mono, null, p.test.recentWithin || "720h")]]
   }), /*#__PURE__*/React.createElement("p", {
     className: "mdesc",
     style: {
@@ -32230,6 +32459,11 @@ function PAppDetail({
         color: "var(--bad)"
       }
     }, "not protected"))
+  }), /*#__PURE__*/React.createElement(ProposalLink, {
+    kind: "ProtectedApplication",
+    name: a.name,
+    namespace: a.namespace,
+    nav: nav
   }), !!running.length && /*#__PURE__*/React.createElement("div", {
     className: "banner",
     style: {
@@ -32543,6 +32777,11 @@ function RPlanDetail({
     badge: /*#__PURE__*/React.createElement("span", {
       className: "badge"
     }, "RecoveryPlan")
+  }), /*#__PURE__*/React.createElement(ProposalLink, {
+    kind: "RecoveryPlan",
+    name: p.name,
+    namespace: p.namespace,
+    nav: nav
   }), /*#__PURE__*/React.createElement("div", {
     className: "stats"
   }, /*#__PURE__*/React.createElement(Stat, {
@@ -33166,6 +33405,10 @@ function SiteProfileDetail({
     badge: /*#__PURE__*/React.createElement("span", {
       className: "badge k8s"
     }, "managed cluster")
+  }), /*#__PURE__*/React.createElement(ProposalLink, {
+    kind: "SiteProfile",
+    name: s.name,
+    nav: nav
   }), /*#__PURE__*/React.createElement("div", {
     className: "banner",
     style: {
@@ -33891,6 +34134,18 @@ function DrHubHome({
   })), /*#__PURE__*/React.createElement("div", {
     className: "navcards"
   }, /*#__PURE__*/React.createElement(NavCard, {
+    icon: "k8s",
+    title: "Discovery",
+    sub: "dependency graphs and application candidates per site",
+    count: "\u2192",
+    onClick: () => nav.drLayer("aidisc")
+  }), /*#__PURE__*/React.createElement(NavCard, {
+    icon: "list",
+    title: "Proposals",
+    sub: "whole-application bundles awaiting approval",
+    count: "\u2192",
+    onClick: () => nav.drLayer("proposals")
+  }), /*#__PURE__*/React.createElement(NavCard, {
     icon: "list",
     title: "Recovery plans",
     sub: "ordered sets of applications",
@@ -33922,6 +34177,15 @@ function DrHubHome({
     onClick: () => nav.drLayer("drconfig")
   })));
 }
+
+// shared with discover.jsx (AI-assisted discovery)
+Object.assign(window, {
+  DrTable: Table,
+  DrMono: Mono,
+  DrCheckTable: CheckTable,
+  DrConditions: Conditions,
+  VerdictBadge
+});
 Object.assign(window, {
   DrHubHome,
   DRConfigView,
@@ -33971,6 +34235,1893 @@ Object.assign(window, {
   sitesError,
   overrideError,
   missingServers
+});
+})();
+// ---- discover.jsx ----
+(function(){
+// ---------------------------------------------------------------------------
+// AI-ASSISTED DISCOVERY — dr-hub ADR 0023 (design: simplyblock-dr
+// docs/design/ai-assisted-discovery.md, sections 7 and 10).
+//
+// dr-hub builds a dependency graph per site from what the sites' dr-agents
+// report (DiscoveryGraph; its nodes, edges and evidence in compressed
+// ConfigMap shards in dr-hub's namespace), derives one bundle per application
+// (DRProposal) and runs discoveries on request (DiscoveryRun). Approval is a
+// GitOps pull request: merging approves, reverting rolls back. The console
+// shows the graph, the candidates and the bundles, starts runs, and asks
+// dr-hub for a pull request or a rejection; only when no GitOps target is
+// configured does it ask for an approval or a rollback itself. dr-hub owns
+// every status: a request is an annotation on the bundle, admitted by
+// dr-hub's webhook against the caller's RBAC (approve / rollback verbs).
+// Questions are answered in the pull request (task-list items) and are
+// read-only here.
+// ---------------------------------------------------------------------------
+const DISC_ANN = {
+  request: "dr.simplyblock.io/request",
+  reason: "dr.simplyblock.io/request-reason"
+};
+const PROP_REQUESTS = {
+  "open-pr": {
+    label: "Open pull request",
+    done: "dr-hub opens the pull request"
+  },
+  reject: {
+    label: "Reject",
+    done: "Rejected — dr-hub closes the pull request"
+  },
+  approve: {
+    label: "Approve",
+    done: "Approved — dr-hub applies the bundle"
+  },
+  rollback: {
+    label: "Roll back",
+    done: "Rollback requested — dr-hub restores the previous objects and labels"
+  }
+};
+// A bundle is final once it can change no more; Applied can still roll back.
+const PROP_FINAL = ["Rejected", "Superseded", "RolledBack"];
+const RUN_FINAL = ["Succeeded", "Failed", "BudgetExceeded", "Cancelled"];
+[["Proposed", "var(--info)", 1, "proposed"], ["PROpened", "var(--accent)", 1, "PR open"], ["Merged", "var(--info)", 1, "merged", true], ["WaitingForApplications", "var(--info)", 1, "waiting for its applications", true], ["Applied", "var(--ok)", 0, "applied"], ["Rejected", "var(--dim2)", 2, "rejected"], ["Superseded", "var(--dim2)", 2, "superseded"], ["Stale", "var(--warn)", 3, "stale"], ["BudgetExceeded", "var(--warn)", 3, "budget exceeded"], ["Cancelled", "var(--dim2)", 2, "cancelled"]].forEach(([k, c, rank, label, blink]) => {
+  if (!STATUS_META[k]) STATUS_META[k] = Object.assign({
+    c,
+    rank,
+    label
+  }, blink ? {
+    blink: true
+  } : {});
+});
+const confPct = n => n == null || isNaN(n) ? "—" : `${Math.round(Number(n) / 10)}%`;
+const discMeta = o => o.metadata || {};
+const discBase = (o, kind) => ({
+  kind,
+  id: discMeta(o).uid || `${kind}:${discMeta(o).namespace || ""}/${discMeta(o).name}`,
+  name: discMeta(o).name,
+  namespace: discMeta(o).namespace || "",
+  createdAt: discMeta(o).creationTimestamp,
+  labels: discMeta(o).labels || {},
+  annotations: discMeta(o).annotations || {},
+  conditions: ((o.status || {}).conditions || []).map(c => ({
+    type: c.type,
+    status: c.status,
+    reason: c.reason,
+    message: c.message,
+    since: c.lastTransitionTime
+  })),
+  raw: o
+});
+
+// ---- normalizers ------------------------------------------------------------------
+function normDGraph(o) {
+  const sp = o.spec || {},
+    st = o.status || {},
+    c = st.counts || {};
+  const site = sp.site || discMeta(o).name;
+  return REG_put(Object.assign(discBase(o, "dgraph"), {
+    site,
+    built: st.built || null,
+    observedReport: st.observedReport || "",
+    shards: st.shards || [],
+    candidates: (st.candidates || []).map(x => ({
+      id: x.id,
+      name: x.name || x.id,
+      namespaces: x.namespaces || [],
+      members: x.members || [],
+      score: x.score || 0,
+      adopted: x.adopted || ""
+    })),
+    interApp: st.interApp || [],
+    counts: {
+      nodes: c.nodes || 0,
+      edges: c.edges || 0,
+      evidence: c.evidence || 0,
+      candidates: c.candidates || (st.candidates || []).length
+    },
+    truncated: c.truncated || [],
+    status: st.built ? (st.conditions || []).some(x => x.status === "False") ? "Degraded" : "Ready" : "Pending"
+  }));
+}
+function normDRProp(o) {
+  const sp = o.spec || {},
+    st = o.status || {};
+  const objects = (sp.objects || []).map(x => ({
+    apiVersion: x.apiVersion,
+    kind: x.kind,
+    name: x.name,
+    namespace: x.namespace || "",
+    operation: x.operation || "create",
+    spec: x.spec || {},
+    fields: Object.entries(x.fields || {}).map(([f, b]) => ({
+      field: f,
+      evidence: b.evidence || [],
+      confidence: b.confidence || 0,
+      note: b.note || ""
+    }))
+  }));
+  const target = objects.find(x => x.kind === "ProtectedApplication") || objects.find(x => x.kind === "RecoveryPlan") || objects[0] || null;
+  const answers = Object.fromEntries((st.answers || []).map(a => [a.question, a]));
+  const questions = (sp.questions || []).map(q => Object.assign({
+    id: q.id,
+    text: q.text,
+    options: q.options || [],
+    field: q.field || "",
+    blocking: !!q.blocking
+  }, answers[q.id] ? {
+    answer: answers[q.id].option,
+    by: answers[q.id].by || ""
+  } : {}));
+  const dry = st.dryRun || null;
+  const checks = dry && dry.checks || [];
+  const phase = st.phase || "Proposed";
+  const source = sp.source || "rules";
+  const ann = discMeta(o).annotations || {};
+  const evidence = new Set();
+  objects.forEach(x => x.fields.forEach(f => f.evidence.forEach(e => evidence.add(e))));
+  (sp.labels || []).forEach(l => (l.evidence || []).forEach(e => evidence.add(e)));
+  return REG_put(Object.assign(discBase(o, "drprop"), {
+    scope: sp.scope || "Application",
+    site: sp.site || "",
+    candidate: sp.candidate || "",
+    source,
+    ai: source.indexOf("ai:") === 0,
+    run: source.indexOf("ai:") === 0 ? source.slice(3) : "",
+    baseline: sp.baseline || "",
+    title: sp.candidate || (target ? target.name : discMeta(o).name),
+    target,
+    objects,
+    labels: (sp.labels || []).map(l => ({
+      cluster: l.cluster,
+      change: l.change || {},
+      reason: l.reason || "",
+      evidence: l.evidence || [],
+      effect: l.effect || ""
+    })),
+    migrations: (sp.migrations || []).map(m => ({
+      cluster: m.cluster,
+      namespace: m.namespace,
+      pvc: m.pvc,
+      group: m.group,
+      reason: m.reason || ""
+    })),
+    dependsOn: sp.dependsOn || [],
+    questions,
+    summary: sp.summary || "",
+    confidence: sp.confidence || 0,
+    openQuestions: questions.filter(q => !q.answer).length,
+    openBlocking: questions.filter(q => q.blocking && !q.answer).length,
+    dryRun: dry ? {
+      verdict: dry.verdict || "Unknown",
+      checks
+    } : null,
+    dryBlocking: checks.filter(c => c.blocking && c.status === "Fail").length,
+    diff: st.diff || "",
+    gitOps: st.gitOps || null,
+    approvedBy: st.approvedBy || "",
+    appliedAt: st.appliedAt || null,
+    supersededBy: st.supersededBy || "",
+    labelRequests: st.labelRequests || [],
+    evidenceIds: [...evidence],
+    request: ann[DISC_ANN.request] || "",
+    requestReason: ann[DISC_ANN.reason] || "",
+    phase,
+    status: phase,
+    final: PROP_FINAL.includes(phase)
+  }));
+}
+function normDRun(o) {
+  const sp = o.spec || {},
+    st = o.status || {},
+    sc = sp.scope || {},
+    u = st.usage || {};
+  const phase = st.phase || "Pending";
+  return REG_put(Object.assign(discBase(o, "drun"), {
+    site: sc.site || "",
+    namespaces: sc.namespaces || [],
+    proposal: sc.proposal || "",
+    mode: sp.mode || "Rules",
+    provider: sp.provider || "",
+    instructions: sp.instructions || "",
+    phase,
+    status: phase,
+    final: RUN_FINAL.includes(phase),
+    progress: st.progress || "",
+    started: st.started || null,
+    completed: st.completed || null,
+    usage: {
+      input: u.inputTokens || 0,
+      output: u.outputTokens || 0,
+      toolCalls: u.toolCalls || 0,
+      cost: u.costEstimate || ""
+    },
+    toolLog: (st.toolLog || []).map(t => ({
+      time: t.time,
+      tool: t.tool,
+      summary: t.summary || "",
+      result: t.result || ""
+    })),
+    proposals: st.proposals || [],
+    rejected: st.rejected || []
+  }));
+}
+function REG_put(vm) {
+  REG[vm.id] = vm;
+  return vm;
+}
+
+// ---- graph data: gzip+JSON ConfigMap shards ---------------------------------------
+// Shard i of n carries annotations shard-index / shard-count / shard-generation
+// (sha256 of the uncompressed JSON) and binaryData["data.gz"]; the gzip stream
+// is the concatenation of the chunks in index order (internal/shard).
+const SHARD_ANN = {
+  gen: "dr.simplyblock.io/shard-generation",
+  index: "dr.simplyblock.io/shard-index",
+  count: "dr.simplyblock.io/shard-count"
+};
+const GRAPH_CACHE = {};
+const b64bytes = s => {
+  const bin = atob(s || "");
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+async function gunzipText(bytes) {
+  if (typeof DecompressionStream === "undefined") throw new Error("this browser cannot decompress the graph data (no DecompressionStream)");
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(stream).text();
+}
+async function sha256hex(text) {
+  if (!(window.crypto && crypto.subtle)) return "";
+  const d = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(d)).map(b => b.toString(16).padStart(2, "0")).join("");
+}
+async function loadGraphData(g) {
+  if (!g || !g.shards.length) return {
+    nodes: [],
+    edges: [],
+    evidence: [],
+    missing: true
+  };
+  const key = `${g.site}|${g.shards.join(",")}|${g.observedReport}`;
+  if (GRAPH_CACHE[key]) return GRAPH_CACHE[key];
+  const ns = DR_HUB_NS();
+  let cms;
+  try {
+    cms = await Promise.all(g.shards.map(n => k8s.get("ConfigMap", n, {
+      namespace: ns
+    })));
+  } catch (e) {
+    if (e && e.status === 403) throw new Error(`Reading the graph data needs get on configmaps in ${ns} (the shards ${g.shards.join(", ")}).`);
+    if (e && e.status === 404) throw new Error(`A shard of the graph is gone (being rewritten?) — ${e.message}`);
+    throw e;
+  }
+  const ann = cm => cm.metadata && cm.metadata.annotations || {};
+  const gen = ann(cms[0])[SHARD_ANN.gen],
+    count = Number(ann(cms[0])[SHARD_ANN.count]);
+  if (count !== cms.length) throw new Error(`${cms.length} of ${count} graph shards present — dr-hub is rewriting the graph; reload in a moment.`);
+  if (cms.some(cm => ann(cm)[SHARD_ANN.gen] !== gen)) throw new Error("The graph shards belong to different writes — reload in a moment.");
+  const parts = new Array(count);
+  cms.forEach(cm => {
+    parts[Number(ann(cm)[SHARD_ANN.index])] = b64bytes((cm.binaryData || {})["data.gz"] || "");
+  });
+  if (parts.some(p => !p)) throw new Error("A graph shard has a bad index.");
+  const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let off = 0;
+  parts.forEach(p => {
+    all.set(p, off);
+    off += p.length;
+  });
+  const text = await gunzipText(all);
+  if (gen) {
+    const h = await sha256hex(text);
+    if (h && h !== gen) throw new Error("The graph data does not match its generation — reload in a moment.");
+  }
+  const d = JSON.parse(text);
+  const out = {
+    nodes: d.nodes || [],
+    edges: d.edges || [],
+    evidence: d.evidence || [],
+    generation: gen
+  };
+  out.byId = Object.fromEntries(out.nodes.map(n => [n.id, n]));
+  out.evById = Object.fromEntries(out.evidence.map(e => [e.id, e]));
+  GRAPH_CACHE[key] = out;
+  return out;
+}
+
+// ---- reads and writes ----------------------------------------------------------------
+const discList = (kind, norm) => k8s.list(kind, RESOURCES[kind].namespaced ? {
+  allNamespaces: true
+} : {}).then(xs => xs.map(norm));
+const discById = (kind, norm, label) => id => discList(kind, norm).then(xs => {
+  const hit = xs.find(x => x.id === id);
+  if (!hit) throw new ApiError(404, `${label} not found`, kind, "NotFound");
+  return hit;
+});
+const newestFirst = (a, b) => Date.parse(b.createdAt || 0) - Date.parse(a.createdAt || 0);
+const discovery = {
+  graphs: () => discList("DiscoveryGraph", normDGraph),
+  graph: discById("DiscoveryGraph", normDGraph, "DiscoveryGraph"),
+  graphBySite: site => discovery.graphs().then(gs => gs.find(g => g.site === site) || null),
+  graphData: loadGraphData,
+  proposals: () => discList("DRProposal", normDRProp).then(xs => xs.sort(newestFirst)),
+  proposal: discById("DRProposal", normDRProp, "DRProposal"),
+  runs: () => discList("DiscoveryRun", normDRun).then(xs => xs.sort(newestFirst)),
+  run: discById("DiscoveryRun", normDRun, "DiscoveryRun"),
+  // DRConfig.spec.discovery: GitOps target (nil: console approval fallback),
+  // model providers (none: AI runs not available), flow opt-outs.
+  config: () => drhub.configs().then(cs => {
+    const c = cs.find(x => x.name === "default") || cs[0] || null;
+    const d = c && c.raw && c.raw.spec && c.raw.spec.discovery || {};
+    const agents = c && c.raw && c.raw.status && c.raw.status.agents || [];
+    return {
+      present: !!c,
+      enabled: !!d.enabled,
+      gitOps: d.gitOps || null,
+      providers: d.providers || [],
+      defaultProvider: d.defaultProvider || "",
+      flows: d.flows || {},
+      optOut: (d.flows || {}).optOut || [],
+      agents
+    };
+  }).catch(() => ({
+    present: false,
+    enabled: false,
+    gitOps: null,
+    providers: [],
+    defaultProvider: "",
+    flows: {},
+    optOut: [],
+    agents: []
+  })),
+  // the newest bundle that would create or change an object (application,
+  // recovery plan, site profile) — the forms link to it
+  latestFor: (kind, name, namespace) => discovery.proposals().then(ps => ps.find(p => !p.final && p.objects.some(x => x.kind === kind && x.name === name && (!namespace || !x.namespace || x.namespace === namespace))) || null).catch(() => null),
+  startRun: ({
+    site,
+    namespaces,
+    proposal,
+    mode,
+    provider,
+    instructions,
+    maxToolCalls,
+    maxDuration
+  }) => k8s.create("DiscoveryRun", {
+    apiVersion: DR_API_GROUP,
+    kind: "DiscoveryRun",
+    metadata: {
+      name: dns63(`discovery-${site}-${Date.now().toString(36)}`),
+      namespace: DR_NS()
+    },
+    spec: Object.assign({
+      scope: Object.assign({
+        site
+      }, namespaces && namespaces.length ? {
+        namespaces
+      } : {}, proposal ? {
+        proposal
+      } : {}),
+      mode
+    }, mode === "AI" && provider ? {
+      provider
+    } : {}, mode === "AI" && instructions ? {
+      instructions
+    } : {}, mode === "AI" && (maxToolCalls || maxDuration) ? {
+      budget: Object.assign({}, maxToolCalls ? {
+        maxToolCalls: Number(maxToolCalls)
+      } : {}, maxDuration ? {
+        maxDuration
+      } : {})
+    } : {})
+  }, {
+    namespace: DR_NS()
+  }),
+  // A request dr-hub carries out and records in the bundle's status.
+  request: (p, action, reason) => k8s.patch("DRProposal", p.name, {
+    metadata: {
+      annotations: {
+        [DISC_ANN.request]: action,
+        [DISC_ANN.reason]: reason || null
+      }
+    }
+  }, {
+    namespace: p.namespace
+  }),
+  cancelRun: r => k8s.remove("DiscoveryRun", r.name, {
+    namespace: r.namespace
+  })
+};
+Object.assign(GETTER, {
+  dgraph: discovery.graph,
+  drprop: discovery.proposal,
+  drun: discovery.run
+});
+
+// ---- small pieces -----------------------------------------------------------------------
+const Table_ = p => React.createElement(window.DrTable, p);
+const M = ({
+  children,
+  dim
+}) => React.createElement(window.DrMono, {
+  dim
+}, children);
+const Conf = ({
+  v
+}) => {
+  const n = Math.max(0, Math.min(1000, Number(v) || 0));
+  const c = n >= 800 ? "var(--ok)" : n >= 500 ? "var(--warn)" : "var(--bad)";
+  return /*#__PURE__*/React.createElement("span", {
+    className: "confbar",
+    title: `confidence ${confPct(n)}`,
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 6,
+      whiteSpace: "nowrap"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "inline-block",
+      width: 42,
+      height: 5,
+      borderRadius: 3,
+      background: "var(--line)",
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "block",
+      width: `${n / 10}%`,
+      height: "100%",
+      background: c
+    }
+  })), /*#__PURE__*/React.createElement("span", {
+    className: "mono",
+    style: {
+      fontSize: 11
+    }
+  }, confPct(n)));
+};
+const SourceBadge = ({
+  p
+}) => p.ai ? /*#__PURE__*/React.createElement("span", {
+  className: "badge",
+  style: {
+    color: "var(--accent)",
+    borderColor: "color-mix(in srgb,var(--accent) 45%,transparent)"
+  },
+  title: `AI run ${p.run}`
+}, "AI \xB7 ", p.run) : /*#__PURE__*/React.createElement("span", {
+  className: "badge"
+}, "rules");
+const PRLink = ({
+  g
+}) => !g ? /*#__PURE__*/React.createElement("span", {
+  style: {
+    color: "var(--dim2)"
+  }
+}, "\u2014") : g.pr ? /*#__PURE__*/React.createElement("a", {
+  href: g.pr,
+  target: "_blank",
+  rel: "noopener noreferrer",
+  className: "mono",
+  style: {
+    color: "var(--accent)"
+  }
+}, g.pr.replace(/^https?:\/\/[^/]+\//, ""), g.state ? ` · ${g.state}` : "") : /*#__PURE__*/React.createElement(M, {
+  dim: true
+}, g.branch || "—");
+const QCount = ({
+  p
+}) => !p.questions.length ? /*#__PURE__*/React.createElement("span", {
+  style: {
+    color: "var(--dim2)"
+  }
+}, "\u2014") : /*#__PURE__*/React.createElement("span", {
+  title: p.questions.filter(q => !q.answer).map(q => q.text).join("\n")
+}, p.openQuestions, "/", p.questions.length, " open", p.openBlocking ? /*#__PURE__*/React.createElement("b", {
+  style: {
+    color: "var(--bad)"
+  }
+}, " \xB7 ", p.openBlocking, " blocking") : null);
+const DryVerdict = ({
+  p
+}) => !p.dryRun ? /*#__PURE__*/React.createElement("span", {
+  style: {
+    color: "var(--dim2)"
+  }
+}, "not run") : /*#__PURE__*/React.createElement("span", {
+  style: {
+    display: "inline-flex",
+    gap: 6,
+    alignItems: "center"
+  }
+}, /*#__PURE__*/React.createElement(VerdictBadge, {
+  v: p.dryRun.verdict,
+  sm: true
+}), p.dryBlocking ? /*#__PURE__*/React.createElement("b", {
+  style: {
+    color: "var(--bad)",
+    fontSize: 11
+  }
+}, p.dryBlocking, " blocking") : null);
+const PhaseCell = ({
+  p
+}) => /*#__PURE__*/React.createElement("span", {
+  style: {
+    display: "inline-flex",
+    gap: 6,
+    alignItems: "center",
+    flexWrap: "wrap"
+  }
+}, /*#__PURE__*/React.createElement(TrafficLight, {
+  status: p.phase,
+  sm: true
+}), p.request && !p.final ? /*#__PURE__*/React.createElement("span", {
+  className: "badge",
+  title: "requested from the console; dr-hub carries it out"
+}, p.request, " requested") : null);
+function ProposalTable({
+  props,
+  nav,
+  empty
+}) {
+  return /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Bundle", "Site", "Scope", "Source", "Confidence", "Phase", "Dry run", "Questions", "Pull request"],
+    empty: empty || "No proposal yet.",
+    rows: props.map(p => [/*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        flexDirection: "column",
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement(Ref, {
+      label: p.title,
+      onClick: () => nav.detail(p)
+    }), /*#__PURE__*/React.createElement(M, {
+      dim: true
+    }, p.name)), /*#__PURE__*/React.createElement(M, null, p.site), /*#__PURE__*/React.createElement("span", {
+      className: "badge"
+    }, p.scope), /*#__PURE__*/React.createElement(SourceBadge, {
+      p: p
+    }), /*#__PURE__*/React.createElement(Conf, {
+      v: p.confidence
+    }), /*#__PURE__*/React.createElement(PhaseCell, {
+      p: p
+    }), /*#__PURE__*/React.createElement(DryVerdict, {
+      p: p
+    }), /*#__PURE__*/React.createElement(QCount, {
+      p: p
+    }), /*#__PURE__*/React.createElement(PRLink, {
+      g: p.gitOps
+    })])
+  });
+}
+function RunTable({
+  runs,
+  limit
+}) {
+  const [open, setOpen] = React.useState(null);
+  const rows = runs.slice(0, limit || runs.length);
+  return /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Run", "Site", "Mode", "Phase", "Progress", "Started", "Proposals", "Tool calls"],
+    empty: "No discovery run yet.",
+    rows: rows.map(r => [/*#__PURE__*/React.createElement("button", {
+      className: "runopen mono",
+      style: {
+        color: "var(--accent)",
+        fontFamily: "inherit"
+      },
+      onClick: () => setOpen(open === r.id ? null : r.id),
+      title: "Show the run's tool log"
+    }, r.name), /*#__PURE__*/React.createElement(M, null, r.site), /*#__PURE__*/React.createElement("span", {
+      className: "badge"
+    }, r.mode === "AI" ? `rules + AI${r.provider ? ` · ${r.provider}` : ""}` : "rules"), /*#__PURE__*/React.createElement(TrafficLight, {
+      status: r.phase,
+      sm: true
+    }), /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim)"
+      }
+    }, r.progress || (r.final ? "" : "waiting for dr-hub")), r.started ? fmtAgo(r.started) : "", r.proposals.length ? /*#__PURE__*/React.createElement("span", null, r.proposals.length, r.rejected.length ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--warn)"
+      }
+    }, " \xB7 ", r.rejected.length, " rejected") : null) : "", r.mode === "AI" ? `${r.usage.toolCalls}` : ""])
+  }), rows.filter(r => r.id === open).map(r => /*#__PURE__*/React.createElement("div", {
+    key: r.id,
+    className: "card runlog",
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement("h3", null, "Run ", r.name), /*#__PURE__*/React.createElement("div", {
+    className: "bd"
+  }, /*#__PURE__*/React.createElement(Props, {
+    rows: [["Scope", /*#__PURE__*/React.createElement(M, null, r.site, r.namespaces.length ? ` · ${r.namespaces.join(", ")}` : "", r.proposal ? ` · bundle ${r.proposal}` : "")], ["Mode", r.mode], ["Completed", r.completed ? fmtDate(r.completed) : "—"], r.mode === "AI" ? ["Usage", `${r.usage.input} in · ${r.usage.output} out tokens${r.usage.cost ? ` · ${r.usage.cost}` : ""}`] : null, r.instructions ? ["Instructions", r.instructions] : null].filter(Boolean)
+  }), !!r.rejected.length && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "sl",
+    style: {
+      margin: "8px 0 4px"
+    }
+  }, "Outputs dr-hub rejected"), /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Proposal", "Reason"],
+    rows: r.rejected.map(x => [/*#__PURE__*/React.createElement(M, null, x.proposal || "—"), x.reason])
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "sl",
+    style: {
+      margin: "8px 0 4px"
+    }
+  }, "Tool log (newest last)"), /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Time", "Tool", "Summary", "Result"],
+    empty: r.mode === "AI" ? "No tool call yet." : "A rules run calls no tools.",
+    rows: r.toolLog.map(t => [fmtDate(t.time), /*#__PURE__*/React.createElement(M, null, t.tool), t.summary, /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: /^(ok|success)/i.test(t.result) ? "var(--ok)" : "var(--dim)"
+      }
+    }, t.result)])
+  })))));
+}
+
+// ---- dialogs --------------------------------------------------------------------------------
+// Run discovery: rules always; rules + AI once a model provider is configured
+// (phase 2 of ADR 0023 ships the agent runtime).
+const runDiscoveryDialog = (sites, cfg, preset) => ({
+  title: preset && preset.proposal ? `Refine ${preset.proposal} with AI` : "Run discovery",
+  confirm: "Start run",
+  done: "Discovery run started",
+  desc: "dr-hub rebuilds the dependency graph of the site from its dr-agent's report and derives one bundle per application candidate. Nothing is applied: every bundle goes to approval.",
+  fields: v => {
+    const ai = (cfg.providers || []).length > 0;
+    const site = v.site || preset && preset.site || (sites[0] || {}).name;
+    const s = sites.find(x => x.name === site) || {
+      namespaces: []
+    };
+    return [{
+      k: "site",
+      label: "Site",
+      type: "select",
+      required: true,
+      def: preset && preset.site,
+      options: sites.map(x => ({
+        v: x.name,
+        l: `${x.name}${x.built ? ` · graph ${fmtAgo(x.built)}` : " · no graph yet"}`
+      }))
+    }, !(preset && preset.proposal) && {
+      k: "namespaces",
+      label: "Namespaces (none: the whole site)",
+      type: "multiselect",
+      options: (s.namespaces || []).map(n => ({
+        v: n,
+        l: n
+      })),
+      empty: "The site's graph lists no namespaces yet."
+    }, {
+      k: "mode",
+      label: "Mode",
+      type: "select",
+      def: preset && preset.mode,
+      options: (preset && preset.mode === "AI" ? [] : [{
+        v: "Rules",
+        l: "rules (deterministic baseline)"
+      }]).concat(ai ? [{
+        v: "AI",
+        l: "rules + AI refinement"
+      }] : [])
+    }, !ai && {
+      k: "n1",
+      type: "note",
+      label: "Rules + AI comes with phase 2: no model provider is configured (DRConfig spec.discovery.providers)."
+    }, ai && v.mode === "AI" && {
+      k: "provider",
+      label: "Model provider",
+      type: "select",
+      def: cfg.defaultProvider,
+      options: cfg.providers.map(p => ({
+        v: p.name,
+        l: `${p.name} · ${p.type}${p.model ? ` · ${p.model}` : ""}`
+      }))
+    }, ai && v.mode === "AI" && {
+      k: "instructions",
+      label: "Instructions for the agent (optional)",
+      type: "text",
+      placeholder: "e.g. treat the reporting namespace as part of the shop"
+    }, ai && v.mode === "AI" && {
+      k: "maxToolCalls",
+      label: "Tool-call budget (optional)",
+      type: "number",
+      min: 1
+    }, ai && v.mode === "AI" && {
+      k: "n2",
+      type: "note",
+      label: "Only metadata leaves the hub, to the provider's model endpoint. The agent can only propose; every bundle still needs approval."
+    }].filter(Boolean);
+  },
+  run: v => discovery.startRun({
+    site: v.site,
+    namespaces: v.namespaces,
+    proposal: preset && preset.proposal,
+    mode: v.mode || "Rules",
+    provider: v.provider,
+    instructions: (v.instructions || "").trim(),
+    maxToolCalls: v.maxToolCalls
+  })
+});
+const rejectDialog = p => ({
+  title: `Reject the bundle for ${p.title}?`,
+  confirm: "Reject",
+  danger: true,
+  done: PROP_REQUESTS.reject.done,
+  desc: p.gitOps && p.gitOps.pr ? `dr-hub closes ${p.gitOps.pr} with this reason. The next discovery proposes again only if the graph changes.` : "dr-hub marks the bundle Rejected with this reason. The next discovery proposes again only if the graph changes.",
+  fields: [{
+    k: "reason",
+    label: "Reason",
+    type: "text",
+    required: true,
+    placeholder: "why this bundle is wrong",
+    validate: x => x && x.trim().length < 10 ? "at least 10 characters" : null
+  }],
+  run: v => discovery.request(p, "reject", v.reason.trim())
+});
+const requestDialog = (p, action) => ({
+  title: `${PROP_REQUESTS[action].label}: ${p.title}?`,
+  confirm: PROP_REQUESTS[action].label,
+  danger: action === "rollback",
+  done: PROP_REQUESTS[action].done,
+  desc: action === "approve" ? `dr-hub applies the bundle: ${p.objects.length} object(s) and ${p.labels.length} label change(s), recorded with you as the approver. This is the approval only because no GitOps target is configured.` : action === "rollback" ? "dr-hub restores the objects and the labels as they were before this bundle was applied." : "dr-hub renders the bundle as manifests and opens a pull request in the GitOps repository. Merging it approves the bundle.",
+  fields: [],
+  run: () => discovery.request(p, action)
+});
+
+// ---- graph view -------------------------------------------------------------------------------
+// Layered SVG: columns by node kind (external endpoints and Services left,
+// workloads in the middle, volumes and networks right), edges as curves whose
+// width follows the weight; click an edge or a node for its evidence.
+const NODE_COLS = {
+  External: 0,
+  Service: 1,
+  Workload: 2,
+  VirtualMachine: 2,
+  Pod: 2,
+  PVC: 3,
+  NAD: 4,
+  Namespace: 5
+};
+const NODE_C = {
+  External: "var(--dim)",
+  Service: "var(--info)",
+  Workload: "var(--accent)",
+  VirtualMachine: "var(--accent)",
+  Pod: "var(--accent)",
+  PVC: "var(--ok)",
+  NAD: "var(--warn)",
+  Namespace: "var(--dim2)"
+};
+const EDGE_KINDS = ["owns", "mounts", "selects", "references", "connects", "attaches", "packagedWith"];
+const EDGE_C = {
+  owns: "var(--dim2)",
+  mounts: "var(--ok)",
+  selects: "var(--info)",
+  references: "var(--accent)",
+  connects: "var(--warn)",
+  attaches: "var(--warn)",
+  packagedWith: "var(--dim)"
+};
+const GRAPH_CAP = 500;
+const nodeLabel = n => n ? `${n.kind === "External" ? "" : n.namespace ? n.namespace + "/" : ""}${n.name}` : "";
+function scopeNodes(data, scope) {
+  if (!data || !scope) return {
+    ids: new Set(),
+    core: new Set()
+  };
+  const core = new Set(scope.type === "candidate" ? scope.members : data.nodes.filter(n => n.namespace === scope.value).map(n => n.id));
+  const ids = new Set(core);
+  data.edges.forEach(e => {
+    if (core.has(e.from)) ids.add(e.to);
+    if (core.has(e.to)) ids.add(e.from);
+  });
+  return {
+    ids,
+    core
+  };
+}
+function GraphView({
+  data,
+  scope,
+  kinds,
+  picked,
+  onPick
+}) {
+  const {
+    ids,
+    core
+  } = scopeNodes(data, scope);
+  if (!ids.size) return /*#__PURE__*/React.createElement("div", {
+    className: "nolim"
+  }, "Nothing in this scope.");
+  if (ids.size > GRAPH_CAP) return /*#__PURE__*/React.createElement("div", {
+    className: "nolim"
+  }, ids.size, " nodes in this scope \u2014 more than ", GRAPH_CAP, "; narrow it to one candidate or namespace.");
+  const nodes = data.nodes.filter(n => ids.has(n.id)).sort((a, b) => (a.namespace || "").localeCompare(b.namespace || "") || a.name.localeCompare(b.name));
+  const cols = {};
+  nodes.forEach(n => {
+    const c = NODE_COLS[n.kind] != null ? NODE_COLS[n.kind] : 2;
+    (cols[c] = cols[c] || []).push(n);
+  });
+  const used = Object.keys(cols).map(Number).sort((a, b) => a - b);
+  const W = 168,
+    H = 22,
+    GX = 64,
+    GY = 10,
+    PAD = 8;
+  const pos = {};
+  used.forEach((c, ci) => cols[c].forEach((n, ri) => {
+    pos[n.id] = {
+      x: PAD + ci * (W + GX),
+      y: PAD + ri * (H + GY)
+    };
+  }));
+  const width = PAD * 2 + used.length * W + (used.length - 1) * GX;
+  const height = PAD * 2 + Math.max(...used.map(c => cols[c].length)) * (H + GY) - GY;
+  const edges = data.edges.filter(e => pos[e.from] && pos[e.to] && kinds.includes(e.kind));
+  const isPicked = x => picked && picked.type === "edge" && picked.e === x;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "graphwrap",
+    style: {
+      overflow: "auto",
+      maxHeight: 560,
+      border: "1px solid var(--line)",
+      borderRadius: 6,
+      background: "var(--panel)"
+    }
+  }, /*#__PURE__*/React.createElement("svg", {
+    className: "dgraph",
+    width: width,
+    height: height,
+    style: {
+      display: "block",
+      fontFamily: "var(--mono, monospace)"
+    }
+  }, edges.map((e, i) => {
+    const a = pos[e.from],
+      b = pos[e.to];
+    const same = a.x === b.x;
+    const x1 = same ? a.x + W : a.x < b.x ? a.x + W : a.x,
+      x2 = same ? b.x + W : a.x < b.x ? b.x : b.x + W;
+    const y1 = a.y + H / 2,
+      y2 = b.y + H / 2;
+    const dx = same ? 40 : (x2 - x1) / 2;
+    const d = `M${x1},${y1} C${x1 + dx},${y1} ${x2 - (same ? -40 : dx)},${y2} ${x2},${y2}`;
+    const w = 1 + Math.max(0, Math.min(1000, e.weight || 0)) / 1000 * 3;
+    return /*#__PURE__*/React.createElement("path", {
+      key: i,
+      d: d,
+      fill: "none",
+      stroke: EDGE_C[e.kind] || "var(--dim)",
+      strokeWidth: isPicked(e) ? w + 2 : w,
+      strokeOpacity: isPicked(e) ? 1 : 0.65,
+      style: {
+        cursor: "pointer"
+      },
+      onClick: () => onPick({
+        type: "edge",
+        e
+      })
+    }, /*#__PURE__*/React.createElement("title", null, `${e.kind}${e.port ? ` :${e.port}` : ""} · weight ${confPct(e.weight)} · ${nodeLabel(data.byId[e.from])} → ${nodeLabel(data.byId[e.to])}`));
+  }), nodes.map(n => {
+    const p = pos[n.id],
+      sel = picked && picked.type === "node" && picked.n === n;
+    return /*#__PURE__*/React.createElement("g", {
+      key: n.id,
+      transform: `translate(${p.x},${p.y})`,
+      style: {
+        cursor: "pointer"
+      },
+      onClick: () => onPick({
+        type: "node",
+        n
+      }),
+      opacity: core.has(n.id) ? 1 : 0.55
+    }, /*#__PURE__*/React.createElement("rect", {
+      width: W,
+      height: H,
+      rx: 4,
+      fill: "var(--bg2, var(--panel))",
+      stroke: NODE_C[n.kind] || "var(--dim)",
+      strokeWidth: sel ? 2.2 : 1
+    }), /*#__PURE__*/React.createElement("rect", {
+      width: 4,
+      height: H,
+      rx: 2,
+      fill: NODE_C[n.kind] || "var(--dim)"
+    }), /*#__PURE__*/React.createElement("text", {
+      x: 9,
+      y: H / 2 + 4,
+      fontSize: 10.5,
+      fill: "var(--text)"
+    }, (n.role ? `${n.role} · ` : "") + nodeLabel(n)), /*#__PURE__*/React.createElement("title", null, `${n.kind} ${nodeLabel(n)}${n.role ? ` (role ${n.role})` : ""}`));
+  })));
+}
+function EvidenceRows({
+  ids,
+  data
+}) {
+  return /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Evidence", "Source", "Object", "Field", "Detail", "Observed"],
+    empty: "No evidence recorded.",
+    rows: (ids || []).map(id => {
+      const e = data && data.evById ? data.evById[id] : null;
+      return e ? [/*#__PURE__*/React.createElement(M, null, e.id), /*#__PURE__*/React.createElement("span", {
+        className: "badge"
+      }, e.source), /*#__PURE__*/React.createElement(M, null, e.object), /*#__PURE__*/React.createElement(M, {
+        dim: true
+      }, e.field || ""), e.detail || "", e.observed ? fmtAgo(e.observed) : ""] : [/*#__PURE__*/React.createElement(M, null, id), /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: "var(--dim2)"
+        }
+      }, "not in the current graph"), "", "", "", ""];
+    })
+  });
+}
+function PickedPanel({
+  picked,
+  data
+}) {
+  if (!picked) return /*#__PURE__*/React.createElement("p", {
+    className: "mdesc",
+    style: {
+      margin: "8px 0 0"
+    }
+  }, "Click an edge or a node for its evidence.");
+  if (picked.type === "node") {
+    const n = picked.n;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        marginTop: 8
+      }
+    }, /*#__PURE__*/React.createElement(Props, {
+      rows: [["Node", /*#__PURE__*/React.createElement(M, null, n.kind, " ", nodeLabel(n))], n.role ? ["Role", n.role] : null, ...Object.entries(n.facts || {}).slice(0, 8).map(([k, v]) => [k, /*#__PURE__*/React.createElement(M, {
+        dim: true
+      }, v)]), Object.keys(n.labels || {}).length ? ["Labels", /*#__PURE__*/React.createElement(M, {
+        dim: true
+      }, Object.entries(n.labels).map(([k, v]) => `${k}=${v}`).join(", "))] : null].filter(Boolean)
+    }));
+  }
+  const e = picked.e;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 8
+    }
+  }, /*#__PURE__*/React.createElement(Props, {
+    rows: [["Edge", /*#__PURE__*/React.createElement(M, null, nodeLabel(data.byId[e.from]), " \u2192 ", nodeLabel(data.byId[e.to]))], ["Kind", /*#__PURE__*/React.createElement("span", {
+      className: "badge"
+    }, e.kind, e.port ? ` :${e.port}` : "")], ["Weight", /*#__PURE__*/React.createElement(Conf, {
+      v: e.weight
+    })]]
+  }), /*#__PURE__*/React.createElement(EvidenceRows, {
+    ids: e.evidence,
+    data: data
+  }));
+}
+function GraphCard({
+  g,
+  data,
+  error,
+  loading,
+  scope,
+  setScope
+}) {
+  const [kinds, setKinds] = React.useState(EDGE_KINDS.filter(k => k !== "owns"));
+  const [picked, setPicked] = React.useState(null);
+  const namespaces = data ? [...new Set(data.nodes.map(n => n.namespace).filter(Boolean))].sort() : [];
+  const options = g.candidates.map(c => ({
+    v: `c:${c.id}`,
+    l: `candidate ${c.name}`
+  })).concat(namespaces.map(n => ({
+    v: `n:${n}`,
+    l: `namespace ${n}`
+  })));
+  const cur = scope ? scope.type === "candidate" ? `c:${scope.id}` : `n:${scope.value}` : "";
+  const choose = v => {
+    setPicked(null);
+    if (!v) return setScope(null);
+    if (v.indexOf("c:") === 0) {
+      const c = g.candidates.find(x => x.id === v.slice(2));
+      setScope(c ? {
+        type: "candidate",
+        id: c.id,
+        members: c.members
+      } : null);
+    } else setScope({
+      type: "namespace",
+      value: v.slice(2)
+    });
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "card graphcard"
+  }, /*#__PURE__*/React.createElement("h3", null, "Dependency graph"), /*#__PURE__*/React.createElement("div", {
+    className: "bd"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "graphbar",
+    style: {
+      display: "flex",
+      gap: 8,
+      alignItems: "center",
+      flexWrap: "wrap",
+      marginBottom: 8
+    }
+  }, /*#__PURE__*/React.createElement("select", {
+    className: "finput sm graphscope",
+    value: cur,
+    onChange: e => choose(e.target.value),
+    style: {
+      maxWidth: 280
+    }
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u2014 choose a candidate or namespace \u2014"), options.map(o => /*#__PURE__*/React.createElement("option", {
+    key: o.v,
+    value: o.v
+  }, o.l))), /*#__PURE__*/React.createElement("span", {
+    className: "sl",
+    style: {
+      marginLeft: 6
+    }
+  }, "edges"), EDGE_KINDS.map(k => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    className: "chip edgekind" + (kinds.includes(k) ? " on" : ""),
+    style: {
+      borderColor: EDGE_C[k],
+      color: kinds.includes(k) ? EDGE_C[k] : "var(--dim2)"
+    },
+    onClick: () => setKinds(kinds.includes(k) ? kinds.filter(x => x !== k) : kinds.concat([k]))
+  }, k))), error ? /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, "Graph data unavailable."), " ", error.message, " The candidates above come from the graph's status and stay usable.")) : loading ? /*#__PURE__*/React.createElement("div", {
+    className: "skel",
+    style: {
+      height: 160
+    }
+  }) : !data || data.missing ? /*#__PURE__*/React.createElement("div", {
+    className: "nolim"
+  }, "dr-hub has not written graph data for ", g.site, " yet.") : !scope ? /*#__PURE__*/React.createElement("div", {
+    className: "nolim"
+  }, "Choose a candidate or a namespace to draw its graph (", data.nodes.length, " nodes, ", data.edges.length, " edges on the site).") : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(GraphView, {
+    data: data,
+    scope: scope,
+    kinds: kinds,
+    picked: picked,
+    onPick: setPicked
+  }), /*#__PURE__*/React.createElement(PickedPanel, {
+    picked: picked,
+    data: data
+  }))));
+}
+
+// ---- discovery home (DR → Discovery) -----------------------------------------------------
+// The sites: every site with a graph, plus the managed clusters and agents
+// that have none yet.
+const discSites = (graphs, cfg, mcs) => {
+  const names = new Set(graphs.map(g => g.site).concat((cfg.agents || []).map(a => a.cluster), (mcs || []).map(m => (m.metadata || {}).name)).filter(Boolean));
+  return [...names].sort().map(name => {
+    const g = graphs.find(x => x.site === name) || null;
+    const a = (cfg.agents || []).find(x => x.cluster === name) || null;
+    return {
+      name,
+      graph: g,
+      built: g ? g.built : null,
+      agent: a,
+      flowsOff: (cfg.optOut || []).includes(name),
+      namespaces: g ? [...new Set(g.candidates.flatMap(c => c.namespaces))].sort() : []
+    };
+  });
+};
+const flowsText = s => s.flowsOff ? "off (opted out)" : "on";
+const openProps = ps => ps.filter(p => !p.final && p.phase !== "Applied");
+function DiscoveryHome({
+  nav
+}) {
+  const r = useResource("disc.home", () => Promise.all([discovery.graphs(), discovery.proposals(), discovery.runs(), discovery.config(), drhub.managedClusters()]), 8000);
+  const acc = useAccess();
+  const [graphs, props, runs, cfg, mcs] = r.data || [[], [], [], {
+    providers: [],
+    optOut: [],
+    agents: []
+  }, []];
+  const sites = discSites(graphs, cfg, mcs);
+  const mayRun = acc.can("create", "drhub", {
+    kind: "drun",
+    namespace: DR_NS()
+  });
+  const open = openProps(props);
+  const run = /*#__PURE__*/React.createElement("button", {
+    className: "btn primary rundisc",
+    disabled: !mayRun || !sites.length,
+    title: mayRun ? "" : acc.why("create", "drhub", {
+      kind: "drun",
+      namespace: DR_NS()
+    }),
+    onClick: () => window.__ui.dialog(runDiscoveryDialog(sites, cfg), {
+      kind: "drun",
+      id: "new"
+    })
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "plus",
+    s: 12
+  }), "Run discovery");
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "dhead"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      minWidth: 0,
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("h1", null, "Discovery"), /*#__PURE__*/React.createElement("div", {
+    className: "dsub"
+  }, "dr-hub builds a dependency graph per site from its dr-agent's report and proposes whole applications as bundles: membership, labels, tiers, probes, recovery order and site mappings. Every bundle needs approval", cfg.gitOps ? " — a merged pull request" : "", ".")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => nav.drLayer("proposals")
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "list",
+    s: 12
+  }), "Proposals"), run)), r.error && /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, "Cannot read discovery."), " ", r.error.message, r.error.status === 404 ? " — this DR hub predates AI-assisted discovery (no DiscoveryGraph CRD)." : "")), cfg.present && !cfg.enabled && /*#__PURE__*/React.createElement("div", {
+    className: "banner info"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, "Discovery is off on this hub (DRConfig ", /*#__PURE__*/React.createElement("span", {
+    className: "mono"
+  }, "spec.discovery.enabled"), "); runs started here still build graphs and bundles once dr-hub serves them.")), cfg.present && !cfg.gitOps && /*#__PURE__*/React.createElement("div", {
+    className: "banner info"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "check",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, "No GitOps target is configured: bundles are approved in this console (fallback). With a target, merging the pull request approves.")), /*#__PURE__*/React.createElement("div", {
+    className: "stats"
+  }, /*#__PURE__*/React.createElement(Stat, {
+    k: "Sites with a graph",
+    v: `${graphs.length}/${sites.length}`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Candidates",
+    v: graphs.reduce((n, g) => n + g.counts.candidates, 0),
+    s: `${graphs.reduce((n, g) => n + g.counts.nodes, 0)} nodes · ${graphs.reduce((n, g) => n + g.counts.edges, 0)} edges`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Open bundles",
+    v: open.length,
+    s: `${open.filter(p => p.openBlocking).length} with blocking questions`,
+    c: open.some(p => p.openBlocking || p.dryBlocking) ? "var(--warn)" : null
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Runs running",
+    v: runs.filter(x => !x.final).length,
+    s: `${runs.length} in total`,
+    c: runs.some(x => !x.final) ? "var(--info)" : null
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "AI refinement",
+    v: cfg.providers.length ? "available" : "phase 2",
+    s: cfg.providers.length ? cfg.providers.map(p => p.name).join(", ") : "no model provider"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Sites"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Site", "Graph built", "Nodes · edges", "Candidates", "Flows", "Agent", "Open bundles"],
+    empty: r.loading ? "Loading…" : "No managed site reports yet.",
+    rows: sites.map(s => [s.graph ? /*#__PURE__*/React.createElement(Ref, {
+      label: s.name,
+      onClick: () => nav.detail(s.graph)
+    }) : /*#__PURE__*/React.createElement(M, null, s.name), s.built ? fmtAgo(s.built) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim2)"
+      }
+    }, "no graph yet"), s.graph ? `${s.graph.counts.nodes} · ${s.graph.counts.edges}` : "", s.graph ? s.graph.counts.candidates : "", /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: s.flowsOff ? "var(--dim)" : "var(--ok)"
+      }
+    }, flowsText(s)), s.agent ? /*#__PURE__*/React.createElement("span", {
+      title: s.agent.lastSeen ? `last seen ${fmtAgo(s.agent.lastSeen)}` : ""
+    }, s.agent.available ? "reporting" : "not reporting", s.agent.version ? /*#__PURE__*/React.createElement(M, {
+      dim: true
+    }, " ", s.agent.version) : null) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim2)"
+      }
+    }, "\u2014"), openProps(props.filter(p => p.site === s.name)).length || ""])
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Recent runs"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(RunTable, {
+    runs: runs,
+    limit: 10
+  }))));
+}
+
+// ---- one site (DiscoveryGraph detail) --------------------------------------------------------
+function DGraphDetail({
+  o: g,
+  nav
+}) {
+  const r = useResource("disc.site." + g.id, () => Promise.all([discovery.proposals(), discovery.runs(), discovery.config(), drhub.managedClusters()]), 8000);
+  const d = useResource("disc.data." + g.id + "." + g.observedReport, () => discovery.graphData(g), 0);
+  const acc = useAccess();
+  const [scope, setScope] = React.useState(null);
+  const [props, runs, cfg, mcs] = r.data || [[], [], {
+    providers: [],
+    optOut: [],
+    agents: []
+  }, []];
+  const siteProps = props.filter(p => p.site === g.site),
+    siteRuns = runs.filter(x => x.site === g.site);
+  const site = discSites([g], cfg, mcs).find(s => s.name === g.site) || {
+    name: g.site,
+    namespaces: [],
+    flowsOff: false
+  };
+  const mayRun = acc.can("create", "drhub", {
+    kind: "drun",
+    namespace: DR_NS()
+  });
+  const bundleOf = c => siteProps.find(p => p.candidate === c.id && !p.final) || siteProps.find(p => p.candidate === c.id) || null;
+  const failing = g.conditions.filter(c => c.status === "False");
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(DetailHead, {
+    obj: g,
+    title: `Discovery · ${g.site}`,
+    sub: /*#__PURE__*/React.createElement("span", {
+      className: "mono",
+      style: {
+        color: "var(--dim)"
+      }
+    }, "DiscoveryGraph ", g.name, g.observedReport ? ` · report ${g.observedReport.slice(0, 12)}` : ""),
+    badge: /*#__PURE__*/React.createElement("button", {
+      className: "btn primary rundisc",
+      disabled: !mayRun,
+      title: mayRun ? "" : acc.why("create", "drhub", {
+        kind: "drun",
+        namespace: DR_NS()
+      }),
+      onClick: () => window.__ui.dialog(runDiscoveryDialog(discSites([g], cfg, mcs), cfg, {
+        site: g.site
+      }), {
+        kind: "drun",
+        id: "new"
+      })
+    }, /*#__PURE__*/React.createElement(Icon, {
+      n: "plus",
+      s: 12
+    }), "Run discovery")
+  }), !!g.truncated.length && /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, "The site's report was truncated:"), " ", g.truncated.join(", "), ". Candidates may miss members; narrow the scope or raise the agent's budget.")), failing.map(c => /*#__PURE__*/React.createElement("div", {
+    key: c.type,
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, c.type, ":"), " ", c.message || c.reason))), /*#__PURE__*/React.createElement("div", {
+    className: "stats"
+  }, /*#__PURE__*/React.createElement(Stat, {
+    k: "Graph built",
+    v: g.built ? fmtAgo(g.built) : "not yet",
+    s: g.built ? fmtDate(g.built) : "waiting for the first report"
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Nodes \xB7 edges",
+    v: `${g.counts.nodes} · ${g.counts.edges}`,
+    s: `${g.counts.evidence} evidence records`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Candidates",
+    v: g.counts.candidates,
+    s: `${g.candidates.filter(c => c.adopted).length} adopted from existing protection`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Flows",
+    v: flowsText(site),
+    s: site.flowsOff ? "no flow evidence on this site" : `eBPF, ${cfg.flows && cfg.flows.udp ? "TCP + UDP" : "TCP"}`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Bundles",
+    v: siteProps.length,
+    s: `${openProps(siteProps).length} open`
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Application candidates"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Candidate", "Namespaces", "Members", "Score", "Adopted application", "Bundle"],
+    empty: "No candidate yet.",
+    rows: g.candidates.map(c => {
+      const b = bundleOf(c);
+      return [/*#__PURE__*/React.createElement("button", {
+        className: "candpick",
+        style: {
+          color: "var(--accent)",
+          fontFamily: "inherit"
+        },
+        onClick: () => setScope({
+          type: "candidate",
+          id: c.id,
+          members: c.members
+        }),
+        title: "Draw this candidate's graph"
+      }, c.name), /*#__PURE__*/React.createElement(M, {
+        dim: true
+      }, c.namespaces.join(", ")), c.members.length, /*#__PURE__*/React.createElement(Conf, {
+        v: c.score
+      }), c.adopted ? /*#__PURE__*/React.createElement(M, null, c.adopted) : "", b ? /*#__PURE__*/React.createElement("span", {
+        style: {
+          display: "inline-flex",
+          gap: 6,
+          alignItems: "center"
+        }
+      }, /*#__PURE__*/React.createElement(TrafficLight, {
+        status: b.phase,
+        sm: true
+      }), /*#__PURE__*/React.createElement(Ref, {
+        label: b.name,
+        onClick: () => nav.detail(b)
+      })) : /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: "var(--dim2)"
+        }
+      }, "none")];
+    })
+  }))), /*#__PURE__*/React.createElement(GraphCard, {
+    g: g,
+    data: d.data,
+    error: d.error,
+    loading: d.loading,
+    scope: scope,
+    setScope: setScope
+  }), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Bundles for ", g.site), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  }), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => nav.drLayer("proposals")
+  }, "All proposals")), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(ProposalTable, {
+    props: siteProps,
+    nav: nav,
+    empty: "No bundle for this site yet."
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Runs"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(RunTable, {
+    runs: siteRuns
+  }))), React.createElement(window.DrConditions, {
+    o: g
+  }));
+}
+
+// ---- proposals (DR → Proposals) -------------------------------------------------------------
+const PROP_FILTERS = {
+  open: p => !p.final && p.phase !== "Applied",
+  applied: p => p.phase === "Applied",
+  all: () => true
+};
+function ProposalsView({
+  nav
+}) {
+  const r = useResource("disc.props", () => Promise.all([discovery.proposals(), discovery.config()]), 8000);
+  const [f, setF] = React.useState("open");
+  const [props, cfg] = r.data || [[], {}];
+  const shown = props.filter(PROP_FILTERS[f]);
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    className: "dhead"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      minWidth: 0,
+      flex: 1
+    }
+  }, /*#__PURE__*/React.createElement("h1", null, "Proposals"), /*#__PURE__*/React.createElement("div", {
+    className: "dsub"
+  }, "One bundle per application: the objects, the labels on its volumes and workloads, its place in a recovery plan and the site mappings it needs. ", cfg.gitOps ? "Approve by merging the bundle's pull request; reverting the merge rolls it back." : "No GitOps target is configured: approve and roll back here.")), /*#__PURE__*/React.createElement("button", {
+    className: "btn",
+    onClick: () => nav.drLayer("aidisc")
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "k8s",
+    s: 12
+  }), "Discovery")), r.error && /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, "Cannot read proposals."), " ", r.error.message)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      margin: "4px 0 10px"
+    }
+  }, Object.keys(PROP_FILTERS).map(k => /*#__PURE__*/React.createElement("button", {
+    key: k,
+    className: "chip propfilter" + (f === k ? " on" : ""),
+    onClick: () => setF(k)
+  }, k, " \xB7 ", props.filter(PROP_FILTERS[k]).length))), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(ProposalTable, {
+    props: shown,
+    nav: nav,
+    empty: r.loading ? "Loading…" : f === "open" ? "No open bundle." : "Nothing here."
+  }))));
+}
+
+// ---- one bundle (DRProposal detail) ---------------------------------------------------------
+const changeText = c => c.remove ? `remove ${c.key}` : `${c.key}=${c.value}`;
+const objRef = x => `${x.namespace ? x.namespace + "/" : ""}${x.name}`;
+function DRPropDetail({
+  o: p,
+  nav
+}) {
+  const r = useResource("disc.prop." + p.id, () => Promise.all([discovery.config(), discovery.graphBySite(p.site).catch(() => null), discovery.proposals()]), 8000);
+  const [cfg, graph, all] = r.data || [{
+    providers: [],
+    gitOps: null
+  }, null, []];
+  const d = useResource("disc.propdata." + p.id + "." + (graph ? graph.observedReport : ""), () => graph ? discovery.graphData(graph) : Promise.resolve(null), 0);
+  const acc = useAccess();
+  const [openSpec, setOpenSpec] = React.useState({});
+  const gitOps = !!(cfg && cfg.gitOps);
+  const byName = n => all.find(x => x.name === n && x.namespace === p.namespace) || null;
+  const may = op => acc.can(op, "drhub", {
+    kind: "drprop",
+    namespace: p.namespace
+  });
+  const why = op => acc.why(op, "drhub", {
+    kind: "drprop",
+    namespace: p.namespace
+  });
+  const mayRun = acc.can("create", "drhub", {
+    kind: "drun",
+    namespace: DR_NS()
+  });
+  const btn = (cls, label, icon, ok, reason, dialog) => /*#__PURE__*/React.createElement("button", {
+    className: "btn " + cls,
+    disabled: !ok,
+    title: ok ? "" : reason,
+    onClick: () => window.__ui.dialog(dialog, p)
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: icon,
+    s: 12
+  }), label);
+  const pending = p.request && !p.final;
+  const notApplyable = p.dryBlocking ? `${p.dryBlocking} blocking dry-run check(s) fail` : p.openBlocking ? `${p.openBlocking} blocking question(s) open` : "";
+  const actions = /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 6,
+      flexWrap: "wrap"
+    }
+  }, gitOps && p.phase === "Proposed" && !(p.gitOps && p.gitOps.pr) && btn("openpr", "Open pull request", "link", may("patch") && !pending, pending ? `${p.request} requested` : why("patch"), requestDialog(p, "open-pr")), !p.final && btn("refine", "Refine with AI", "camera", cfg.providers.length > 0 && mayRun && !p.final, !cfg.providers.length ? "Phase 2: no model provider is configured (DRConfig spec.discovery.providers)" : p.final ? "the bundle is final" : acc.why("create", "drhub", {
+    kind: "drun",
+    namespace: DR_NS()
+  }), runDiscoveryDialog([{
+    name: p.site,
+    built: graph && graph.built,
+    namespaces: []
+  }], cfg, {
+    site: p.site,
+    proposal: p.name,
+    mode: "AI"
+  })), !gitOps && ["Proposed", "Stale"].includes(p.phase) && btn("primary approve", "Approve", "check", may("approve") && !notApplyable && !pending, pending ? `${p.request} requested` : notApplyable || why("approve"), requestDialog(p, "approve")), !gitOps && p.phase === "Applied" && btn("rollback", "Roll back", "swap", may("rollback") && !pending, pending ? `${p.request} requested` : why("rollback"), requestDialog(p, "rollback")), !p.final && !["Applied", "Merged", "WaitingForApplications"].includes(p.phase) && btn("reject", "Reject", "x", may("patch") && !pending, pending ? `${p.request} requested` : why("patch"), rejectDialog(p)));
+  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(DetailHead, {
+    obj: p,
+    title: `Bundle · ${p.title}`,
+    sub: /*#__PURE__*/React.createElement("span", {
+      className: "mono",
+      style: {
+        color: "var(--dim)"
+      }
+    }, "DRProposal ", p.namespace, "/", p.name, " \xB7 ", p.scope, " \xB7 site ", p.site),
+    badge: actions
+  }), pending && /*#__PURE__*/React.createElement("div", {
+    className: "banner info"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "clock",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, (PROP_REQUESTS[p.request] || {
+    label: p.request
+  }).label, " requested"), p.requestReason ? ` (${p.requestReason})` : "", " \u2014 dr-hub carries it out and records the result in the bundle's phase.")), !!p.dryBlocking && !p.final && /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, p.dryBlocking, " blocking dry-run check(s) fail."), " ", gitOps ? "dr-hub still opens the pull request; fix it on the branch or wait for a revision." : "Approval stays disabled until a revision passes.")), !!p.openBlocking && !p.final && /*#__PURE__*/React.createElement("div", {
+    className: "banner"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "alert",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, p.openBlocking, " blocking question(s) open."), " ", gitOps ? "Answer them in the pull request by checking one option each." : "Answer them before approving (see Questions).")), p.phase === "Superseded" && /*#__PURE__*/React.createElement("div", {
+    className: "banner info"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "swap",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, "Superseded by ", byName(p.supersededBy) ? /*#__PURE__*/React.createElement(Ref, {
+    label: p.supersededBy,
+    onClick: () => nav.detail(byName(p.supersededBy))
+  }) : /*#__PURE__*/React.createElement("span", {
+    className: "mono"
+  }, p.supersededBy || "a newer bundle"), ".")), /*#__PURE__*/React.createElement("div", {
+    className: "stats"
+  }, /*#__PURE__*/React.createElement(Stat, {
+    k: "Phase",
+    v: /*#__PURE__*/React.createElement(TrafficLight, {
+      status: p.phase
+    }),
+    s: p.approvedBy ? `approved by ${p.approvedBy}` : p.appliedAt ? `applied ${fmtAgo(p.appliedAt)}` : ""
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Confidence",
+    v: confPct(p.confidence),
+    s: `${p.evidenceIds.length} evidence record(s)`
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Source",
+    v: p.ai ? "AI" : "rules",
+    s: p.ai ? `run ${p.run}${p.baseline ? ` · baseline ${p.baseline}` : ""}` : "deterministic baseline"
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Dry run",
+    v: p.dryRun ? /*#__PURE__*/React.createElement(VerdictBadge, {
+      v: p.dryRun.verdict
+    }) : "not run",
+    s: p.dryRun ? `${p.dryRun.checks.length} checks` : ""
+  }), /*#__PURE__*/React.createElement(Stat, {
+    k: "Pull request",
+    v: p.gitOps && p.gitOps.pr ? /*#__PURE__*/React.createElement(PRLink, {
+      g: p.gitOps
+    }) : gitOps ? "not opened" : "no GitOps target",
+    s: p.gitOps && p.gitOps.mergeCommit ? `merged ${p.gitOps.mergeCommit.slice(0, 10)}` : ""
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("h3", null, "Summary"), /*#__PURE__*/React.createElement("div", {
+    className: "bd"
+  }, /*#__PURE__*/React.createElement("p", {
+    style: {
+      margin: 0
+    }
+  }, p.summary || /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: "var(--dim2)"
+    }
+  }, "No summary.")), (p.dependsOn.length > 0 || p.baseline) && /*#__PURE__*/React.createElement(Props, {
+    rows: [p.dependsOn.length ? ["Depends on", /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 8,
+        flexWrap: "wrap"
+      }
+    }, p.dependsOn.map(n => byName(n) ? /*#__PURE__*/React.createElement(Ref, {
+      key: n,
+      label: n,
+      onClick: () => nav.detail(byName(n))
+    }) : /*#__PURE__*/React.createElement(M, {
+      key: n
+    }, n)))] : null, p.baseline ? ["Rules baseline", byName(p.baseline) ? /*#__PURE__*/React.createElement(Ref, {
+      label: p.baseline,
+      onClick: () => nav.detail(byName(p.baseline))
+    }) : /*#__PURE__*/React.createElement(M, null, p.baseline)] : null].filter(Boolean)
+  }), p.scope === "RecoveryPlan" && /*#__PURE__*/React.createElement("p", {
+    className: "mdesc",
+    style: {
+      margin: "8px 0 0"
+    }
+  }, "After its merge, dr-hub applies a recovery-plan bundle only once every application bundle it names is applied."))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Objects"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), p.objects.map((x, i) => /*#__PURE__*/React.createElement("div", {
+    className: "card propobj",
+    key: i
+  }, /*#__PURE__*/React.createElement("h3", null, /*#__PURE__*/React.createElement("span", {
+    className: "badge"
+  }, x.operation), " ", x.kind, " ", /*#__PURE__*/React.createElement("span", {
+    className: "mono",
+    style: {
+      color: "var(--dim)"
+    }
+  }, objRef(x)), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    style: {
+      marginLeft: "auto"
+    },
+    onClick: () => setOpenSpec(Object.assign({}, openSpec, {
+      [i]: !openSpec[i]
+    }))
+  }, openSpec[i] ? "hide spec" : "show spec")), /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Field", "Confidence", "Evidence", "Note"],
+    empty: "No field carries its own basis.",
+    rows: x.fields.map(f => [/*#__PURE__*/React.createElement(M, null, f.field), /*#__PURE__*/React.createElement(Conf, {
+      v: f.confidence
+    }), /*#__PURE__*/React.createElement(M, {
+      dim: true
+    }, f.evidence.join(", ")), f.note])
+  }), openSpec[i] && /*#__PURE__*/React.createElement("pre", {
+    className: "mono propspec",
+    style: {
+      margin: "8px 0 0",
+      fontSize: 11,
+      maxHeight: 320,
+      overflow: "auto",
+      background: "var(--bg2, var(--panel))",
+      padding: 8,
+      borderRadius: 4
+    }
+  }, JSON.stringify(x.spec, null, 2))))), !!p.diff && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Diff against the current objects"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd"
+  }, /*#__PURE__*/React.createElement("pre", {
+    className: "mono propdiff",
+    style: {
+      margin: 0,
+      fontSize: 11,
+      maxHeight: 360,
+      overflow: "auto"
+    }
+  }, p.diff)))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Labels"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Site", "Object", "Change", "Effect", "Reason", "Evidence"],
+    empty: "The bundle changes no label.",
+    rows: p.labels.map(l => [/*#__PURE__*/React.createElement(M, null, l.cluster), /*#__PURE__*/React.createElement(M, null, l.change.kind, " ", objRef(l.change)), /*#__PURE__*/React.createElement(M, null, changeText(l.change)), l.effect ? /*#__PURE__*/React.createElement("span", {
+      className: "badge"
+    }, l.effect) : "", l.reason, /*#__PURE__*/React.createElement(M, {
+      dim: true
+    }, l.evidence.join(", "))])
+  }), /*#__PURE__*/React.createElement("p", {
+    className: "mdesc",
+    style: {
+      margin: "8px 0 0"
+    }
+  }, "Applied by each site's dr-agent through allow-listed label requests; a rollback restores the previous values."))), !!p.migrations.length && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Volumes that would join a consistency group"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Site", "Volume", "Group", "Why"],
+    rows: p.migrations.map(m => [/*#__PURE__*/React.createElement(M, null, m.cluster), /*#__PURE__*/React.createElement(M, null, m.namespace, "/", m.pvc), /*#__PURE__*/React.createElement(M, null, m.group), m.reason])
+  }), /*#__PURE__*/React.createElement("p", {
+    className: "mdesc",
+    style: {
+      margin: "8px 0 0"
+    }
+  }, "Listed for information only. A consistency group is fixed when a volume is created, so these existing volumes are not moved; they join once the storage refactor allows forming groups later.")))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Questions"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, /*#__PURE__*/React.createElement(Table_, {
+    cols: ["Question", "Options", "Blocking", "Answer"],
+    empty: "Nothing left to decide.",
+    rows: p.questions.map(q => [q.text, /*#__PURE__*/React.createElement("span", {
+      style: {
+        display: "inline-flex",
+        gap: 4,
+        flexWrap: "wrap"
+      }
+    }, q.options.map(op => /*#__PURE__*/React.createElement("span", {
+      key: op,
+      className: "badge",
+      style: op === q.answer ? {
+        color: "var(--ok)",
+        borderColor: "var(--ok)"
+      } : {}
+    }, op))), q.blocking ? /*#__PURE__*/React.createElement("b", {
+      style: {
+        color: "var(--bad)"
+      }
+    }, "yes") : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim)"
+      }
+    }, "no"), q.answer ? /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("b", null, q.answer), q.by ? /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--dim)"
+      }
+    }, " \xB7 ", q.by) : null) : /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: "var(--warn)"
+      }
+    }, "open")])
+  }), !!p.questions.length && /*#__PURE__*/React.createElement("p", {
+    className: "mdesc propqnote",
+    style: {
+      margin: "8px 0 0"
+    }
+  }, gitOps ? /*#__PURE__*/React.createElement(React.Fragment, null, "Read-only here: answer in the pull request by checking one option of each question", p.gitOps && p.gitOps.pr ? /*#__PURE__*/React.createElement(React.Fragment, null, " (", /*#__PURE__*/React.createElement("a", {
+    href: p.gitOps.pr,
+    target: "_blank",
+    rel: "noopener noreferrer",
+    style: {
+      color: "var(--accent)"
+    }
+  }, "open it"), ")") : null, "; dr-hub reads the answers back.") : "Read-only here: without a GitOps target dr-hub takes answers from the bundle's annotations (dr.simplyblock.io/answer.<question id>), set with kubectl until the console offers them."))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Evidence"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  }), graph && /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    onClick: () => nav.detail(graph)
+  }, "Open the graph of ", p.site)), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, d.error && /*#__PURE__*/React.createElement("p", {
+    className: "mdesc",
+    style: {
+      margin: "0 0 8px",
+      color: "var(--warn)"
+    }
+  }, "Graph data unavailable (", d.error.message, "); evidence is shown by id only."), /*#__PURE__*/React.createElement(EvidenceRows, {
+    ids: p.evidenceIds,
+    data: d.data
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "sech"
+  }, /*#__PURE__*/React.createElement("h2", null, "Dry run"), /*#__PURE__*/React.createElement("span", {
+    className: "ln"
+  })), /*#__PURE__*/React.createElement("div", {
+    className: "card"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "bd",
+    style: {
+      overflowX: "auto"
+    }
+  }, p.dryRun ? React.createElement(window.DrCheckTable, {
+    checks: p.dryRun.checks
+  }) : /*#__PURE__*/React.createElement("div", {
+    className: "nolim"
+  }, "dr-hub has not dry-run this bundle yet."))), React.createElement(window.DrConditions, {
+    o: p
+  }));
+}
+
+// ---- links from the existing pages -------------------------------------------------------------
+// Protect application, Edit tiers & probes, Edit bindings stay; the pages
+// they live on point at the newest bundle that would change the object.
+function ProposalLink({
+  kind,
+  name,
+  namespace,
+  nav
+}) {
+  const r = useResource(`disc.latest.${kind}.${namespace || ""}.${name}`, () => discovery.latestFor(kind, name, namespace), 15000);
+  const p = r.data;
+  if (!p) return null;
+  return /*#__PURE__*/React.createElement("div", {
+    className: "banner info proplink"
+  }, /*#__PURE__*/React.createElement(Icon, {
+    n: "list",
+    s: 15
+  }), /*#__PURE__*/React.createElement("span", null, "A ", p.ai ? "AI-refined" : "discovered", " bundle proposes ", p.objects.find(x => x.kind === kind && x.name === name) ? p.objects.find(x => x.kind === kind && x.name === name).operation === "create" ? "this object" : "changes to this object" : "changes", " (", confPct(p.confidence), " confidence, ", (STATUS_META[p.phase] || {
+    label: p.phase
+  }).label, ")."), /*#__PURE__*/React.createElement("button", {
+    className: "chip",
+    style: {
+      marginLeft: "auto"
+    },
+    onClick: () => nav.detail(p)
+  }, "Open latest proposal"));
+}
+Object.assign(window, {
+  discovery,
+  normDGraph,
+  normDRProp,
+  normDRun,
+  DiscoveryHome,
+  DGraphDetail,
+  DRPropDetail,
+  ProposalsView,
+  ProposalTable,
+  RunTable,
+  GraphView,
+  ProposalLink,
+  runDiscoveryDialog,
+  rejectDialog,
+  requestDialog,
+  DISC_ANN,
+  confPct
 });
 })();
 // ---- details-data.jsx ----
@@ -34772,6 +36923,9 @@ const DETAIL_KIND = {
   siteprofile: "SiteProfileDetail",
   dhcpserver: "DHCPServerDetail",
   sitedeploy: "SiteDeployDetail",
+  // AI-assisted discovery: discover.jsx
+  dgraph: "DGraphDetail",
+  drprop: "DRPropDetail",
   deployconfig: "DeployConfigDetail",
   mpath: "MPathDetail",
   appgroup: "AppGroupDetail"
@@ -34961,6 +37115,21 @@ const LAYER_META = {
   },
   sitedeploy: {
     icon: "cluster"
+  },
+  // AI-assisted discovery (discover.jsx): the per-site graph and the bundles
+  aidisc: {
+    label: "Discovery",
+    icon: "k8s"
+  },
+  dgraph: {
+    icon: "k8s"
+  },
+  proposals: {
+    label: "Proposals",
+    icon: "list"
+  },
+  drprop: {
+    icon: "list"
   },
   logs: {
     label: "Logs",
@@ -35209,6 +37378,22 @@ const pSiteDeploy = id => [{
   t: "sitedeploy",
   id
 }];
+const pDGraph = id => [{
+  t: "dr"
+}, {
+  t: "aidisc"
+}, {
+  t: "dgraph",
+  id
+}];
+const pDRProp = id => [{
+  t: "dr"
+}, {
+  t: "proposals"
+}, {
+  t: "drprop",
+  id
+}];
 const pPair = id => [{
   t: "dr"
 }, {
@@ -35305,7 +37490,7 @@ const pAg = (pid, id) => [...pMp(pid), {
   t: "appgroup",
   id
 }];
-const detailPath = o => o.kind === "cluster" ? pC(o.id) : o.kind === "deployconfig" ? pDep(o.k8sClusterId, o.id) : o.kind === "host" ? pH(o.clusterId, o.id) : o.kind === "node" ? pN(o.clusterId, o.id) : o.kind === "device" ? pD(o.clusterId, o.nodeId, o.id) : o.kind === "pool" ? pP(o.clusterId, o.id) : o.kind === "volume" ? pV(o.clusterId, o.poolId, o.id) : o.kind === "pplan" ? pPPlan(o.id) : o.kind === "drpath" ? pDRPath(o.id) : o.kind === "papp" ? pPApp(o.id) : o.kind === "rplan" ? pRPlan(o.id) : o.kind === "raction" ? pRAction(o.id) : o.kind === "tbubble" ? pTBubble(o.id) : o.kind === "tsched" ? pTSched(o.id) : o.kind === "restore" ? pRestore(o.id) : o.kind === "siteprofile" ? pSProf(o.id) : o.kind === "dhcpserver" ? pDhcp(o.id) : o.kind === "sitedeploy" ? pSiteDeploy(o.id) : o.kind === "pair" ? pPair(o.id) : o.kind === "slot" ? pSlot(o.id) : o.kind === "replops" ? pReplOp(o.id) : o.kind === "rpolicy" ? pRPol(o.id) : o.kind === "zone" ? pZone(o.id) : o.kind === "mpath" ? pMp(o.id) : o.kind === "appgroup" ? pAg(o.pathId, o.id) : o.kind === "bucket" ? pBucket(o.clusterId, o.id) : o.kind === "k8sc" ? pK(o.id) : o.kind === "storageclass" ? pSc(o.k8sClusterId, o.id) : o.kind === "pvc" ? pPvc(o.k8sClusterId, o.id) : o.kind === "migration" ? pMig(o.sourceClusterId || o.clusterId, o.id) : o.kind === "cgroup" ? pCg(o.clusterId, o.id) : o.kind === "cgsnapshot" ? [...pCg(o.clusterId, o.cgId), {
+const detailPath = o => o.kind === "cluster" ? pC(o.id) : o.kind === "deployconfig" ? pDep(o.k8sClusterId, o.id) : o.kind === "host" ? pH(o.clusterId, o.id) : o.kind === "node" ? pN(o.clusterId, o.id) : o.kind === "device" ? pD(o.clusterId, o.nodeId, o.id) : o.kind === "pool" ? pP(o.clusterId, o.id) : o.kind === "volume" ? pV(o.clusterId, o.poolId, o.id) : o.kind === "pplan" ? pPPlan(o.id) : o.kind === "drpath" ? pDRPath(o.id) : o.kind === "papp" ? pPApp(o.id) : o.kind === "rplan" ? pRPlan(o.id) : o.kind === "raction" ? pRAction(o.id) : o.kind === "tbubble" ? pTBubble(o.id) : o.kind === "tsched" ? pTSched(o.id) : o.kind === "restore" ? pRestore(o.id) : o.kind === "siteprofile" ? pSProf(o.id) : o.kind === "dhcpserver" ? pDhcp(o.id) : o.kind === "sitedeploy" ? pSiteDeploy(o.id) : o.kind === "dgraph" ? pDGraph(o.id) : o.kind === "drprop" ? pDRProp(o.id) : o.kind === "pair" ? pPair(o.id) : o.kind === "slot" ? pSlot(o.id) : o.kind === "replops" ? pReplOp(o.id) : o.kind === "rpolicy" ? pRPol(o.id) : o.kind === "zone" ? pZone(o.id) : o.kind === "mpath" ? pMp(o.id) : o.kind === "appgroup" ? pAg(o.pathId, o.id) : o.kind === "bucket" ? pBucket(o.clusterId, o.id) : o.kind === "k8sc" ? pK(o.id) : o.kind === "storageclass" ? pSc(o.k8sClusterId, o.id) : o.kind === "pvc" ? pPvc(o.k8sClusterId, o.id) : o.kind === "migration" ? pMig(o.sourceClusterId || o.clusterId, o.id) : o.kind === "cgroup" ? pCg(o.clusterId, o.id) : o.kind === "cgsnapshot" ? [...pCg(o.clusterId, o.cgId), {
   t: "cgsnapshots"
 }, {
   t: "cgsnapshot",
@@ -35645,6 +37830,8 @@ const DETAIL_API = {
   siteprofile: "GET /apis/sitemap.simplyblock.io/v1alpha1/siteprofiles/{name}",
   dhcpserver: "GET /apis/sitemap.simplyblock.io/v1alpha1/dhcpservers/{name}",
   sitedeploy: "GET /apis/storage.simplyblock.io/v1alpha2/namespaces/{ns}/storagesitedeployments/{name}",
+  dgraph: drcrd("discoverygraphs/{name}"),
+  drprop: drcrd("drproposals/{name}", true),
   pair: crd1("replicationpairs"),
   rpolicy: crd1("replicationpolicies"),
   slot: crd1("replicationslots"),
@@ -37094,7 +39281,7 @@ function App() {
     return s ? REG[s.id] : null;
   }, [viewKey, clusters.length]);
   const parentSeg = path[path.length - 2];
-  const apiHint = cur.id ? DETAIL_API[cur.t] : VIEWS[cur.t] ? VIEWS[cur.t].api(parentSeg || {}) : "—";
+  const apiHint = cur.id ? DETAIL_API[cur.t] : VIEWS[cur.t] ? VIEWS[cur.t].api(parentSeg || {}) : cur.t === "aidisc" ? drcrd("discoverygraphs") + " · " + drcrd("discoveryruns", true) : cur.t === "proposals" ? drcrd("drproposals", true) : "—";
   const s0 = path[0] && path[0].t;
   const section = s0 === "dr" ? "dr" : s0 === "k8s" ? "k8s" : s0 === "cp" ? "cp" : s0 === "logs" ? "logs" : "clusters";
   const drVisible = DR_ONLY || acc.canAnywhere("read", "drhub") || acc.canAnywhere("read", "drpolicy") || acc.canAnywhere("read", "replicationpolicy") || acc.canAnywhere("read", "application");
@@ -37319,6 +39506,12 @@ function App() {
     up: upOne,
     upLabel: upLabel
   }) : cur.t === "dr" ? /*#__PURE__*/React.createElement(DrHubHome, {
+    key: viewKey,
+    nav: nav
+  }) : cur.t === "aidisc" ? /*#__PURE__*/React.createElement(DiscoveryHome, {
+    key: viewKey,
+    nav: nav
+  }) : cur.t === "proposals" ? /*#__PURE__*/React.createElement(ProposalsView, {
     key: viewKey,
     nav: nav
   }) : cur.t === "drconfig" ? /*#__PURE__*/React.createElement(DRConfigView, {

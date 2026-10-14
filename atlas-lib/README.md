@@ -40,6 +40,9 @@ atlas/
 │   ├── detach.go           DetachDevice: disconnect unless the subsystem is shared
 │   └── multipath.go        the halves: ConnectPaths (ordered per-path connect) + PathResult
 ├── nqn/                    Build & parse simplyblock lvol NQNs
+├── fiemap/                 What a byte range of a file is made of: data, unwritten, delalloc, or hole
+├── nfsclient/              The kernel NFS client's own view of its mounts
+│   └── mountstats.go       Mount, ParseMountstats, ReadMountstats: op counts, layout types, reconnects
 ├── blockdev/               What a Linux block device is, and what it carries
 │   ├── device.go           Device: path, kernel name, device numbers, block sizes, size, read-only
 │   ├── content.go          Content, Reading, Reader/Opener seam, Prober.Read
@@ -135,6 +138,12 @@ atlas/
 │       ├── client.go       Remote(conn) + the nvme resolver interfaces, remoted
 │       ├── convert.go      nvme snapshot types ↔ wire form (total, both directions)
 │       └── storagev1/      SubsystemService + DeviceService (buf-generated, committed)
+├── conntrack/              Forget the host's conntrack entries translated to one dead backend
+│   ├── conntrack.go        Selector (protocol, port, reply source), Tuple, Matches, Forget
+│   ├── forget_linux.go     netlink delete, filtered by Selector.Matches (non-Linux: ErrUnsupported)
+│   └── conntrackrpc/       FlowService: served by the CSI node plugin, called by the operator
+│       ├── conntrackrpc.go NewServer(conntrack.Forget), Remote(conn).Forget
+│       └── conntrackv1/    the FlowService protocol (buf-generated, committed)
 ├── prometheus/             The telemetry simplyblock exports about itself (PromQL)
 │   ├── doc.go              Why this is not part of controlplane, and how fresh a value is
 │   ├── client.go           Provider, New, NewWithAPI (the test seam), query helpers
@@ -153,7 +162,7 @@ atlas/
 │   ├── bounded.go          Call/Do: a sysfs read, ioctl, or open under a deadline + the stuck-key guard
 │   └── command.go          CombinedOutput/Output: a child process that returns even when it cannot be reaped
 ├── errs/                   Sentinel errors (errors.Is across packages)
-│   └── deferrers/          defer-friendly Close/Run that log instead of dropping errors
+│   └── deferrers/          defer-friendly Close/Run (and CloseFn/RunFn) that log instead of dropping errors
 │
 ├── internal/               Private — not importable by consumers
 │   ├── cpapi/              oapi-codegen client for the control-plane v2 API (generated)
@@ -1402,6 +1411,34 @@ And the `nvmeof` composition helpers must not be assembled across a link:
 in the operator it would consult the operator's `/dev`. Those belong on the node,
 behind their own RPC.
 
+#### Forget the flows translated to a dead backend
+
+A Service's ClusterIP is translated to a backend by the first packet of a
+connection, and conntrack keeps that translation for the life of the entry. When
+the backend goes away, a client that retries its SYN on the same tuple keeps the
+entry alive and keeps reaching the dead address, after the EndpointSlice has
+moved on. kube-proxy clears such entries for UDP only. The node forgets them when
+asked, for one protocol, one port, and one address, never more:
+
+```go
+// On the node (the CSI node plugin, host network, privileged):
+srv, err := conntrackrpc.NewServer(conntrack.Forget)
+cfg.Register = func(r grpc.ServiceRegistrar) { storageSrv.Register(r); srv.Register(r) }
+cfg.Capabilities = append(storagerpc.Capabilities(), conntrackrpc.Capabilities()...)
+
+// From the operator, per node peer:
+sel := conntrack.Selector{Protocol: conntrack.TCP, DstPort: 2049, ReplySource: oldPodIP}
+for _, p := range registry.PeersOfKind(link.PeerKindNode) {
+    if p.HasCapability(conntrackrpc.CapabilityFlows) {
+        n, err := conntrackrpc.Remote(p.Conn()).Forget(ctx, sel)
+    }
+}
+```
+
+*Today:* the operator's `NFSExport` reconciler asks for it when a pNFS metadata
+server pod goes away, through `operator/internal/csilink/flows.go`, and
+`csi-driver/internal/driver/driver.go` serves it on every node plugin.
+
 ### Cross-cutting
 
 #### Map errors at the consumer's boundary
@@ -1443,6 +1480,14 @@ size := ptr.ClampToInt(sizeBytes, false)           // saturates, never wraps
 ```go
 defer deferrers.Close(resp.Body)
 defer deferrers.Run(cancelWatch)
+```
+
+Where an API takes a `func()` instead of a call, such as `t.Cleanup`, `CloseFn`
+and `RunFn` return the cleanup and log the site that registered it:
+
+```go
+t.Cleanup(deferrers.CloseFn(conn))
+t.Cleanup(deferrers.RunFn(func() error { return os.RemoveAll(dir) }))
 ```
 
 #### Bound a call that blocks in the kernel

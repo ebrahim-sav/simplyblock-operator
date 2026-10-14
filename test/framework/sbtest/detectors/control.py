@@ -16,7 +16,17 @@ import re
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
-from ..core import Detector, Evidence, Finding, SkipDetector, critical, detector, info, warning
+from ..core import (
+    Attribution,
+    Detector,
+    Evidence,
+    Finding,
+    SkipDetector,
+    critical,
+    detector,
+    info,
+    warning,
+)
 
 
 @detector
@@ -285,7 +295,7 @@ class NodeAgent(Detector):
         live = set(self.opt("liveness_endpoints") or [])
         gap_limit = float(self.opt("max_poll_gap_s"))
         errors: dict[str, dict[str, int]] = {}
-        gaps: list[tuple[str, str, float]] = []
+        gaps: list[tuple[str, str, float, datetime]] = []
 
         for name in names:
             last_poll: datetime | None = None
@@ -308,7 +318,8 @@ class NodeAgent(Detector):
                 except ValueError:
                     continue
                 if last_poll is not None and (ts - last_poll).total_seconds() > gap_limit:
-                    gaps.append((name, f"{last_poll:%H:%M:%S}", (ts - last_poll).total_seconds()))
+                    gaps.append((name, f"{last_poll:%H:%M:%S}", (ts - last_poll).total_seconds(),
+                                 ts))
                 last_poll = ts
 
         total_errors = sum(sum(v.values()) for v in errors.values())
@@ -325,17 +336,28 @@ class NodeAgent(Detector):
                      "control.node-flap: this is the upstream half of a false offline.",
             )
 
-        if gaps:
-            worst = sorted(gaps, key=lambda g: -g[2])[:6]
+        # The log is collected whole and starts hours before the run, so a gap that ended
+        # before the run began is history the run inherited, not something it caused.
+        start, _ = ev.run_window()
+        if start is None:
+            groups = {Attribution.UNKNOWN: gaps}
+        else:
+            groups = {Attribution.PRE_EXISTING: [g for g in gaps if g[3] <= start],
+                      Attribution.RUN: [g for g in gaps if g[3] > start]}
+        for attribution, group in groups.items():
+            if not group:
+                continue
+            worst = sorted(group, key=lambda g: -g[2])[:6]
             yield warning(
                 self.name,
-                title=f"{len(gaps)} gap(s) in the liveness polling, worst {worst[0][2]:.0f}s",
+                title=f"{len(group)} gap(s) in the liveness polling, worst {worst[0][2]:.0f}s",
                 subject="control-plane",
-                detail="; ".join(f"{n} after {t} ({d:.0f}s)" for n, t, d in worst),
+                detail="; ".join(f"{n} after {t} ({d:.0f}s)" for n, t, d, _ in worst),
                 evidence={"gaps": [{"log": n, "after": t, "seconds": round(d)}
-                                   for n, t, d in gaps]},
+                                   for n, t, d, _ in group]},
                 note="Either the control plane stopped asking or the agent stopped answering. "
                      "A poll that never happened leaves no other trace, so this is the only "
                      "place the stall is visible — and it is what precedes a node being "
                      "declared down.",
+                attribution=attribution,
             )

@@ -3,7 +3,7 @@
 //
 // The management API's second replica is the one worth naming. Three things
 // depend on it: Degraded is defined as a component below its desired count while
-// the probe still passes, a Restart recycles the workload after draining rather
+// the probe still passes, a Restart restarts the workload after draining rather
 // than instead of serving, and an Upgrade rolls this Deployment. With one
 // instance each of those becomes an outage.
 
@@ -379,7 +379,7 @@ func TestTheExporterDoesNotRunTheControlPlanesImage(t *testing.T) {
 // Every service container reaches the database through the cluster file, and
 // every pod that mounts it is annotated for restart when it changes. A
 // coordinator change rewrites that ConfigMap, and a pod holding a connection to
-// the old coordinator has to be recycled to notice.
+// the old coordinator has to be restarted to notice.
 func TestEveryWorkloadThatReachesTheDatabaseIsRolledWhenItMoves(t *testing.T) {
 	cp := localControlPlane()
 
@@ -438,6 +438,9 @@ func TestTheServicePoolsRunWhatTheyDeclare(t *testing.T) {
 			}
 			seen[container.Name] = true
 
+			if len(container.Command) == 1 && container.Command[0] == twoNodeEventCollectorBinary {
+				continue // the one service the image ships as a binary
+			}
 			if len(container.Command) != 2 || container.Command[0] != "python3" {
 				t.Errorf("%s/%s runs %v, want a python3 module", tc.name, container.Name,
 					container.Command)
@@ -655,5 +658,28 @@ func TestNoExtraAdminServiceAccountsMeansTheOperatorAlone(t *testing.T) {
 
 	if want := "system:serviceaccount:" + cp.Namespace + ":simplyblock-operator"; env.Value != want {
 		t.Errorf("SB_K8S_ADMIN_SERVICE_ACCOUNTS = %q, want %q", env.Value, want)
+	}
+}
+
+// The two-node arbiter and event collector must name what the control-plane
+// image ships (sbcli simplyblock_core/scripts/docker-compose-swarm.yml:
+// TwoNodeArbiter, TwoNodeEventCollector), or they crash-loop and pin the
+// monitoring pod.
+func TestTheTwoNodeServicesNameWhatTheImageShips(t *testing.T) {
+	d := findDeployment(t, managementAPIObjects(localControlPlane()), ComponentMonitoring)
+	want := map[string][]string{
+		"two-node-arbiter":         {"python3", "simplyblock_core/services/two_node_arbiter.py"},
+		"two-node-event-collector": {"/usr/local/bin/sb-event-collector"},
+	}
+	for _, c := range d.Spec.Template.Spec.Containers {
+		if w, ok := want[c.Name]; ok {
+			if strings.Join(c.Command, " ") != strings.Join(w, " ") {
+				t.Errorf("%s runs %v, want %v", c.Name, c.Command, w)
+			}
+			delete(want, c.Name)
+		}
+	}
+	for name := range want {
+		t.Errorf("the monitoring pod runs no %s", name)
 	}
 }

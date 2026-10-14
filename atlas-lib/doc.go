@@ -37,11 +37,18 @@
 //	                what order: one constructor per plan the design names.
 //	kube            Map a logical volume to the Kubernetes objects representing it.
 //	controlplane    Client for the simplyblock control-plane API.
+//	nfsexport       Publish a pNFS export on its metadata-server host.
+//	fiemap          What a byte range of a file is made of on disk: data,
+//	                unwritten, delalloc, or hole.
+//	nfsclient       What the kernel's NFS client says about its mounts:
+//	                per-operation counts, layout types, and reconnects.
 //	link            gRPC between the operator and the CSI driver, over
 //	                connections the CSI driver opens.
 //	storage         One node's storage as one value (Accessor);
 //	                storage/storagerpc serves it over a link and reaches
 //	                another node's.
+//	conntrack       Forget a host's connection-tracking entries for one dead
+//	                backend; conntrack/conntrackrpc serves it over a link.
 //	prometheus      Read the telemetry simplyblock exports about itself:
 //	                capacity, per-volume load, and node write latency.
 //	errs            Sentinel errors shared across atlas, matched with errors.Is.

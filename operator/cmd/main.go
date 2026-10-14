@@ -68,6 +68,8 @@ import (
 	"github.com/simplyblock/simplyblock-operator/internal/controllers/driver"
 	nodecontroller "github.com/simplyblock/simplyblock-operator/internal/controllers/node"
 	"github.com/simplyblock/simplyblock-operator/internal/controllers/pool"
+	"github.com/simplyblock/simplyblock-operator/internal/controllers/twonode"
+	twonodecp "github.com/simplyblock/simplyblock-operator/internal/controllers/twonode/cpadapter"
 	volumecontrollers "github.com/simplyblock/simplyblock-operator/internal/controllers/volume"
 	"github.com/simplyblock/simplyblock-operator/internal/csilink"
 	"github.com/simplyblock/simplyblock-operator/internal/utils"
@@ -241,6 +243,10 @@ func main() {
 	flag.StringVar(&latencyPercentile, "latency-percentile", "p50",
 		"fio write-latency percentile driving the volume-rebalancing deviation signal: "+
 			"\"p50\" (median, stable) or \"p99\" (tail, noisy).")
+	var clusterDNSDomain string
+	flag.StringVar(&clusterDNSDomain, "cluster-dns-domain", utils.DefaultClusterDNSDomain,
+		"The cluster's DNS domain, the suffix after <service>.<namespace>.svc. Every "+
+			"in-cluster address and certificate name the operator builds uses it.")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -248,6 +254,11 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := utils.SetClusterDNSDomain(clusterDNSDomain); err != nil {
+		setupLog.Error(err, "invalid --cluster-dns-domain")
+		os.Exit(1)
+	}
 
 	nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
 	if err != nil {
@@ -392,6 +403,7 @@ func main() {
 			Audiences:                []string{csiLinkAudience},
 			NodeServiceAccount:       "simplyblock-csi-node-sa",
 			ControllerServiceAccount: "simplyblock-csi-controller-sa",
+			MDSServiceAccount:        "simplyblock-csi-mds-sa",
 		})
 		if err != nil {
 			setupLog.Error(err, "unable to set up the CSI link")
@@ -465,6 +477,11 @@ func main() {
 	// that opens it is also what registers the namespace its objects belong in.
 	backupSubscription := subscriptions.NewBackupSubscription()
 	backupScopes := cpSubscriptions.AddSubscription(backupSubscription)
+	// A backup request snapshots a volume and follows the snapshot and then the
+	// copy, so it reads the snapshot stream too. That one is per pool, and the
+	// pool's controller opens it.
+	snapshotSubscription := subscriptions.NewSnapshotSubscription()
+	snapshotScopes := cpSubscriptions.AddSubscription(snapshotSubscription)
 	backupPolicySubscription := subscriptions.NewBackupPolicySubscription()
 	backupPolicyScopes := cpSubscriptions.AddSubscription(backupPolicySubscription)
 	// How full a node is exists only in the metrics the control plane exports,
@@ -481,12 +498,14 @@ func main() {
 	// way: with the link off an export binds a host and then waits, visibly,
 	// rather than the kind disappearing.
 	nfsExportReconciler := &controller.NFSExportReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("nfsexport-controller"),
+		Client:            mgr.GetClient(),
+		Scheme:            mgr.GetScheme(),
+		Recorder:          mgr.GetEventRecorder("nfsexport-controller"),
+		OperatorNamespace: operatorNamespace,
 	}
 	if csiPeers != nil {
 		nfsExportReconciler.Assembler = controller.NewLinkAssembler(csiPeers)
+		nfsExportReconciler.Flows = csilink.NewFlows(csilink.RegistryNodePeers(csiPeers))
 	}
 	if err := nfsExportReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "NFSExport")
@@ -644,6 +663,7 @@ func main() {
 		Scheme:           mgr.GetScheme(),
 		Recorder:         mgr.GetEventRecorder("storagepool-controller"),
 		VolumeScopes:     volumeScopes,
+		SnapshotScopes:   snapshotScopes,
 		EndpointResolver: controlPlaneEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "StoragePool")
@@ -686,6 +706,17 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackup")
 		os.Exit(1)
 	}
+	if err := (&backupcontrollers.StorageBackupRequestReconciler{
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("storagebackuprequest-controller"),
+		API:       backupAPI,
+		Snapshots: snapshotSubscription,
+		Backups:   backupSubscription,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupRequest")
+		os.Exit(1)
+	}
 	if err := (&backupcontrollers.StorageBackupPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
@@ -695,7 +726,18 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupPolicy")
 		os.Exit(1)
 	}
-	if err := (&backupcontrollers.StorageBackupOpsReconciler{
+	// An operation stored with string references cannot be decoded, and a cache
+	// that cannot list it never syncs, which would exit the whole manager. The
+	// controller is skipped instead, and the rest of the operator runs.
+	legacyOps, err := backupcontrollers.LegacyBackupOps(context.Background(), mgr.GetAPIReader())
+	if err != nil {
+		setupLog.Error(err, "unable to check for StorageBackupOps in the old format; starting the controller anyway")
+	}
+	if len(legacyOps) > 0 {
+		setupLog.Error(nil, "StorageBackupOps controller not started: these operations use the old string "+
+			"spec.backupRef and spec.clusterRef. Delete them and restart the operator",
+			"operations", legacyOps)
+	} else if err := (&backupcontrollers.StorageBackupOpsReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("storagebackupops-controller"),
@@ -704,7 +746,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "StorageBackupOps")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupRestoreReconciler{
+	if err := (&backupcontrollers.BackupRestoreReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backuprestore-controller"),
@@ -712,7 +754,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupRestore")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupPolicyReconciler{
+	if err := (&backupcontrollers.BackupPolicyReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backuppolicy-controller"),
@@ -720,7 +762,7 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupPolicy")
 		os.Exit(1)
 	}
-	if err := (&controller.BackupImportReconciler{
+	if err := (&backupcontrollers.BackupImportReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorder("backupimport-controller"),
@@ -931,6 +973,16 @@ func main() {
 		EndpointResolver: controlPlaneEndpoint,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ReplicationPair")
+		os.Exit(1)
+	}
+	// Two-node arbitration (sbcli docs/design/two-node-arbitration.md §9): follows the
+	// arbiter's record and taints the Kubernetes node of a fenced storage node.
+	if err := (&twonode.ArbitrationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		API:    &twonodecp.Adapter{Reader: mgr.GetClient(), EndpointResolver: controlPlaneEndpoint},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "TwoNodeArbitration")
 		os.Exit(1)
 	}
 	if err := (&controller.ReplicationSlotReconciler{

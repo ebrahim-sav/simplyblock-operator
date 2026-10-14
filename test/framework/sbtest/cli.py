@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Iterable
 
 from . import __version__
 from .adapters import ArchiveEvidence
@@ -43,6 +44,25 @@ def _cfg(args: argparse.Namespace, known_c: list[str], known_d: list[str]) -> Co
     apply_cli_toggles(cfg.components, args.enable_component, args.disable_component)
     apply_cli_toggles(cfg.detectors, args.enable_detector, args.disable_detector)
     return cfg
+
+
+def namespaces(args: argparse.Namespace, cfg: Config) -> tuple[str, str, str]:
+    """The run's operator, cluster, and test namespaces: a flag beats the suite's run
+    block, which beats the default. The defaults are independent: today the operator and
+    the cluster share simplyblock, and the operator is to move to simplyblock-system while
+    the initial cluster stays."""
+    def pick(key: str, default: str) -> str:
+        return str(getattr(args, key, None) or cfg.run.get(key) or default)
+    return (pick("operator_namespace", "simplyblock"), pick("cluster_namespace", "simplyblock"),
+            pick("test_namespace", "default"))
+
+
+def _context(args: argparse.Namespace, cfg: Config, run_id: str, outdir: str,
+             log: Logger) -> RunContext:
+    operator, cluster, test = namespaces(args, cfg)
+    log.info(f"namespaces: operator {operator}, cluster {cluster}, test {test}")
+    return RunContext(run_id=run_id, outdir=outdir, log=log, operator_namespace=operator,
+                      cluster_namespace=cluster, test_namespace=test)
 
 
 def _first_doc_line(cls: type) -> str:
@@ -109,8 +129,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
     os.makedirs(args.outdir, exist_ok=True)
     run_id = args.run_id or f"sbtest-{int(now_utc().timestamp())}"
     log = Logger(os.path.join(args.outdir, "sbtest.log"), verbose=args.verbose)
-    ctx = RunContext(run_id=run_id, outdir=args.outdir, log=log)
     cfg = _cfg(args, list(known_components()), list(known_detectors()))
+    ctx = _context(args, cfg, run_id, args.outdir, log)
     if not cfg.components.enabled:
         raise SystemExit("collect: no components enabled — pass --enable-component or a suite")
 
@@ -134,6 +154,14 @@ def cmd_collect(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_drivers(enabled: Iterable[str]) -> list[str]:
+    """The enabled components that create load: the ones marked `required`, because a
+    component that is the run is the one whose absence leaves nothing to judge. Read from
+    the flag rather than the name, so a workload counts as much as a migration driver."""
+    known = known_components()
+    return [n for n in enabled if n in known and known[n].required]
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """A driven run: components create the load, then the same detectors judge it.
 
@@ -147,15 +175,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     outdir = args.outdir or os.path.join(cfg.outdir, run_id)
     os.makedirs(outdir, exist_ok=True)
     log = Logger(os.path.join(outdir, "test.log"), verbose=args.verbose)
-    ctx = RunContext(run_id=run_id, outdir=outdir, log=log)
+    ctx = _context(args, cfg, run_id, outdir, log)
     # Read by the components that create cluster objects. A kept run leaves the volumes and
     # the CRs behind for inspection — the reason most post-mortems are possible at all.
     ctx.shared["keep"] = bool(args.keep)
+    # Read by the workloads, whose fio runtime is the run's duration unless a suite sets one.
+    ctx.shared["run.duration_s"] = float(args.duration or 0)
 
     if not cfg.components.enabled:
         raise SystemExit("run: no components enabled — pass --enable-component or a suite")
-    drivers = [n for n in cfg.components.enabled if n.endswith(".driver")]
-    if not drivers:
+    if not load_drivers(cfg.components.enabled):
         log.warn("no driver component is enabled, so nothing will create load — this run "
                  "will only observe. Use `sbtest collect` if that is what you meant")
 
@@ -194,6 +223,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--disable-component", action="append", default=[], metavar="NAME")
         sp.add_argument("--json-name", default="findings.json",
                         help="where to write findings inside the run directory")
+        sp.add_argument("--operator-namespace",
+                        help="where the operator, control plane, CSI driver, and MDS run "
+                             "(default: the suite's run.operator_namespace, else simplyblock)")
+        sp.add_argument("--cluster-namespace",
+                        help="where the storage cluster's SPDK and node-agent pods run "
+                             "(default: the suite's run.cluster_namespace, else simplyblock)")
+        sp.add_argument("--test-namespace",
+                        help="where the run creates its client pods and helpers "
+                             "(default: the suite's run.test_namespace, else default)")
         sp.add_argument("-v", "--verbose", action="store_true")
 
     for what in ("detectors", "components"):

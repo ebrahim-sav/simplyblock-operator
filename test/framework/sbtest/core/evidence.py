@@ -22,6 +22,15 @@ from typing import Protocol, runtime_checkable
 # ── the value types detectors reason about ──────────────────────────────────────────
 
 
+#: What host.dmesg writes into a node's kernel log, followed by `wall=<ISO time>`, just before
+#: reading it back. dmesg renders a line's time from the boot time and the kernel's own clock,
+#: which is not NTP-disciplined and drifts: nodes up for weeks run minutes behind. The marker
+#: carries the wall time it was written at and comes back with the time dmesg renders for it,
+#: and the difference is what every other line of that log is corrected by. It stays in the
+#: collected file, so an archived run carries its own correction.
+KERNEL_CLOCK_PROBE = "sbtest-clock-probe"
+
+
 @dataclass(frozen=True)
 class AnaSample:
     """One controller's state on one consuming host at one instant."""
@@ -94,6 +103,38 @@ class FioJob:
     total_iops: float = 0.0
     read_iops: float = 0.0
     write_iops: float = 0.0
+    start: datetime | None = None   # when fio's timed run began, from job_start
+    runtime_s: float = 0.0          # how long it ran, from job_runtime
+
+
+@dataclass(frozen=True)
+class BlockSample:
+    """One reading of one NVMe namespace's I/O counters on one node, from sysfs `stat`.
+
+    Counters are cumulative since the device appeared, so a reading means nothing alone and
+    everything against the one before it.
+    """
+
+    ts: datetime
+    node: str
+    device: str        # the head device, nvmeXnY
+    uuid: str          # the namespace UUID, which for a simplyblock volume is the lvol's
+    read_ios: int
+    read_sectors: int
+    write_ios: int
+    write_sectors: int
+
+
+@dataclass(frozen=True)
+class PnfsVolume:
+    """A pNFS volume a run provisioned, and the client nodes that should write to it."""
+
+    claim: str
+    lvol: str
+    shared: bool
+    nodes: list[str] = field(default_factory=list)
+    # fio instance (its evidence directory) -> the node it ran on
+    instances: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -157,6 +198,290 @@ class NvmeController:
         return not self.namespaces
 
 
+@dataclass(frozen=True)
+class FenceWrite:
+    """One write of the fence scenario's probe writer on the partitioned node."""
+
+    ts: datetime
+    ok: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Fence:
+    """What the fence scenario did and saw (chaos.fence).
+
+    The victim node is cut off from the metadata server while its NVMe-oF paths stay up,
+    and the recaller changes the size of the file the victim's probe writer holds a layout
+    on. nfsd recalls the victim's layout, cannot reach it, and fences it by preempting its
+    reservation key, after which no write of the victim's may land.
+    """
+
+    victim_node: str
+    recaller_node: str
+    claim: str
+    victim_pod: str = ""
+    recaller_pod: str = ""
+    file: str = ""
+    rules: tuple[str, ...] = ()
+    partitioned: datetime | None = None
+    healed: datetime | None = None
+    truncate_issued: datetime | None = None
+    #: None when the truncate did not return within truncate_timeout_s.
+    truncate_returned: datetime | None = None
+    truncate_timeout_s: float = 0.0
+    #: The truncate's exit status and first error line, empty when it succeeded.
+    truncate_error: str = ""
+    writes: tuple[FenceWrite, ...] = ()
+    #: Why the scenario could not run to the end, empty when it did.
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class Restart:
+    """One pod a run restarted on purpose, and when its replacement came back."""
+
+    target: str
+    pod: str
+    node: str
+    deleted: datetime
+    ready: datetime | None = None
+    replacement: str = ""
+    #: The victim's log, followed from its deletion until its containers exited.
+    log: str = ""
+    #: The victim's pod IP and its replacement's, "" when the run did not record them. A
+    #: Service routes to the pod IP, so a flow still translated to the old one after the
+    #: replacement is Ready never reaches it.
+    ip: str = ""
+    replacement_ip: str = ""
+
+
+@dataclass(frozen=True)
+class ChurnPod:
+    """One short-lived pod that joined a pNFS volume, ran fio, and left.
+
+    `own_volume` says whether it brought a volume of its own, which it deleted when it
+    left, or used one the run's long-lived pods share. For an own volume, `pv_gone` and
+    `export_gone` say whether the PersistentVolume and the NFSExport behind it were gone by
+    the end of the run, None when that was never checked, and `gone_s` how long after the
+    claim's deletion both were.
+    """
+
+    pod: str
+    claim: str
+    own_volume: bool
+    created: datetime
+    node: str = ""
+    io_started: datetime | None = None
+    finished: datetime | None = None
+    deleted: datetime | None = None
+    rc: int | None = None
+    pvc_deleted: datetime | None = None
+    pv: str = ""
+    pv_gone: bool | None = None
+    export_gone: bool | None = None
+    gone_s: float | None = None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class Registrant:
+    """One host registered on a namespace's NVMe reservation, with the key it holds."""
+
+    hostid: str
+    rkey: int
+    holder: bool = False
+
+
+@dataclass(frozen=True)
+class NamespaceReservation:
+    """A namespace's NVMe reservation as one node's `nvme resv-report` saw it.
+
+    The state is the target's, so every node attached to the namespace reports the same
+    registrants. A pNFS metadata server holds the reservation, and each client registers
+    the key nfsd gave it, whose upper 32 bits are nfsd's boot time.
+    """
+
+    node: str
+    device: str
+    uuid: str
+    rtype: int
+    generation: int
+    registrants: tuple[Registrant, ...] = ()
+
+
+@dataclass(frozen=True)
+class NfsSample:
+    """One fio instance's NFS client counters at one moment. The counts are the pod's
+    mount's, which every instance in the pod writes through."""
+
+    ts: datetime
+    instance: str   # the instance's evidence directory, such as "<run>-fio-0-c0"
+    pod: str
+    container: str
+    layoutget: int
+    read: int
+    write: int
+    connects: int = 0
+
+
+@dataclass(frozen=True)
+class MetadataOp:
+    """One namespace operation a workload.pnfs-metadata worker made on a pNFS volume.
+
+    `ts` is when the operation started and `ms` how long it took, so it completed at
+    `ts + ms`. `error` is the errno name of a failed operation.
+    """
+
+    ts: datetime
+    worker: str
+    op: str
+    path: str
+    ok: bool
+    ms: float
+    error: str = ""
+
+    @property
+    def ended(self) -> datetime:
+        return self.ts + timedelta(milliseconds=self.ms)
+
+
+@dataclass(frozen=True)
+class MetadataCheck:
+    """One comparison of a worker's directory, as another client lists it, with the
+    manifest the worker wrote while holding still.
+
+    Paths are relative to the worker's directory. `error` says why the check could not run,
+    and then the path lists are empty.
+    """
+
+    ts: datetime
+    worker: str
+    worker_node: str
+    verifier_node: str
+    missing: tuple[str, ...] = ()
+    extra: tuple[str, ...] = ()
+    mismatched: tuple[str, ...] = ()
+    error: str = ""
+
+    @property
+    def cross_node(self) -> bool:
+        return self.worker_node != self.verifier_node
+
+    @property
+    def clean(self) -> bool:
+        return not (self.missing or self.extra or self.mismatched)
+
+
+@dataclass(frozen=True)
+class MetadataWorker:
+    """One workload.pnfs-metadata worker: when it was due to stop, and what kept it from
+    running or from being read.
+
+    `stop_at` is the run-relative deadline the worker was given, so a worker whose last
+    operation completed long before it stopped making progress. `start_error` says why its
+    pods were never released to start, and `collect_error` why its operation log could not
+    be read, in which case its operations are missing, not clean.
+    """
+
+    worker: str
+    node: str = ""
+    stop_at: datetime | None = None
+    start_error: str = ""
+    collect_error: str = ""
+
+
+@dataclass(frozen=True)
+class VolumeOp:
+    """One operation chaos.volume-ops performed on a live pNFS volume, and how far it got.
+
+    `op` is `expand` or `snapshot`. A step that did not happen leaves its timestamp None,
+    and `skipped` says why an operation was not attempted at all, which is not a failure.
+
+    For an expansion, `target_bytes` is the size asked for, `capacity_at` when the claim's
+    status reached it, and `client_seen_at` when `df` in `client_pod` reported more than
+    `client_before_b`. For a snapshot, `marker_md5` is the checksum of a file a client wrote
+    just before it, `ready_at` when the snapshot was ready to use, and `restore_md5` what a
+    pod read back from `restore_claim`, a block volume restored from it, at `restored_at`.
+    `snapshot` is set only once the VolumeSnapshot was created. A deletion is recorded only
+    when the object was gone, and a deletion that failed or did not finish is in
+    `cleanup_error`, apart from `error`, which is the operation itself failing.
+    """
+
+    op: str
+    claim: str
+    requested: datetime
+    timeout_s: float = 0.0
+    skipped: str = ""
+    error: str = ""
+    target_bytes: int = 0
+    capacity_at: datetime | None = None
+    client_pod: str = ""
+    client_before_b: int = 0
+    client_after_b: int = 0
+    client_seen_at: datetime | None = None
+    snapshot: str = ""
+    marker_md5: str = ""
+    ready_at: datetime | None = None
+    restore_claim: str = ""
+    restored_at: datetime | None = None
+    restore_md5: str = ""
+    restore_deleted: datetime | None = None
+    snapshot_deleted: datetime | None = None
+    cleanup_error: str = ""
+
+
+@dataclass(frozen=True)
+class ConntrackSample:
+    """One NFS flow in a node's connection tracking table at one moment.
+
+    The orig tuple is the client's view (its address and source port to the export's
+    Service address), and reply_src is where the node translated it: the MDS pod. A row
+    with state "NONE" and no tuple records that the node was read and held no NFS flow,
+    which keeps a node with nothing to find apart from a node never read.
+    """
+
+    ts: datetime
+    node: str
+    state: str
+    orig_src: str = ""
+    orig_sport: int = 0
+    orig_dst: str = ""
+    orig_dport: int = 0
+    reply_src: str = ""
+
+
+@dataclass(frozen=True)
+class DeployedImage:
+    """One container of the deployment, and the image it actually ran."""
+
+    namespace: str
+    pod: str
+    container: str
+    image: str      # the reference the pod asked for, usually a tag
+    image_id: str   # what the runtime resolved it to, with the digest
+
+
+@dataclass(frozen=True)
+class NodeVersion:
+    """What one node runs underneath the pods."""
+
+    node: str
+    kernel: str
+    os_image: str
+    runtime: str
+    kubelet: str
+
+
+@dataclass(frozen=True)
+class Versions:
+    """What was deployed when the run started, so a result can be tied to it."""
+
+    server: str
+    images: tuple[DeployedImage, ...] = ()
+    nodes: tuple[NodeVersion, ...] = ()
+
+
 # ── the contract ────────────────────────────────────────────────────────────────────
 
 
@@ -192,6 +517,27 @@ class Evidence(Protocol):
 
     def pods(self) -> list[str]: ...
 
+    def nfs_ops(self, pod: str) -> dict[str, int]:
+        """The per-operation counts of the NFS mount a fio instance wrote through, e.g.
+        {"LAYOUTGET": 3, "WRITE": 0}. Empty when the instance used no NFS mount."""
+        ...
+
+    def block_samples(self) -> list[BlockSample]:
+        """NVMe namespace I/O counters per node over the run, oldest first."""
+        ...
+
+    def pnfs_volumes(self) -> list[PnfsVolume]:
+        """The pNFS volumes the run provisioned, with their consuming nodes."""
+        ...
+
+    def reservations_pre(self) -> list[NamespaceReservation]:
+        """Every namespace's NVMe reservation when the run started, one entry per node."""
+        ...
+
+    def reservations_post(self) -> list[NamespaceReservation]:
+        """Every namespace's NVMe reservation when the run ended, one entry per node."""
+        ...
+
     def run_window(self) -> tuple[datetime | None, datetime | None]:
         """When the run started and ended, or (None, None) if not known.
 
@@ -203,6 +549,46 @@ class Evidence(Protocol):
         ...
 
     def control_events(self) -> list[ControlEvent]: ...
+
+    def restarts(self) -> list[Restart]:
+        """The pods the run restarted on purpose, oldest first."""
+        ...
+
+    def fence(self) -> Fence | None:
+        """The fence scenario's record, or None when it did not run."""
+        ...
+
+    def churn(self) -> list[ChurnPod]:
+        """The short-lived pods that joined and left pNFS volumes, oldest first."""
+
+    def versions(self) -> Versions | None:
+        """What was deployed, or None when the run did not record it."""
+        ...
+
+    def nfs_timeline(self) -> list[NfsSample]:
+        """Each fio instance's NFS client counters over the run, oldest first."""
+        ...
+
+    def conntrack(self) -> list[ConntrackSample]:
+        """Each node's NFS flows in its connection tracking table over the run, oldest
+        first."""
+        ...
+
+    def metadata_ops(self) -> list[MetadataOp]:
+        """Every namespace operation of workload.pnfs-metadata's workers, oldest first."""
+        ...
+
+    def metadata_checks(self) -> list[MetadataCheck]:
+        """Each comparison of a worker's directory with its manifest, oldest first."""
+        ...
+
+    def metadata_workers(self) -> list[MetadataWorker]:
+        """Each metadata worker's stop time and start and collection errors."""
+        ...
+
+    def volume_ops(self) -> list[VolumeOp]:
+        """The operations chaos.volume-ops performed on live pNFS volumes, oldest first."""
+        ...
 
     def log_spans(self) -> list[LogSpan]:
         """The time range each collected log covers. Empty when not determinable."""

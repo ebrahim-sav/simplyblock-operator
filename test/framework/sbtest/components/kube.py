@@ -26,6 +26,19 @@ def run(args: list[str], timeout: int = 60, check: bool = True,
     return cp
 
 
+def apply_each(namespace: str, docs: list[dict], timeout: int = 60) -> None:
+    """Apply each object with its own kubectl call.
+
+    Not as a v1 List: kubectl validates a List against every model the cluster publishes,
+    and the operator's metrics API publishes names with slashes in them, whose references
+    kubectl cannot resolve. Not as a stream of documents either: kubectl 1.33 panicked
+    decoding JSON documents between YAML separators (slice bounds out of range in
+    StreamReader.Consume). A single object needs neither.
+    """
+    for doc in docs:
+        run(["-n", namespace, "apply", "-f", "-"], stdin=json.dumps(doc), timeout=timeout)
+
+
 def run_bytes(args: list[str], timeout: int = 300) -> bytes:
     cp = subprocess.run(["kubectl", *args], capture_output=True, timeout=timeout, check=False)
     return cp.stdout
@@ -38,6 +51,7 @@ class Pod:
     node: str
     containers: tuple[str, ...]
     phase: str = ""
+    ip: str = ""
 
 
 def list_pods(namespace: str, name_contains: list[str] | None = None) -> list[Pod]:
@@ -51,17 +65,41 @@ def list_pods(namespace: str, name_contains: list[str] | None = None) -> list[Po
             name=name, namespace=namespace,
             node=it.get("spec", {}).get("nodeName", "") or "",
             containers=tuple(c["name"] for c in it.get("spec", {}).get("containers", [])),
-            phase=it.get("status", {}).get("phase", "") or ""))
+            phase=it.get("status", {}).get("phase", "") or "",
+            ip=it.get("status", {}).get("podIP", "") or ""))
     return out
 
 
 def exec_sh(namespace: str, pod: str, script: str, container: str | None = None,
             timeout: int = 300) -> str:
+    return exec_result(namespace, pod, script, container=container, timeout=timeout).stdout
+
+
+def exec_result(namespace: str, pod: str, script: str, container: str | None = None,
+                timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    """exec_sh with the exit code and stderr kept, for a caller that has to say why a command
+    failed rather than only that its output was empty."""
     args = ["-n", namespace, "exec", pod]
     if container:
         args += ["-c", container]
     args += ["--", "sh", "-c", script]
-    return run(args, timeout=timeout, check=False).stdout
+    return run(args, timeout=timeout, check=False)
+
+
+def pod_mounting(namespace: str, claim: str) -> tuple[str, str] | None:
+    """A running fio pod mounting claim, and its first container."""
+    cp = run(["-n", namespace, "get", "pods", "-l", "app=fio", "-o", "json"], check=False)
+    if cp.returncode != 0:
+        return None
+    for p in json.loads(cp.stdout or "{}").get("items", []):
+        if p.get("status", {}).get("phase") != "Running":
+            continue
+        claims = {(v.get("persistentVolumeClaim") or {}).get("claimName")
+                  for v in p.get("spec", {}).get("volumes", [])}
+        containers = p.get("spec", {}).get("containers", [])
+        if claim in claims and containers:
+            return str(p["metadata"]["name"]), str(containers[0]["name"])
+    return None
 
 
 def short(node: str) -> str:

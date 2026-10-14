@@ -98,34 +98,6 @@ render() {
     "$@" 2>/dev/null | objects
 }
 
-# checkPair asserts that a StorageClass and the provisioner it names are
-# rendered together.
-#
-# A class naming a provisioner nothing installed is worse than no class: it is
-# advertised by `kubectl get storageclass`, a PVC can be pointed at it, and that
-# PVC then waits for a provisioner that is never coming, with nothing in the
-# cluster saying why.
-checkPair() {
-  local present
-
-  present="$(render standalone)"
-  if grep -qxF "StorageClass/local-hostpath" <<<"$present"; then
-    echo "  hostpath: StorageClass/local-hostpath is rendered while its provisioner is not installed"
-    fail=1
-  else
-    echo "  hostpath: no StorageClass without its provisioner"
-  fi
-
-  present="$(render standalone --set controlplane.csiHostpathDriver.enabled=true)"
-  local want
-  for want in "StorageClass/local-hostpath" "CSIDriver/hostpath.csi.k8s.io"; do
-    if ! grep -qxF "$want" <<<"$present"; then
-      echo "  hostpath: MISSING ${want} with the driver enabled"
-      fail=1
-    fi
-  done
-}
-
 # checkVendoredCRDs asserts that the CRDs the chart carries for FoundationDB and
 # for MongoDB are rendered by default, and that each one's value drops its own
 # and leaves the other alone.
@@ -254,7 +226,6 @@ checkLogCollector() {
     "${CAPABILITIES[@]}" \
     --set deployment.profile=standalone \
     --set controlplane.observability.enabled=true \
-    --set controlplane.csiHostpathDriver.enabled=true \
     --set snapshotcontroller.create=true)"; then
     echo "  log collector: RENDER FAILED"
     fail=1
@@ -282,12 +253,174 @@ checkLogCollector() {
   fi
 }
 
+# checkClusterStorageClasses asserts that a storage cluster given at install time,
+# with a pool, gets a block StorageClass naming that cluster and pool.
+#
+# A cluster given this way has no StorageCluster or StoragePool object here, so
+# no reconciler writes a class for it. Without one nothing can provision from
+# it, and the pNFS metadata server finds no class of the cluster to derive its
+# state disk's class from (nfsexport_mds.go, clusterBlockClass).
+#
+# Regression: #726 — with a managed control plane and the cluster given through
+# csiConfig.simplybk, every pNFS export stayed Pending on MDSStateUnavailable,
+# because no StorageClass of the cluster existed to derive the state disk's from.
+checkClusterStorageClasses() {
+  local yq="${YQ:-yq}"
+  local uuid1="11111111-2222-3333-4444-555555555555"
+  local uuid2="66666666-7777-8888-9999-000000000000"
+  local rendered got want
+  local ok=1
+
+  # classes prints `name provisioner cluster_id pool_name` per simplyblock class.
+  classes() {
+    "$yq" -N 'select(.kind == "StorageClass" and .provisioner == "csi.simplyblock.io") |
+      .metadata.name + " " + .provisioner + " " + .parameters.cluster_id + " " + .parameters.pool_name' <<<"$1"
+  }
+
+  if ! rendered="$(helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=managed \
+    --set controlplane.managed.endpoint=https://cp.example.com \
+    --set csiConfig.simplybk.uuid="$uuid1" \
+    --set csiConfig.simplybk.ip=https://cp.example.com \
+    --set csiSecret.simplybk.secret=s3cret \
+    --set csiConfig.simplybk.pool=pool1)"; then
+    echo "  storage classes: RENDER FAILED (single cluster)"
+    fail=1
+    return
+  fi
+  got="$(classes "$rendered")"
+  want="simplyblock-pool1 csi.simplyblock.io ${uuid1} pool1"
+  if [ "$got" != "$want" ]; then
+    echo "  storage classes: single cluster rendered [${got}], want [${want}]"
+    ok=0
+  fi
+
+  if ! rendered="$(helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=managed \
+    --set controlplane.managed.endpoint=https://cp.example.com \
+    --set csiConfig.simplybk.uuid="$uuid1" \
+    --set csiSecret.simplybk.secret=s3cret \
+    --set multiCluster.enable=true \
+    --set multiCluster.clusters[0].cluster_id="$uuid1" \
+    --set multiCluster.clusters[0].secret=s1 \
+    --set multiCluster.clusters[0].pool=pool1 \
+    --set multiCluster.clusters[1].cluster_id="$uuid2" \
+    --set multiCluster.clusters[1].secret=s2 \
+    --set multiCluster.clusters[1].pool=pool2 \
+    --set multiCluster.clusters[1].storageClassName=fast)"; then
+    echo "  storage classes: RENDER FAILED (two clusters)"
+    fail=1
+    return
+  fi
+  got="$(classes "$rendered" | sort)"
+  want="$(printf '%s\n' "fast csi.simplyblock.io ${uuid2} pool2" "simplyblock-pool1 csi.simplyblock.io ${uuid1} pool1" | sort)"
+  if [ "$got" != "$want" ]; then
+    echo "  storage classes: two clusters rendered [${got}], want [${want}]"
+    ok=0
+  fi
+
+  # No pool is no class: a class without pool_name provisions into no pool.
+  if ! rendered="$(helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=managed \
+    --set controlplane.managed.endpoint=https://cp.example.com \
+    --set csiConfig.simplybk.uuid="$uuid1" \
+    --set csiSecret.simplybk.secret=s3cret)"; then
+    echo "  storage classes: RENDER FAILED (no pool)"
+    fail=1
+    return
+  fi
+  got="$(classes "$rendered")"
+  if [ -n "$got" ]; then
+    echo "  storage classes: a cluster without a pool rendered [${got}]"
+    ok=0
+  fi
+
+  # A Secret supplied outside the chart is still a cluster the driver reaches,
+  # so who writes the Secret does not decide whether the class is rendered.
+  if ! rendered="$(helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=managed \
+    --set controlplane.managed.endpoint=https://cp.example.com \
+    --set externallyManagedSecret.create=false \
+    --set csiConfig.simplybk.uuid="$uuid1" \
+    --set csiConfig.simplybk.pool=pool1)"; then
+    echo "  storage classes: RENDER FAILED (externally managed Secret)"
+    fail=1
+    return
+  fi
+  got="$(classes "$rendered")"
+  want="simplyblock-pool1 csi.simplyblock.io ${uuid1} pool1"
+  if [ "$got" != "$want" ]; then
+    echo "  storage classes: externally managed Secret rendered [${got}], want [${want}]"
+    ok=0
+  fi
+
+  # A name YAML would read as another type stays a string.
+  if ! rendered="$(helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=managed \
+    --set controlplane.managed.endpoint=https://cp.example.com \
+    --set csiConfig.simplybk.uuid="$uuid1" \
+    --set csiSecret.simplybk.secret=s3cret \
+    --set csiConfig.simplybk.pool=pool1 \
+    --set csiConfig.simplybk.storageClassName=123)"; then
+    echo "  storage classes: RENDER FAILED (numeric name)"
+    fail=1
+    return
+  fi
+  got="$("$yq" -N 'select(.kind == "StorageClass") | .metadata.name | type' <<<"$rendered")"
+  if [ "$got" != "!!str" ]; then
+    echo "  storage classes: storageClassName=123 rendered as [${got}], want [!!str]"
+    ok=0
+  fi
+
+  # Two clusters resolving to one class name, and a cluster ID that is not a
+  # UUID, are refused rather than rendered.
+  refused() {
+    local label="$1" message="$2"
+    shift 2
+    local out
+    if out="$(helm template sb "$CHART" --namespace simplyblock \
+      "${CAPABILITIES[@]}" \
+      --set deployment.profile=managed \
+      --set controlplane.managed.endpoint=https://cp.example.com \
+      --set csiConfig.simplybk.uuid="$uuid1" \
+      --set csiSecret.simplybk.secret=s3cret "$@" 2>&1)"; then
+      echo "  storage classes: ${label} rendered"
+      ok=0
+    elif ! grep -qF "$message" <<<"$out"; then
+      echo "  storage classes: ${label} failed without [${message}]: ${out}"
+      ok=0
+    fi
+  }
+  refused "two clusters with one class name" "rendered for two clusters" \
+    --set multiCluster.enable=true \
+    --set multiCluster.clusters[0].cluster_id="$uuid1" \
+    --set multiCluster.clusters[0].secret=s1 \
+    --set multiCluster.clusters[0].pool=pool1 \
+    --set multiCluster.clusters[1].cluster_id="$uuid2" \
+    --set multiCluster.clusters[1].secret=s2 \
+    --set multiCluster.clusters[1].pool=pool1
+  refused "a cluster ID that is not a UUID" "is not a UUID" \
+    --set csiConfig.simplybk.uuid=my-cluster \
+    --set csiConfig.simplybk.pool=pool1
+
+  if [ "$ok" -eq 1 ]; then
+    echo "  storage classes: one per install-time cluster with a pool, none without"
+  else
+    fail=1
+  fi
+}
+
 check standalone "${COMMON[@]}"
 check managed "${COMMON[@]}"
 check empty "${OPERATOR[@]}"
 checkEmpty
-checkPair
 checkVendoredCRDs
 checkLogCollector
+checkClusterStorageClasses
 
 exit "$fail"

@@ -23,8 +23,12 @@ which reads as a product bug.
 affects is the volume's *group*, not the volume. The control plane decides the packing; the
 driver re-reads it before every migration, because a previous migration may have changed it.
 
-**What the migration actually did.** `status.sourceNodeUUID` is the operator's own resolved
-answer and beats the driver's guess, so it is written back over it.
+**What the migration actually did.** `status.migration.sourceNodeUUID` is the operator's own
+resolved answer and beats the driver's guess, so it is written back over it.
+
+Each migration is a PersistentVolumeOps with action Migrate. The kind is cluster-scoped, so the
+CRs it creates carry the run's id as a label, and teardown selects on it rather than on a
+namespace.
 
 What it deliberately does not do is judge anything. Whether a migration was acceptable is the
 detectors' business; this records what happened and moves on. That separation is why the same
@@ -46,12 +50,16 @@ from . import kube
 from .sbctl import Sbctl, SbctlError
 
 #: Phases the operator will not move on from.
-TERMINAL = ("Completed", "Failed", "Aborted")
+TERMINAL = ("Succeeded", "Failed", "Aborted")
+
+#: The kind every migration is created as, and its resource name for kubectl.
+KIND = "PersistentVolumeOps"
+RESOURCE = "persistentvolumeops"
 
 
 @component
 class MigrationDriver(Component):
-    """Drive VolumeMigration CRs in a loop, one at a time, recording each outcome.
+    """Drive PersistentVolumeOps migrations in a loop, one at a time, recording each outcome.
 
     One at a time on purpose. Concurrent migrations of the same subsystem are rejected by the
     control plane, and concurrent migrations of *different* subsystems make every host-side
@@ -60,13 +68,12 @@ class MigrationDriver(Component):
     """
 
     name = "migration.driver"
-    summary = "create VolumeMigration CRs in a loop and record what each one did"
+    summary = "create PersistentVolumeOps migrations in a loop and record what each one did"
     required = True
 
     def defaults(self) -> dict[str, Any]:
         return {
-            "namespace": "default",
-            "api_group": "storage.simplyblock.io/v1alpha1",
+            "api_group": "storage.simplyblock.io/v1alpha2",
             # alternate | consumer | no-consumer | random. The policy is about whether the
             # *target* also hosts a pod consuming this subsystem — the materially harder case,
             # so which one a migration exercised is chosen rather than left to chance.
@@ -88,6 +95,7 @@ class MigrationDriver(Component):
         self._sb: Sbctl | None = None
         self._nodes: list[str] = []
         self._node_host: dict[str, str] = {}
+        self._node_ref: dict[str, dict[str, str]] = {}   # node UUID -> StorageNode namespace/name
         self._placement: dict[str, str] = {}   # pv -> storage node uuid
         self._volume_of: dict[str, str] = {}   # pv -> lvol uuid
         self._nqn_of: dict[str, str] = {}      # pv -> subsystem nqn
@@ -98,7 +106,7 @@ class MigrationDriver(Component):
     # ── setup ──────────────────────────────────────────────────────────────────────
 
     def setup(self, ctx: RunContext) -> None:
-        self._nodes, self._node_host = self._storage_nodes()
+        self._nodes, self._node_host, self._node_ref = self._storage_nodes()
         if len(self._nodes) < 2:
             raise RuntimeError("need at least two online storage nodes to migrate between, "
                                f"found {len(self._nodes)}")
@@ -120,17 +128,19 @@ class MigrationDriver(Component):
         ctx.log.info(f"{self.name}: {len(self._pvs)} volume(s) across {len(self._nodes)} "
                      f"storage node(s), policy={self.opt('target_policy')}")
 
-    def _storage_nodes(self) -> tuple[list[str], dict[str, str]]:
-        """Online storage nodes as (uuids, uuid -> k8s hostname).
+    def _storage_nodes(self) -> tuple[list[str], dict[str, str], dict[str, dict[str, str]]]:
+        """Online storage nodes as (UUIDs, UUID -> Kubernetes hostname, UUID -> object reference).
 
         Only online ones: migrating *to* an offline node is a rejected request, not a test.
+        The reference is what a migration names its target by: the StorageNode object, not
+        the backend UUID.
         """
         cp = kube.run(["get", "storagenodes", "-A", "-o", "json"], check=False)
         try:
             items = json.loads(cp.stdout).get("items", []) if cp.stdout else []
         except json.JSONDecodeError:
             items = []
-        uuids, hosts = [], {}
+        uuids, hosts, refs = [], {}, {}
         for it in items:
             st = it.get("status", {})
             uuid = st.get("uuid") or ""
@@ -138,7 +148,9 @@ class MigrationDriver(Component):
                 continue
             uuids.append(uuid)
             hosts[uuid] = it.get("spec", {}).get("workerNode", "") or st.get("workerNode", "")
-        return uuids, hosts
+            meta = it.get("metadata", {})
+            refs[uuid] = {"namespace": meta.get("namespace", ""), "name": meta.get("name", "")}
+        return uuids, hosts, refs
 
     # ── the loop ───────────────────────────────────────────────────────────────────
 
@@ -198,7 +210,7 @@ class MigrationDriver(Component):
                          f"node: {', '.join(sorted(off))}")
 
         try:
-            kube.run(["apply", "-f", "-"], stdin=self._manifest(name, pv, target))
+            kube.run(["apply", "-f", "-"], stdin=self._manifest(ctx.run_id, name, pv, target))
         except kube.KubectlError as e:
             rec.phase, rec.error, rec.end = "Failed", f"create: {e}", now_utc()
             ctx.log.error(f"{self.name}: cannot create {name}: {e}")
@@ -224,8 +236,7 @@ class MigrationDriver(Component):
         poll = float(self.opt("poll_s"))
         seen = ""
         while time.time() < deadline and not self._stop.is_set():
-            cp = kube.run(["-n", self.opt("namespace"), "get", "volumemigration", name,
-                           "-o", "json"], check=False, timeout=30)
+            cp = kube.run(["get", RESOURCE, name, "-o", "json"], check=False, timeout=30)
             if cp.returncode == 0 and cp.stdout:
                 try:
                     st = json.loads(cp.stdout).get("status", {})
@@ -233,21 +244,28 @@ class MigrationDriver(Component):
                     st = {}
                 # The operator resolved the source from the control plane; ours came from a
                 # listing that may already be stale, so its answer wins.
-                if st.get("sourceNodeUUID"):
-                    rec.source = str(st["sourceNodeUUID"])
+                source = (st.get("migration") or {}).get("sourceNodeUUID")
+                if source:
+                    rec.source = str(source)
                     self._placement[rec.pv] = rec.source
                 phase = str(st.get("phase", ""))
-                if phase and phase != seen:
-                    seen = phase
+                # A running operation is reported by its step: Running alone does not say
+                # whether the copy has started.
+                label = phase
+                if phase == "Running":
+                    label = str((st.get("step") or {}).get("state", "") or phase)
+                if label and label != seen:
+                    seen = label
                     # The sampler stamps this on every sample it takes, which is what makes an
                     # ANA transition readable as "during cutover" rather than "at 09:31:02".
                     if sampler is not None and hasattr(sampler, "set_phase"):
-                        sampler.set_phase(phase)
-                    ctx.timeline.record("migration.phase", subject=name, phase=phase)
-                    ctx.log.info(f"{self.name}: {name} -> {phase}")
+                        sampler.set_phase(label)
+                    ctx.timeline.record("migration.phase", subject=name, phase=label)
+                    ctx.log.info(f"{self.name}: {name} -> {label}")
                 if phase in TERMINAL:
                     rec.phase = phase
-                    rec.error = str(st.get("errorMessage", "") or "")
+                    # The message explains every phase, so only a failure keeps it as an error.
+                    rec.error = "" if phase == "Succeeded" else str(st.get("message", "") or "")
                     rec.end = now_utc()
                     return
             self._stop.wait(poll)
@@ -358,13 +376,15 @@ class MigrationDriver(Component):
         nqn = self._nqn_of.get(pv, "")
         return list(self._groups.get(nqn, [pv])) if nqn else [pv]
 
-    def _manifest(self, name: str, pv: str, target: str) -> str:
+    def _manifest(self, run_id: str, name: str, pv: str, target: str) -> str:
         return json.dumps({
             "apiVersion": self.opt("api_group"),
-            "kind": "VolumeMigration",
-            "metadata": {"name": name, "namespace": self.opt("namespace"),
-                         "labels": {"sbtest-run": "true", "sbtest": name}},
-            "spec": {"pvName": pv, "targetNodeUUID": target},
+            "kind": KIND,
+            "metadata": {"name": name,
+                         "labels": {"sbtest-run": "true", "sbtest-run-id": run_id,
+                                    "sbtest": name}},
+            "spec": {"persistentVolumeName": pv, "action": "Migrate",
+                     "migrate": {"targetNodeRef": self._node_ref.get(target, {})}},
         })
 
     # ── lifecycle tail ─────────────────────────────────────────────────────────────
@@ -407,14 +427,14 @@ class MigrationDriver(Component):
         """Remove the CRs this run created, unless asked to keep them.
 
         By label rather than by name, so a CR whose creation succeeded but whose name never
-        made it into the records still goes.
+        made it into the records still goes. The run id is part of the selector because the
+        kind is cluster-scoped: `sbtest-run=true` alone would match other runs' CRs.
         """
         if ctx.shared.get("keep"):
             ctx.log.info(f"{self.name}: keep set; leaving {len(self._records)} CR(s) in place")
             return
-        kube.run(["-n", self.opt("namespace"), "delete", "volumemigration",
-                  "-l", "sbtest-run=true", "--ignore-not-found", "--wait=false"],
-                 check=False)
+        kube.run(["delete", RESOURCE, "-l", f"sbtest-run=true,sbtest-run-id={ctx.run_id}",
+                  "--ignore-not-found", "--wait=false"], check=False)
 
 
 def migrations_from_file(path: str) -> list[Migration]:

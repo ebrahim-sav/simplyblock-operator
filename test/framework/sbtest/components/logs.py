@@ -15,12 +15,13 @@ which containers it owns so the grab skips them.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import os
 import subprocess
 from typing import Any
 
-from ..core import Component, RunContext, component
+from ..core import KERNEL_CLOCK_PROBE, Component, RunContext, component
 from . import kube
 
 #: Where the host keeps CRI container logs. Mounted read-only into the grabber.
@@ -105,8 +106,11 @@ class _GrabberBase(Component):
     """Shared management of the privileged pod that reads the host's /var/log/pods.
 
     A Component rather than a bare mixin: it uses `opt` and `name`, so inheriting states
-    that dependency instead of leaving it to whatever it happens to be mixed into.
+    that dependency instead of leaving it to whatever it happens to be mixed into. The
+    grabbers are the run's own pods, so `namespace` is the test namespace by default.
     """
+
+    namespace_options = {"namespace": "test"}  # noqa: RUF012
 
     def _grabber_manifest(self, ctx: RunContext, node: str, name: str, ttl_s: int) -> str:
         import json as _json
@@ -187,10 +191,15 @@ class LogStream(_GrabberBase):
 
     def defaults(self) -> dict[str, Any]:
         return {
-            "namespace": "default",
+            # Where the grabber pods run: the test namespace when unset.
+            "namespace": None,
             "image": DEFAULT_GRABBER_IMAGE,
-            # Pods to follow, matched by substring, and the containers within them.
+            # Pods to follow, matched by substring, and the containers within them. `plane`
+            # says which of the run's namespaces they are in: "cluster" for the storage
+            # cluster's own pods, "operator" for the operator's, the CSI driver's, and the
+            # control plane's.
             "pods_matching": ["snode-spdk"],
+            "plane": "cluster",
             "containers": ["spdk-container", "spdk-proxy-container"],
             # Artifact name: "spdk-<port>" and "spdk-<port>-proxy" for the SPDK pods.
             "name_from": "snode-port",
@@ -218,10 +227,11 @@ class LogStream(_GrabberBase):
 
     # -- lifecycle ------------------------------------------------------------------
     def setup(self, ctx: RunContext) -> None:
-        self._pods = kube.list_pods(self.opt("namespace"), self.opt("pods_matching"))
+        ns = ctx.namespace(str(self.opt("plane")))
+        self._pods = kube.list_pods(ns, self.opt("pods_matching"))
         if not self._pods:
-            ctx.log.warn(f"{self.name}: no pods matching {self.opt('pods_matching')}; "
-                         "nothing to follow")
+            ctx.log.warn(f"{self.name}: no pods matching {self.opt('pods_matching')} in "
+                         f"{ns}; nothing to follow")
             return
         nodes = {p.node for p in self._pods if p.node}
         self._grabbers = self._start_grabbers(ctx, sorted(nodes), int(self.opt("ttl_s")))
@@ -312,6 +322,10 @@ class LogStream(_GrabberBase):
         self._grabbers = {}
 
 
+#: How many container logs the collector fetches at once.
+COLLECT_PARALLEL = 6
+
+
 @component
 class LogCollect(_GrabberBase):
     """Grab container logs from the hosts at the end of the run.
@@ -325,37 +339,44 @@ class LogCollect(_GrabberBase):
 
     def defaults(self) -> dict[str, Any]:
         return {
-            "namespace": "default",
-            "control_plane_namespace": "simplyblock",
+            # Where the grabber pods run: the test namespace when unset.
+            "namespace": None,
             "image": DEFAULT_GRABBER_IMAGE,
-            #: [{pods: [substr], containers: [name]|"all", name_from: ..., namespace: ...}]
+            #: [{pods: [substr], containers: [name]|"all", name_from: ..., plane: ...}]. A
+            #: target's `plane` is the run namespace its pods are in: "cluster" for the
+            #: storage cluster's own (SPDK, node agents), "operator" for the rest. A
+            #: `namespace` of its own overrides it.
             "targets": [
                 {"pods": ["snode-spdk"], "containers": ["spdk-container", "spdk-proxy-container"],
-                 "name_from": "snode-port"},
+                 "plane": "cluster", "name_from": "snode-port"},
                 {"pods": ["operator", "webappapi"], "containers": "all",
-                 "namespace": "simplyblock", "name_from": "pod-key"},
+                 "plane": "operator", "name_from": "pod-key"},
                 # One artifact per container, not per pod. The tasks pod runs seventeen
                 # independent runners, so merging them produces a 50 MiB file that is not in
                 # time order — which makes its time span meaningless and stops a pattern being
                 # scoped to the one runner you care about. The container names are already
                 # unique and descriptive, so they are the artifact names.
                 {"pods": ["tasks"], "containers": "all",
-                 "namespace": "simplyblock", "name_from": "container"},
+                 "plane": "operator", "name_from": "container"},
                 # The CSI driver is where the connects, the path reconcilers and
                 # NodeStage/NodePublish actually happen, so it is the log that says what the
                 # *host side* did and why. Kept per node rather than merged: the node plugin
                 # reconciles per host, so "which node" is the first question about anything
                 # it did, and a merged file loses it.
                 {"pods": ["simplyblock-csi-node"], "containers": ["csi-node"],
-                 "namespace": "simplyblock", "name_from": "pod-node", "name": "csi-node"},
+                 "plane": "operator", "name_from": "pod-node", "name": "csi-node"},
                 # The node-side agent the control plane talks to on each host. It is what
                 # starts and probes the SPDK process, which puts it on the causal path of
                 # every "the node went offline" event — including the liveness check that
                 # concluded SPDK was dead because a Kubernetes API call blipped.
                 {"pods": ["simplyblock-storage-node-ds"], "containers": "all",
-                 "namespace": "default", "name_from": "pod-node", "name": "snode-api"},
+                 "plane": "cluster", "name_from": "pod-node", "name": "snode-api"},
                 {"pods": ["simplyblock-csi-controller"], "containers": "all",
-                 "namespace": "simplyblock", "name_from": "container"},
+                 "plane": "operator", "name_from": "container"},
+                # The pNFS metadata server: the runner, whose log carries the guest's
+                # console, so its boot, grace period, and export assembly.
+                {"pods": ["simplyblock-pnfs-mds"], "containers": "all",
+                 "plane": "operator", "name_from": "container"},
             ],
             "ttl_s": 1800,
         }
@@ -371,8 +392,13 @@ class LogCollect(_GrabberBase):
         streamed = ctx.shared.get("logs.streamed", set())
         plan: list[tuple[kube.Pod, str, str]] = []
         for target in self.opt("targets"):
-            ns = target.get("namespace", self.opt("namespace"))
-            for p in kube.list_pods(ns, target["pods"]):
+            ns = target.get("namespace") or ctx.namespace(str(target.get("plane", "operator")))
+            pods = kube.list_pods(ns, target["pods"])
+            if not pods:
+                # Said, because the detectors reading this log can only report themselves
+                # skipped, which does not say the target looked in the wrong place.
+                ctx.log.warn(f"{self.name}: no pods matching {target['pods']} in {ns}")
+            for p in pods:
                 wanted = (list(p.containers) if target.get("containers") == "all"
                           else [c for c in target["containers"] if c in p.containers])
                 for c in wanted:
@@ -398,26 +424,35 @@ class LogCollect(_GrabberBase):
         for p, c, artifact in plan:
             grouped.setdefault(artifact, []).append((p, c))
 
-        for artifact, items in sorted(grouped.items()):
-            path = ctx.path(f"{artifact}.txt")
-            with open(path, "wb") as fh:
-                for p, c in items:
-                    grab = self._grabbers.get(p.node)
-                    if not grab:
-                        continue
-                    if len(items) > 1:  # several containers share one artifact; header them
-                        fh.write(f"==================== {p.name} / {c} "
-                                 f"({kube.short(p.node)}) ====================\n".encode())
-                    data = kube.run_bytes(
-                        ["-n", self.opt("namespace"), "exec", grab, "--", "sh", "-c",
-                         dump_script(p.namespace, p.name, c)])
-                    fh.write(data)
-                    if not data:
-                        # The dump script swallows read errors, so an empty grab is
-                        # otherwise indistinguishable from "this container logged nothing".
-                        ctx.log.warn(f"{self.name}: empty grab for {p.name}/{c}")
-            ctx.log.info(f"{self.name}: {artifact}.txt "
-                         f"({os.path.getsize(path) / 1048576:.1f} MiB)")
+        # One artifact after another took 34-37 s for 35 logs. Each artifact is its own
+        # file, so they are fetched in parallel, a few at a time.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=COLLECT_PARALLEL) as pool:
+            futures = [pool.submit(self._grab_artifact, ctx, artifact, items)
+                       for artifact, items in sorted(grouped.items())]
+        for future in futures:
+            future.result()
+
+    def _grab_artifact(self, ctx: RunContext, artifact: str,
+                       items: list[tuple[kube.Pod, str]]) -> None:
+        path = ctx.path(f"{artifact}.txt")
+        with open(path, "wb") as fh:
+            for p, c in items:
+                grab = self._grabbers.get(p.node)
+                if not grab:
+                    continue
+                if len(items) > 1:  # several containers share one artifact, so header each
+                    fh.write(f"==================== {p.name} / {c} "
+                             f"({kube.short(p.node)}) ====================\n".encode())
+                data = kube.run_bytes(
+                    ["-n", self.opt("namespace"), "exec", grab, "--", "sh", "-c",
+                     dump_script(p.namespace, p.name, c)])
+                fh.write(data)
+                if not data:
+                    # The dump script swallows read errors, so an empty grab is
+                    # otherwise looks the same as a container that logged nothing.
+                    ctx.log.warn(f"{self.name}: empty grab for {p.name}/{c}")
+        ctx.log.info(f"{self.name}: {artifact}.txt "
+                     f"({os.path.getsize(path) / 1048576:.1f} MiB)")
 
     @staticmethod
     def _name_for(target: dict, pod: kube.Pod, container: str) -> str:
@@ -449,6 +484,15 @@ class LogCollect(_GrabberBase):
         self._own = {}
 
 
+#: Write the clock marker (see KERNEL_CLOCK_PROBE), then read the log back. A marker that
+#: cannot be written leaves the log uncorrected rather than failing the read.
+_READ_DMESG = (
+    f'echo "{KERNEL_CLOCK_PROBE} wall=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" '
+    "> /dev/kmsg 2>/dev/null; "
+    "dmesg --time-format=iso 2>/dev/null || dmesg -T"
+)
+
+
 @component
 class Dmesg(Component):
     """Kernel ring buffer from each storage worker.
@@ -463,24 +507,43 @@ class Dmesg(Component):
     *local* time with no offset, so an event cannot be placed against a run window recorded
     in UTC without assuming the two agree. `--time-format=iso` emits an offset, which makes
     the comparison sound; it is preferred, with `-T` kept as a fallback for older util-linux.
+
+    An offset is not enough on its own: the kernel's clock drifts from wall time, by 61s to
+    182s on lab-talos nodes up for 43 to 129 days, which moves a run's first minutes to before
+    it. So a marker carrying the wall time is written into the log before it is read, and the
+    kernel detectors correct every line by the gap between the two (see KERNEL_CLOCK_PROBE).
     """
 
     name = "host.dmesg"
     summary = "dmesg from each storage worker, ISO-timestamped so events can be placed in time"
 
     def defaults(self) -> dict[str, Any]:
-        return {"namespace": "default", "pods_matching": ["snode-spdk"],
+        # A privileged pod on each node to read dmesg through. `plane` is the run namespace
+        # it is in, and `namespace` overrides it.
+        return {"plane": "cluster", "namespace": None, "pods_matching": ["snode-spdk"],
                 "container": "spdk-container"}
 
     def collect(self, ctx: RunContext) -> None:
-        for p in kube.list_pods(self.opt("namespace"), self.opt("pods_matching")):
+        ns = self.opt("namespace") or ctx.namespace(str(self.opt("plane")))
+        pods = kube.list_pods(ns, self.opt("pods_matching"))
+        if not pods:
+            # Said, because the detectors reading dmesg can only report themselves skipped,
+            # which does not say that this component was pointed at the wrong pods.
+            ctx.log.warn(f"{self.name}: no pods matching {self.opt('pods_matching')} in "
+                         f"{ns}, so no dmesg was collected; point plane, pods_matching and "
+                         "container at a privileged pod on each node")
+        for p in pods:
             if not p.node:
                 continue
             data = kube.run_bytes(
                 ["-n", p.namespace, "exec", p.name, "-c", self.opt("container"), "--",
-                 "sh", "-c", "dmesg --time-format=iso 2>/dev/null || dmesg -T"],
+                 "sh", "-c", _READ_DMESG],
                 timeout=120)
             if not data:
                 ctx.log.warn(f"{self.name}: empty dmesg from {kube.short(p.node)}")
+            elif KERNEL_CLOCK_PROBE.encode() not in data:
+                ctx.log.warn(f"{self.name}: no clock marker in {kube.short(p.node)}'s dmesg, so "
+                             "its times are taken as the kernel renders them; the container "
+                             "needs to write /dev/kmsg for the correction")
             with open(ctx.path(f"dmesg-{kube.short(p.node)}.txt"), "wb") as fh:
                 fh.write(data)

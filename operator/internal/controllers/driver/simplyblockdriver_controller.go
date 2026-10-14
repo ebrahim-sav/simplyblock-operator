@@ -59,6 +59,9 @@ const (
 	reasonAdoptionRefused   = "AdoptionRefused"
 	reasonNoImage           = "NoImage"
 	reasonSnapshotsEnabled  = "SnapshotsEnabled"
+	// The same reasons the export reconciler records for the same update.
+	reasonMDSUpdated          = "MDSUpdated"
+	reasonMDSResourcesInvalid = "MDSResourcesInvalid"
 )
 
 // +kubebuilder:rbac:groups=storage.simplyblock.io,resources=simplyblockdrivers,verbs=get;list;watch;create;update;patch;delete
@@ -196,6 +199,10 @@ func (r *SimplyblockDriverReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 	logger.V(1).Info("applied the driver deployment", "driver", names(&d).csiDriver, "adopted", met)
 
+	if err := r.refreshMDS(ctx, &d); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.recordOrigin(ctx, &d, met); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -222,6 +229,40 @@ func (r *SimplyblockDriverReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	}
 
 	return ctrl.Result{RequeueAfter: driverResyncInterval}, nil
+}
+
+// refreshMDS brings every metadata server StatefulSet of this driver to the
+// pod template this release builds. A driver change or an operator upgrade
+// then restarts the guests at once, rather than at the next export reconcile,
+// which on a cluster nothing is provisioning on is the next workload's first
+// volume. It never creates one: that is the export's. Resources the runner
+// would refuse leave the running guest as it is, and say why.
+func (r *SimplyblockDriverReconciler) refreshMDS(ctx context.Context, d *simplyblockv1alpha2.SimplyblockDriver) error {
+	if d.Spec.PNFS.MDS == nil {
+		return nil
+	}
+	var list appsv1.StatefulSetList
+	if err := r.List(ctx, &list, client.InNamespace(d.Namespace), client.HasLabels{MDSClusterLabel}); err != nil {
+		return fmt.Errorf("listing the metadata server StatefulSets: %w", err)
+	}
+	for i := range list.Items {
+		sts := &list.Items[i]
+		if problem := MDSResourcesProblem(d.Spec.PNFS.MDS); problem != "" {
+			r.event(d, corev1.EventTypeWarning, reasonMDSResourcesInvalid,
+				fmt.Sprintf("cannot update the metadata server StatefulSet %s: %s", sts.Name, problem))
+			return nil
+		}
+		updated, err := UpdateMDS(ctx, r.Client, d, sts)
+		if err != nil {
+			return err
+		}
+		if updated {
+			r.event(d, corev1.EventTypeNormal, reasonMDSUpdated,
+				fmt.Sprintf("updated the metadata server StatefulSet %s to this release's pod template, "+
+					"which restarts its guest", sts.Name))
+		}
+	}
+	return nil
 }
 
 // observe reads the two workloads and the registration back, which is what §4.2

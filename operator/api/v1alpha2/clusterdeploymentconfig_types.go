@@ -326,6 +326,7 @@ type NodeSet struct {
 // ClusterTemplate is the StorageCluster the expansion creates, where it creates
 // one. It carries the layout fields a cluster cannot change later, so that a
 // reviewer sees them before the cluster exists rather than after.
+// +kubebuilder:validation:XValidation:rule="(has(self.clusterMode) && self.clusterMode == 'Dual') || (!has(self.arbitration) && !(has(self.enableArbitration) && self.enableArbitration))",message="enableArbitration and arbitration are only valid when clusterMode is Dual"
 type ClusterTemplate struct {
 	// Name is the StorageCluster's name, and is therefore held to what such a
 	// name may be rather than to what an object name may be. A longer value is a
@@ -518,6 +519,28 @@ type ClusterTemplate struct {
 	// Stripe is the erasure-coding layout.
 	// +optional
 	Stripe *StripeSpec `json:"stripe,omitempty"`
+
+	// ClusterMode is how many storage nodes the cluster is built for: Single
+	// runs every erasure-coding scheme on exactly one storage node, each chunk of
+	// a stripe on its own device, so the node needs dataChunks+parityChunks
+	// devices and the parity protects against device failures rather than the
+	// loss of the node; Dual runs 1+1 on exactly two storage nodes; Standard,
+	// the default, keeps every scheme at its usual minimum. It is carried to the
+	// cluster's spec.clusterMode.
+	// +optional
+	// +kubebuilder:default=Standard
+	ClusterMode ClusterMode `json:"clusterMode,omitempty"`
+
+	// EnableArbitration turns on the control plane's two-node arbitration, and
+	// is carried to the cluster's spec.enableArbitration. Only valid when
+	// clusterMode is Dual.
+	// +optional
+	EnableArbitration *bool `json:"enableArbitration,omitempty"`
+
+	// Arbitration tunes the two-node arbitration, and is carried to the
+	// cluster's spec.arbitration. Only valid when clusterMode is Dual.
+	// +optional
+	Arbitration *ArbitrationSpec `json:"arbitration,omitempty"`
 
 	// FabricType is the storage fabric.
 	// +kubebuilder:validation:MaxLength=32

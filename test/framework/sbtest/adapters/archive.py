@@ -11,6 +11,11 @@ becomes a fixture for the whole detector set:
       <run>-fio-N/result.json        fio's own summary
       <run>-fio-N/fio.log            the pod's container log (verify failures live here)
       <run>-fio-N/timeseries.csv     per-second IOPS
+      <run>-fio-N/nfs-ops.json       per-op counts of the NFS mount it wrote through (pNFS)
+      iostat.csv                     NVMe namespace I/O counters per node over the run
+      pnfs.json                      the run's pNFS volumes and their consuming nodes
+      versions.json                  deployed images and digests, node kernels, server version
+      nfs-timeline.csv               each pNFS fio instance's NFS client counters over the run
       spdk-<port>[-proxy].txt        host-sourced container logs
       operator.txt / webappapi.txt   likewise
       dmesg-<vm>.txt                 kernel ring buffer per storage worker
@@ -33,12 +38,29 @@ from datetime import UTC, datetime, timedelta
 
 from ..core import (
     AnaSample,
+    BlockSample,
+    ChurnPod,
+    ConntrackSample,
     ControlEvent,
+    DeployedImage,
+    Fence,
+    FenceWrite,
     FioJob,
     IopsSample,
     LogSpan,
+    MetadataCheck,
+    MetadataOp,
+    MetadataWorker,
     Migration,
+    NamespaceReservation,
+    NfsSample,
+    NodeVersion,
     NvmeController,
+    PnfsVolume,
+    Registrant,
+    Restart,
+    Versions,
+    VolumeOp,
 )
 
 
@@ -57,6 +79,8 @@ def _dt(v: object) -> datetime | None:
 _TS_PATTERNS = (
     # CRI container log: 2026-08-19T22:23:18.994807954Z stderr F <msg>
     (re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"), "%Y-%m-%dT%H:%M:%S"),
+    # kubectl logs --prefix --timestamps: [pod/NAME/CONTAINER] 2026-10-09T06:07:43.86Z <msg>
+    (re.compile(r"^\[pod/[^\]]+\] (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"), "%Y-%m-%dT%H:%M:%S"),
     # dmesg -T: [Thu Aug 20 05:46:57 2026]
     (re.compile(r"^\[(\w{3} \w{3}\s+\d+ \d{2}:\d{2}:\d{2} \d{4})\]"),
      "%a %b %d %H:%M:%S %Y"),
@@ -256,11 +280,15 @@ class ArchiveEvidence:
                 continue
             for job in res.get("jobs", []):
                 rd, wr = job.get("read", {}), job.get("write", {})
+                start_ms = job.get("job_start")
                 out.append(FioJob(
                     pod=pod, error=int(job.get("error", 0) or 0),
                     read_iops=float(rd.get("iops", 0) or 0),
                     write_iops=float(wr.get("iops", 0) or 0),
-                    total_iops=float(rd.get("iops", 0) or 0) + float(wr.get("iops", 0) or 0)))
+                    total_iops=float(rd.get("iops", 0) or 0) + float(wr.get("iops", 0) or 0),
+                    start=(datetime.fromtimestamp(start_ms / 1000.0, tz=UTC)
+                           if isinstance(start_ms, int | float) and start_ms > 0 else None),
+                    runtime_s=float(job.get("job_runtime", 0) or 0) / 1000.0))
         return out
 
     def fio_timeseries(self, pod: str) -> list[IopsSample]:
@@ -296,6 +324,320 @@ class ArchiveEvidence:
             return []
         out.sort(key=lambda s: s.offset_s)
         return out
+
+    def nfs_ops(self, pod: str) -> dict[str, int]:
+        p = os.path.join(self.outdir, pod, "nfs-ops.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return {str(k): int(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    def block_samples(self) -> list[BlockSample]:
+        p = os.path.join(self.outdir, "iostat.csv")
+        out: list[BlockSample] = []
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    t = _dt(r.get("ts"))
+                    if not t:
+                        continue
+                    try:
+                        out.append(BlockSample(
+                            ts=t, node=r.get("node", ""), device=r.get("device", ""),
+                            uuid=r.get("uuid", ""),
+                            read_ios=int(r["read_ios"]), read_sectors=int(r["read_sectors"]),
+                            write_ios=int(r["write_ios"]),
+                            write_sectors=int(r["write_sectors"])))
+                    except (KeyError, ValueError):
+                        continue
+        except OSError:
+            return []
+        out.sort(key=lambda b: (b.ts, b.node, b.device))
+        return out
+
+    def reservations_pre(self) -> list[NamespaceReservation]:
+        return self._reservations("reservations-pre.json")
+
+    def reservations_post(self) -> list[NamespaceReservation]:
+        return self._reservations("reservations-post.json")
+
+    def _reservations(self, name: str) -> list[NamespaceReservation]:
+        try:
+            with open(os.path.join(self.outdir, name)) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out = []
+        for n in raw.get("namespaces", []) if isinstance(raw, dict) else []:
+            if not isinstance(n, dict):
+                continue
+            regs = tuple(Registrant(hostid=str(r.get("hostid", "")), rkey=int(r.get("rkey", 0)),
+                                    holder=bool(r.get("holder")))
+                         for r in n.get("registrants") or [] if isinstance(r, dict))
+            out.append(NamespaceReservation(
+                node=str(n.get("node", "")), device=str(n.get("device", "")),
+                uuid=str(n.get("uuid", "")), rtype=int(n.get("rtype", 0)),
+                generation=int(n.get("generation", 0)), registrants=regs))
+        return out
+
+    def nfs_timeline(self) -> list[NfsSample]:
+        p = os.path.join(self.outdir, "nfs-timeline.csv")
+        out: list[NfsSample] = []
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    t = _dt(r.get("ts"))
+                    if t is None:
+                        continue
+                    try:
+                        out.append(NfsSample(
+                            ts=t, instance=r.get("instance", ""), pod=r.get("pod", ""),
+                            container=r.get("container", ""),
+                            layoutget=int(r.get("layoutget") or 0),
+                            read=int(r.get("read") or 0), write=int(r.get("write") or 0),
+                            connects=int(r.get("connects") or 0)))
+                    except ValueError:
+                        continue
+        except OSError:
+            return []
+        out.sort(key=lambda x: (x.ts, x.instance))
+        return out
+
+    def metadata_ops(self) -> list[MetadataOp]:
+        """Every worker's op log, `metadata-<worker>.log`, one JSON object per line. A line
+        that does not parse is skipped: the worker may have been cut off mid-write."""
+        out: list[MetadataOp] = []
+        for p in sorted(glob.glob(os.path.join(self.outdir, "metadata-*.log"))):
+            worker = os.path.basename(p)[len("metadata-"):-len(".log")]
+            for line in self._lines(p):
+                try:
+                    o = json.loads(line)
+                    out.append(MetadataOp(
+                        ts=datetime.fromtimestamp(float(o["t"]), tz=UTC), worker=worker,
+                        op=str(o["op"]), path=str(o.get("path", "")), ok=bool(o["ok"]),
+                        ms=float(o.get("ms") or 0.0), error=str(o.get("err") or "")))
+                except (ValueError, KeyError, TypeError):
+                    continue
+        out.sort(key=lambda o: o.ts)
+        return out
+
+    def metadata_workers(self) -> list[MetadataWorker]:
+        """Each worker's entry in metadata.json: its stop time and its errors."""
+        p = os.path.join(self.outdir, "metadata.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out: list[MetadataWorker] = []
+        for w in raw.get("workers", []) if isinstance(raw, dict) else []:
+            if not isinstance(w, dict) or not w.get("worker"):
+                continue
+            out.append(MetadataWorker(
+                worker=str(w["worker"]), node=str(w.get("node") or ""),
+                stop_at=_dt(w.get("stop_at")), start_error=str(w.get("start_error") or ""),
+                collect_error=str(w.get("collect_error") or "")))
+        return out
+
+    def metadata_checks(self) -> list[MetadataCheck]:
+        p = os.path.join(self.outdir, "metadata.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out: list[MetadataCheck] = []
+        for c in raw.get("checks", []) if isinstance(raw, dict) else []:
+            t = _dt(c.get("ts")) if isinstance(c, dict) else None
+            if t is None:
+                continue
+            out.append(MetadataCheck(
+                ts=t, worker=str(c.get("worker", "")),
+                worker_node=str(c.get("worker_node") or ""),
+                verifier_node=str(c.get("verifier_node") or ""),
+                missing=tuple(str(x) for x in c.get("missing") or []),
+                extra=tuple(str(x) for x in c.get("extra") or []),
+                mismatched=tuple(str(x) for x in c.get("mismatched") or []),
+                error=str(c.get("error") or "")))
+        out.sort(key=lambda c: c.ts)
+        return out
+
+    def conntrack(self) -> list[ConntrackSample]:
+        p = os.path.join(self.outdir, "conntrack.csv")
+        out: list[ConntrackSample] = []
+        try:
+            with open(p, newline="") as fh:
+                for r in csv.DictReader(fh):
+                    t = _dt(r.get("ts"))
+                    if t is None:
+                        continue
+                    try:
+                        out.append(ConntrackSample(
+                            ts=t, node=r.get("node", ""), state=r.get("state", ""),
+                            orig_src=r.get("orig_src", ""),
+                            orig_sport=int(r.get("orig_sport") or 0),
+                            orig_dst=r.get("orig_dst", ""),
+                            orig_dport=int(r.get("orig_dport") or 0),
+                            reply_src=r.get("reply_src", "")))
+                    except ValueError:
+                        continue
+        except OSError:
+            return []
+        out.sort(key=lambda x: (x.ts, x.node))
+        return out
+
+    def versions(self) -> Versions | None:
+        p = os.path.join(self.outdir, "versions.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        images = tuple(DeployedImage(
+            namespace=str(i.get("namespace", "")), pod=str(i.get("pod", "")),
+            container=str(i.get("container", "")), image=str(i.get("image", "")),
+            image_id=str(i.get("image_id", "")))
+            for i in raw.get("images", []) if isinstance(i, dict))
+        nodes = tuple(NodeVersion(
+            node=str(n.get("node", "")), kernel=str(n.get("kernel", "")),
+            os_image=str(n.get("os_image", "")), runtime=str(n.get("runtime", "")),
+            kubelet=str(n.get("kubelet", "")))
+            for n in raw.get("nodes", []) if isinstance(n, dict))
+        return Versions(server=str(raw.get("server", "")), images=images, nodes=nodes)
+
+    def fence(self) -> Fence | None:
+        p = os.path.join(self.outdir, "fence.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        writes = []
+        for w in raw.get("writes", []):
+            t = _dt(w.get("ts")) if isinstance(w, dict) else None
+            if t is not None:
+                writes.append(FenceWrite(ts=t, ok=bool(w.get("ok")),
+                                         detail=str(w.get("detail") or "")))
+        writes.sort(key=lambda w: w.ts)
+        return Fence(
+            victim_node=str(raw.get("victim_node", "")),
+            recaller_node=str(raw.get("recaller_node", "")),
+            claim=str(raw.get("claim", "")),
+            victim_pod=str(raw.get("victim_pod") or ""),
+            recaller_pod=str(raw.get("recaller_pod") or ""),
+            file=str(raw.get("file") or ""),
+            rules=tuple(str(r) for r in raw.get("rules", [])),
+            partitioned=_dt(raw.get("partitioned")), healed=_dt(raw.get("healed")),
+            truncate_issued=_dt(raw.get("truncate_issued")),
+            truncate_returned=_dt(raw.get("truncate_returned")),
+            truncate_timeout_s=float(raw.get("truncate_timeout_s") or 0),
+            truncate_error=str(raw.get("truncate_error") or ""),
+            writes=tuple(writes), error=str(raw.get("error") or ""))
+
+    def restarts(self) -> list[Restart]:
+        p = os.path.join(self.outdir, "restarts.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out = []
+        for r in raw.get("restarts", []) if isinstance(raw, dict) else []:
+            deleted = _dt(r.get("deleted")) if isinstance(r, dict) else None
+            if deleted is None:
+                continue
+            out.append(Restart(target=str(r.get("target", "")), pod=str(r.get("pod", "")),
+                               node=str(r.get("node", "")), deleted=deleted,
+                               ready=_dt(r.get("ready")),
+                               replacement=str(r.get("replacement", "")),
+                               log=str(r.get("log") or ""),
+                               ip=str(r.get("ip") or ""),
+                               replacement_ip=str(r.get("replacement_ip") or "")))
+        out.sort(key=lambda r: r.deleted)
+        return out
+
+    def churn(self) -> list[ChurnPod]:
+        p = os.path.join(self.outdir, "churn.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out = []
+        for c in raw.get("pods", []) if isinstance(raw, dict) else []:
+            created = _dt(c.get("created")) if isinstance(c, dict) else None
+            if created is None:
+                continue
+            rc, gone = c.get("rc"), c.get("gone_s")
+            out.append(ChurnPod(
+                pod=str(c.get("pod", "")), claim=str(c.get("claim", "")),
+                own_volume=bool(c.get("own_volume")), created=created,
+                node=str(c.get("node") or ""), io_started=_dt(c.get("io_started")),
+                finished=_dt(c.get("finished")), deleted=_dt(c.get("deleted")),
+                rc=int(rc) if isinstance(rc, int) else None,
+                pvc_deleted=_dt(c.get("pvc_deleted")), pv=str(c.get("pv") or ""),
+                pv_gone=c.get("pv_gone") if isinstance(c.get("pv_gone"), bool) else None,
+                export_gone=(c.get("export_gone") if isinstance(c.get("export_gone"), bool)
+                             else None),
+                gone_s=float(gone) if isinstance(gone, int | float) else None,
+                error=str(c.get("error") or "")))
+        out.sort(key=lambda c: c.created)
+        return out
+
+    def volume_ops(self) -> list[VolumeOp]:
+        p = os.path.join(self.outdir, "volume-ops.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        out = []
+        for o in raw.get("ops", []) if isinstance(raw, dict) else []:
+            requested = _dt(o.get("requested")) if isinstance(o, dict) else None
+            if requested is None:
+                continue
+
+            def num(key: str, o: dict = o) -> int:
+                v = o.get(key)
+                return int(v) if isinstance(v, int | float) else 0
+
+            timeout = o.get("timeout_s")
+            out.append(VolumeOp(
+                op=str(o.get("op", "")), claim=str(o.get("claim", "")), requested=requested,
+                timeout_s=float(timeout) if isinstance(timeout, int | float) else 0.0,
+                skipped=str(o.get("skipped") or ""), error=str(o.get("error") or ""),
+                target_bytes=num("target_bytes"), capacity_at=_dt(o.get("capacity_at")),
+                client_pod=str(o.get("client_pod") or ""),
+                client_before_b=num("client_before_b"), client_after_b=num("client_after_b"),
+                client_seen_at=_dt(o.get("client_seen_at")),
+                snapshot=str(o.get("snapshot") or ""), marker_md5=str(o.get("marker_md5") or ""),
+                ready_at=_dt(o.get("ready_at")),
+                restore_claim=str(o.get("restore_claim") or ""),
+                restored_at=_dt(o.get("restored_at")),
+                restore_md5=str(o.get("restore_md5") or ""),
+                restore_deleted=_dt(o.get("restore_deleted")),
+                snapshot_deleted=_dt(o.get("snapshot_deleted")),
+                cleanup_error=str(o.get("cleanup_error") or "")))
+        out.sort(key=lambda o: o.requested)
+        return out
+
+    def pnfs_volumes(self) -> list[PnfsVolume]:
+        p = os.path.join(self.outdir, "pnfs.json")
+        try:
+            with open(p) as fh:
+                raw = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return []
+        return [PnfsVolume(claim=v.get("claim", ""), lvol=v.get("lvol", ""),
+                           shared=bool(v.get("shared")), nodes=list(v.get("nodes") or []),
+                           instances=dict(v.get("instances") or {}))
+                for v in raw.get("volumes", []) if isinstance(v, dict)]
 
     def fio_log(self, pod: str) -> Iterator[str]:
         p = os.path.join(self.outdir, pod, "fio.log")
@@ -407,11 +749,20 @@ class ArchiveEvidence:
         return spans
 
     def cluster_uuid(self) -> str:
-        """The run's cluster, from the NQNs it recorded, else from the event log."""
+        """The run's cluster, from the NQNs it recorded, else from its pNFS volumes' handles,
+        else from the event log."""
         for nqn in (self._state.get("nqn_of") or {}).values():
             m = re.search(r"simplyblock:([0-9a-f-]{36}):", str(nqn))
             if m:
                 return m.group(1)
+        try:
+            with open(os.path.join(self.outdir, "pnfs.json")) as fh:
+                volumes = json.load(fh).get("volumes", [])
+        except (OSError, json.JSONDecodeError, AttributeError):
+            volumes = []
+        for v in volumes:
+            if isinstance(v, dict) and v.get("cluster"):
+                return str(v["cluster"])
         p = os.path.join(self.outdir, "test.log")
         if os.path.exists(p):
             try:

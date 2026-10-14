@@ -769,6 +769,34 @@ spec:
                 description: Cluster is the StorageCluster to create. Ignored when
                   ClusterRef is set.
                 properties:
+                  arbitration:
+                    description: |-
+                      Arbitration tunes the two-node arbitration, and is carried to the
+                      cluster's spec.arbitration. Only valid when clusterMode is Dual.
+                    properties:
+                      holdMs:
+                        description: |-
+                          HoldMs is how long a node holds writes after losing its peer before it
+                          acts on its own. It must stay below the hosts' NVMe keep-alive timeout
+                          (5000 ms), or clients fail I/O before the verdict arrives.
+                        format: int32
+                        maximum: 4500
+                        minimum: 500
+                        type: integer
+                      leaseTtlMs:
+                        description: |-
+                          LeaseTtlMs is how long a lease from the arbiter stays valid. It only
+                          matters while a node is holding; a healthy pair is never fenced by a
+                          late renewal.
+                        format: int32
+                        maximum: 10000
+                        minimum: 500
+                        type: integer
+                    type: object
+                    x-kubernetes-validations:
+                    - message: leaseTtlMs must be shorter than holdMs
+                      rule: '!has(self.holdMs) || !has(self.leaseTtlMs) || self.leaseTtlMs
+                        < self.holdMs'
                   backup:
                     description: |-
                       Backup is where this cluster's backups live, and it expands into
@@ -818,6 +846,21 @@ spec:
                     - credentialsSecretRef
                     - endpoint
                     type: object
+                  clusterMode:
+                    default: Standard
+                    description: |-
+                      ClusterMode is how many storage nodes the cluster is built for: Single
+                      runs every erasure-coding scheme on exactly one storage node, each chunk of
+                      a stripe on its own device, so the node needs dataChunks+parityChunks
+                      devices and the parity protects against device failures rather than the
+                      loss of the node; Dual runs 1+1 on exactly two storage nodes; Standard,
+                      the default, keeps every scheme at its usual minimum. It is carried to the
+                      cluster's spec.clusterMode.
+                    enum:
+                    - Single
+                    - Dual
+                    - Standard
+                    type: string
                   containerResources:
                     description: |-
                       ContainerResources sizes the storage-node container, and expands into the
@@ -898,6 +941,12 @@ spec:
                           More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                         type: object
                     type: object
+                  enableArbitration:
+                    description: |-
+                      EnableArbitration turns on the control plane's two-node arbitration, and
+                      is carried to the cluster's spec.enableArbitration. Only valid when
+                      clusterMode is Dual.
+                    type: boolean
                   enableAtomicity4K:
                     description: |-
                       EnableAtomicity4K enforces 4K write atomicity on every device this
@@ -1306,6 +1355,11 @@ spec:
                 - name
                 - vcpuCount
                 type: object
+                x-kubernetes-validations:
+                - message: enableArbitration and arbitration are only valid when clusterMode
+                    is Dual
+                  rule: (has(self.clusterMode) && self.clusterMode == 'Dual') || (!has(self.arbitration)
+                    && !(has(self.enableArbitration) && self.enableArbitration))
               clusterRef:
                 description: |-
                   ClusterRef names an existing StorageCluster this document adds nodes to.
@@ -1824,7 +1878,7 @@ spec:
               what makes the status an audit of the request that ran rather than of whatever
               the object says now. The parameters are consumed several steps apart:
               Preflight reads spec.upgrade.image and Applying writes it, and Draining reads
-              spec.restart.components before Restarting recycles them. An edit in between
+              spec.restart.components before Restarting rolls them. An edit in between
               produces an operation that checked one thing and did another.
 
               What is frozen is each parameter block's presence together with its
@@ -1885,9 +1939,9 @@ spec:
                 properties:
                   components:
                     description: |-
-                      Components names the workloads to recycle. Empty recycles the whole
+                      Components names the workloads to restart. Empty restarts the whole
                       control plane. Naming only components that status.components reports as
-                      non-essential skips the drain, because recycling them interrupts nothing.
+                      non-essential skips the drain, because restarting them interrupts nothing.
                     items:
                       type: string
                     type: array
@@ -2770,8 +2824,11 @@ spec:
     - jsonPath: .spec.volumeRef
       name: Volume
       type: string
-    - jsonPath: .status.mdsNodeName
+    - jsonPath: .status.mdsPodName
       name: MDS
+      type: string
+    - jsonPath: .status.mdsPodName
+      name: MDSPod
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -2885,21 +2942,27 @@ spec:
                 items:
                   type: string
                 type: array
+              assembledBy:
+                description: |-
+                  AssembledBy is the metadata server instance that last assembled this
+                  export: the pod's UID and its runner container's ID. A guest that
+                  restarted, in a new pod or in the same one, has lost its mounts and
+                  exports, so a mismatch with the running instance means the export is
+                  assembled again.
+                type: string
               mdsNodeIP:
                 description: |-
-                  MDSNodeIP is the bound MDS host's own address. Not what a client mounts:
-                  it is what the export's Service's EndpointSlice points at, so a client's
+                  MDSNodeIP is the metadata server pod's IP. Not what a client mounts: it
+                  is what the export's Service's EndpointSlice points at, so a client's
                   mount address (ServiceAddress) does not have to change when this does.
                 type: string
-              mdsNodeName:
+              mdsPodName:
                 description: |-
-                  MDSNodeName is the Kubernetes node serving this export, which is the one
-                  running the csi-node pod that assembled it. It is not a StorageNode: an
-                  MDS reaches the volume over NVMe-oF exactly as a client does, so it need
-                  not hold any storage itself.
+                  MDSPodName is the metadata server pod serving this export, in the
+                  operator's namespace. Empty until the export is bound.
 
-                  The serialization point for one-MDS-per-export: no second host is a
-                  candidate until this field is rewritten.
+                  One metadata server per export: no second one is a candidate until this
+                  field is rewritten.
                 type: string
               message:
                 description: Message is a human-readable note on the current phase.
@@ -4814,13 +4877,160 @@ spec:
               pnfs:
                 description: PNFS configures pNFS support on the node plugin.
                 properties:
-                  enablePNFS:
-                    default: false
+                  mds:
                     description: |-
-                      EnablePNFS gives the node plugin the four host directories an export is
-                      assembled through. It is gated because a plugin not serving exports has
-                      no use for them.
-                    type: boolean
+                      MDS runs the metadata server: one pod per storage cluster, whose QEMU
+                      guest runs the NFS server with its own kernel, so no node runs nfsd,
+                      mounts an export, or needs nfs-utils. The pod needs a node with
+                      /dev/kvm. Unset, no pNFS volume can be exported: its export waits in
+                      Pending until this is set.
+                    properties:
+                      image:
+                        description: |-
+                          Image is the metadata server image: QEMU, the guest kernel, the guest
+                          root filesystem, and the runner. Unset takes the operator's own registry
+                          in the spdkcsi repository, tagged with the operator's tag prefixed
+                          pnfs-mds-, so a deployment that states nothing runs the image belonging
+                          to the operator reconciling it.
+                        pattern: ^($|(quay\.io/simplyblock-io|docker\.io/simplyblock|public\.ecr\.aws/simply-block)/[a-z0-9][a-z0-9._-]*:[a-zA-Z0-9][a-zA-Z0-9._-]*(@sha256:[a-f0-9]{64})?)$
+                        type: string
+                      nodeSelector:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          NodeSelector is merged with the kvm-capable label the pod always
+                          requires.
+                        type: object
+                      resources:
+                        description: |-
+                          Resources are the pod's requests and limits. The guest's vCPUs are the
+                          whole cores the CPU limit covers, at least one, and its memory is the
+                          memory limit less 256Mi for QEMU, so the memory limit has to be at
+                          least 512Mi. A CPU or memory limit left unset defaults to 2 and 2Gi,
+                          and a memory request left unset to 512Mi, or the limit when that is
+                          lower. The guest returns the memory it frees to the node, so the pod
+                          uses about what the guest does.
+                        properties:
+                          claims:
+                            description: |-
+                              Claims lists the names of resources, defined in spec.resourceClaims,
+                              that are used by this container.
+
+                              This field depends on the
+                              DynamicResourceAllocation feature gate.
+
+                              This field is immutable. It can only be set for containers.
+                            items:
+                              description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                              properties:
+                                name:
+                                  description: |-
+                                    Name must match the name of one entry in pod.spec.resourceClaims of
+                                    the Pod where this field is used. It makes that resource available
+                                    inside a container.
+                                  type: string
+                                request:
+                                  description: |-
+                                    Request is the name chosen for a request in the referenced claim.
+                                    If empty, everything from the claim is made available, otherwise
+                                    only the result of this request.
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                          limits:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Limits describes the maximum amount of compute resources allowed.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                          requests:
+                            additionalProperties:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            description: |-
+                              Requests describes the minimum amount of compute resources required.
+                              If Requests is omitted for a container, it defaults to Limits if that is explicitly specified,
+                              otherwise to an implementation-defined value. Requests cannot exceed Limits.
+                              More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+                            type: object
+                        type: object
+                      stateSize:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        default: 1Gi
+                        description: |-
+                          StateSize is the size of the guest's state disk, which holds the NFS
+                          client-recovery database that lets clients reclaim their state after
+                          the pod restarts.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      stateStorageClassName:
+                        description: |-
+                          StateStorageClassName is the storage class of the state disk, which is
+                          always a simplyblock volume so the pod can restart on any worker with
+                          its client-recovery database. A named class must be provisioned by this
+                          driver and must not be a pNFS class. Unset gives each storage cluster a
+                          class of its own, <driver>-<cluster>-pnfs-mds-state, derived from the
+                          cluster's simplyblock class without its QoS caps and reserved for the
+                          state disk by an admission policy. Read only when the metadata server is
+                          first created: a StatefulSet's claim template cannot change afterward.
+                        type: string
+                      tolerations:
+                        description: Tolerations let the pod schedule onto tainted
+                          KVM nodes.
+                        items:
+                          description: |-
+                            The pod this Toleration is attached to tolerates any taint that matches
+                            the triple <key,value,effect> using the matching operator <operator>.
+                          properties:
+                            effect:
+                              description: |-
+                                Effect indicates the taint effect to match. Empty means match all taint effects.
+                                When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                              type: string
+                            key:
+                              description: |-
+                                Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                                If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                              type: string
+                            operator:
+                              description: |-
+                                Operator represents a key's relationship to the value.
+                                Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                                Exists is equivalent to wildcard for value, so that a pod can
+                                tolerate all taints of a particular category.
+                                Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                              type: string
+                            tolerationSeconds:
+                              description: |-
+                                TolerationSeconds represents the period of time the toleration (which must be
+                                of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                                it is not set, which means tolerate the taint forever (do not evict). Zero and
+                                negative values will be treated as 0 (evict immediately) by the system.
+                              format: int64
+                              type: integer
+                            value:
+                              description: |-
+                                Value is the taint value the toleration matches to.
+                                If the operator is Exists, the value should be empty, otherwise just a regular string.
+                              type: string
+                          type: object
+                        type: array
+                    type: object
                 type: object
               sidecarImages:
                 description: |-
@@ -5044,7 +5254,7 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.backupRef
+    - jsonPath: .spec.backupRef.name
       name: Backup
       type: string
     - jsonPath: .spec.action
@@ -5121,21 +5331,50 @@ spec:
                   rule: self == oldSelf
               backupRef:
                 description: |-
-                  BackupRef names the StorageBackup this operation acts on, in this
-                  namespace. Required, since Restore is the only action and every backup in
-                  the store has an object.
-                type: string
+                  BackupRef names the StorageBackup this operation acts on. Its namespace
+                  defaults to this operation's. A backup in another namespace needs the
+                  requesting user to be allowed to read it there.
+                properties:
+                  name:
+                    description: Name is the object's name.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the object's namespace. When it is empty, the namespace of the
+                      object that holds the reference.
+                    maxLength: 63
+                    type: string
+                required:
+                - name
+                type: object
                 x-kubernetes-validations:
                 - message: field is immutable
                   rule: self == oldSelf
               clusterRef:
                 description: |-
-                  ClusterRef names the StorageCluster the operation runs against.
+                  ClusterRef names the StorageCluster the operation runs against. Its
+                  namespace defaults to this operation's. The cluster's StoragePool, which
+                  spec.restore.targetPool names, is read from the cluster's namespace.
 
-                  Bounded at what a StorageCluster name may be, since a longer value names
-                  nothing that can exist.
-                maxLength: 63
-                type: string
+                  A cluster in another namespace needs the requesting user to be allowed to
+                  read it there.
+                properties:
+                  name:
+                    description: Name is the referenced object's name.
+                    maxLength: 63
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace is the object's namespace. When it is empty, the namespace of the
+                      object that holds the reference.
+                    maxLength: 63
+                    type: string
+                required:
+                - name
+                type: object
                 x-kubernetes-validations:
                 - message: field is immutable
                   rule: self == oldSelf
@@ -5167,9 +5406,9 @@ spec:
                       rule: self == oldSelf
                   claimName:
                     description: |-
-                      ClaimName is the PersistentVolumeClaim to create. It must not already
-                      exist: a restore that adopted an existing claim would replace a running
-                      workload's data with the backup's.
+                      ClaimName is the PersistentVolumeClaim to create, in this operation's
+                      namespace. It must not already exist: a restore that adopted an existing
+                      claim would replace a running workload's data with the backup's.
                     type: string
                     x-kubernetes-validations:
                     - message: field is immutable
@@ -5826,39 +6065,55 @@ spec:
           spec:
             description: spec identifies the backup this object reports on
             properties:
-              backupID:
-                description: |-
-                  BackupID is the identifier the store holds the backup under, and what a
-                  restore addresses. It is the store's identifier rather than a name this
-                  operator assigns, so the same backup is the same object however many
-                  clusters have the location configured.
-                type: string
-                x-kubernetes-validations:
-                - message: field is immutable
-                  rule: self == oldSelf
               clusterRef:
                 description: |-
-                  ClusterRef names the StorageCluster whose store this backup was found in.
-                  With BackupID it is the whole of this object's identity.
-
-                  Bounded at what a StorageCluster name may be, since a longer value names
-                  nothing that can exist.
+                  ClusterRef is the StorageCluster that holds this backup. The operator sets
+                  it on a record of an existing backup. Leave it unset when source is set:
+                  the cluster is then the one that provisioned the claim's volume.
                 maxLength: 63
                 type: string
                 x-kubernetes-validations:
                 - message: field is immutable
                   rule: self == oldSelf
-            required:
-            - backupID
-            - clusterRef
+              source:
+                description: |-
+                  Source asks for a new backup of a claim, the way a VolumeSnapshot asks
+                  for a snapshot. It stays after the backup is taken and marks this object
+                  as a request. Leave it unset when clusterRef is set.
+                properties:
+                  claimName:
+                    description: |-
+                      ClaimName is the PersistentVolumeClaim to back up, in this object's own
+                      namespace. It must be bound to a volume this product provisioned.
+                    maxLength: 253
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: field is immutable
+                      rule: self == oldSelf
+                required:
+                - claimName
+                type: object
+                x-kubernetes-validations:
+                - message: field is immutable
+                  rule: self == oldSelf
             type: object
+            x-kubernetes-validations:
+            - message: field clusterRef is immutable once set
+              rule: '!has(oldSelf.clusterRef) || has(self.clusterRef)'
+            - message: field source is immutable once set
+              rule: '!has(oldSelf.source) || has(self.source)'
+            - message: set exactly one of source (to request a backup) or clusterRef
+                (to record one the store holds)
+              rule: has(self.source) != has(self.clusterRef)
           status:
             description: status defines the observed state of StorageBackup
             properties:
               activeOpsRef:
                 description: |-
                   ActiveOpsRef names the StorageBackupOps currently allowed to act on this
-                  backup. Empty when none is running.
+                  backup, as namespace/name when it is in another namespace. Empty when none
+                  is running.
                 type: string
               apiStatus:
                 description: |-
@@ -7088,6 +7343,35 @@ spec:
             description: StorageClusterSpec is the desired state of one simplyblock
               backend cluster.
             properties:
+              arbitration:
+                description: |-
+                  Arbitration tunes the two-node arbitration that enableArbitration turns
+                  on. Omitted values take the arbiter's defaults. Only valid when
+                  clusterMode is Dual.
+                properties:
+                  holdMs:
+                    description: |-
+                      HoldMs is how long a node holds writes after losing its peer before it
+                      acts on its own. It must stay below the hosts' NVMe keep-alive timeout
+                      (5000 ms), or clients fail I/O before the verdict arrives.
+                    format: int32
+                    maximum: 4500
+                    minimum: 500
+                    type: integer
+                  leaseTtlMs:
+                    description: |-
+                      LeaseTtlMs is how long a lease from the arbiter stays valid. It only
+                      matters while a node is holding; a healthy pair is never fenced by a
+                      late renewal.
+                    format: int32
+                    maximum: 10000
+                    minimum: 500
+                    type: integer
+                type: object
+                x-kubernetes-validations:
+                - message: leaseTtlMs must be shorter than holdMs
+                  rule: '!has(self.holdMs) || !has(self.leaseTtlMs) || self.leaseTtlMs
+                    < self.holdMs'
               backup:
                 description: |-
                   Backup is the S3 location this cluster's backups live in, and it is both
@@ -7137,6 +7421,23 @@ spec:
                   once at cluster-add, so an edit moves the next attach onto the named
                   interface.
                 type: string
+              clusterMode:
+                default: Standard
+                description: |-
+                  ClusterMode is how many storage nodes the cluster is built for. Single is
+                  one storage node, created on the control plane non-HA with a single
+                  journal, with every erasure-coding scheme placed across that node's
+                  devices (one chunk of a stripe per device): the node needs
+                  dataChunks+parityChunks devices, and the parity protects against device
+                  failures rather than the loss of the node. Dual is exactly two storage
+                  nodes running 1+1, one copy on each, optionally under the control plane's
+                  two-node arbitration. Standard, the default, is three or more storage
+                  nodes. A cluster cannot be changed to or from Single after it is created.
+                enum:
+                - Single
+                - Dual
+                - Standard
+                type: string
               criticalThreshold:
                 description: CriticalThreshold is the capacity level at which the
                   cluster alarms.
@@ -7184,6 +7485,13 @@ spec:
                   same word twice. There is no DisableVolumeMigration beside it: migration
                   cannot be turned off, since a drain, a rebalance, and a device
                   replacement are all performed by moving volumes.
+                type: boolean
+              enableArbitration:
+                description: |-
+                  EnableArbitration turns on the control plane's two-node arbitration:
+                  nodes hold writes when they lose their peer, and only a node the arbiter
+                  grants may continue alone. Without it a Dual cluster tolerates the loss
+                  of either node without arbitration. Only valid when clusterMode is Dual.
                 type: boolean
               enableAtomicity4K:
                 default: false
@@ -7932,6 +8240,14 @@ spec:
               rule: '!has(oldSelf.deviceClass) || has(self.deviceClass)'
             - message: kms is immutable once set
               rule: '!has(oldSelf.kms) || self.kms == oldSelf.kms'
+            - message: enableArbitration and arbitration are only valid when clusterMode
+                is Dual
+              rule: (has(self.clusterMode) && self.clusterMode == 'Dual') || (!has(self.arbitration)
+                && !(has(self.enableArbitration) && self.enableArbitration))
+            - message: 'clusterMode cannot be changed to or from Single: the control
+                plane fixes it when the cluster is created'
+              rule: (has(self.clusterMode) && self.clusterMode == 'Single') == (has(oldSelf.clusterMode)
+                && oldSelf.clusterMode == 'Single')
             - message: enableAtomicity4K requires enableChecksumValidation to be true
               rule: '!(has(self.enableAtomicity4K) && self.enableAtomicity4K) || (has(self.enableChecksumValidation)
                 && self.enableChecksumValidation)'
@@ -7942,6 +8258,39 @@ spec:
                   ActiveOpsRef names the StorageClusterOps currently allowed to operate on
                   this cluster. Empty when none is running.
                 type: string
+              arbitration:
+                description: |-
+                  ObservedGeneration is the generation the rest of this status was computed
+                  from, so a stale status can be told from a current one.
+                  Arbitration is the two-node arbiter's record as the operator last read
+                  it; set only when spec.enableArbitration is on.
+                properties:
+                  epoch:
+                    description: Epoch is the arbiter's current epoch.
+                    format: int64
+                    type: integer
+                  fencedNodes:
+                    description: |-
+                      FencedNodes are the Kubernetes nodes that carry the storage-fenced taint
+                      on the arbiter's request.
+                    items:
+                      type: string
+                    type: array
+                  message:
+                    description: Message explains why the record could not be read
+                      or applied.
+                    type: string
+                  observedAt:
+                    description: ObservedAt is when the operator last read the arbiter's
+                      record.
+                    format: date-time
+                    type: string
+                  state:
+                    description: |-
+                      State is the arbiter's state: steady, deciding, partitioned, degraded or
+                      healing.
+                    type: string
+                type: object
               clusterName:
                 description: ClusterName is the resolved backend name.
                 type: string
@@ -8019,9 +8368,6 @@ spec:
                 description: NQN is the cluster subsystem qualified name.
                 type: string
               observedGeneration:
-                description: |-
-                  ObservedGeneration is the generation the rest of this status was computed
-                  from, so a stale status can be told from a current one.
                 format: int64
                 type: integer
               phase:
@@ -9991,9 +10337,6 @@ spec:
                   a node that is still being added reads why its own add is failing.
                 type: string
               observedGeneration:
-                description: |-
-                  ObservedGeneration is the generation the rest of this status was computed
-                  from, so a stale status can be told from a current one.
                 format: int64
                 type: integer
               phase:
@@ -10027,6 +10370,42 @@ spec:
                   rpc:
                     description: Rpc is the RPC and management API port.
                     format: int32
+                    type: integer
+                type: object
+              remediation:
+                description: |-
+                  ObservedGeneration is the generation the rest of this status was computed
+                  from, so a stale status can be told from a current one.
+                  Remediation is what Kubernetes knows about this node's host, reported
+                  for the two-node arbiter as positive fencing evidence.
+                properties:
+                  nodeNotReady:
+                    description: |-
+                      NodeNotReady is true when the Kubernetes node's Ready condition is not
+                      True (Node Health Check and remediation act on the same signal).
+                    type: boolean
+                  observedAt:
+                    description: ObservedAt is when the operator last looked at the
+                      node.
+                    format: date-time
+                    type: string
+                  outOfService:
+                    description: |-
+                      OutOfService is true when the Kubernetes node carries the
+                      node.kubernetes.io/out-of-service taint.
+                    type: boolean
+                  reportedFenced:
+                    description: |-
+                      ReportedFenced is the fencing evidence the control plane last accepted
+                      for this node (PUT .../arbitration/remediation): true while the node is
+                      out of service. Unset until the first report succeeds; a failed report
+                      leaves it unchanged, so the next reconcile retries.
+                    type: boolean
+                  storageFencedEpoch:
+                    description: |-
+                      StorageFencedEpoch is the epoch in the storage-fenced taint the operator
+                      set on the node, or zero when the node is not fenced.
+                    format: int64
                     type: integer
                 type: object
               resources:
@@ -12109,6 +12488,34 @@ spec:
                     description: Cluster is the draft's cluster template, with the
                       sizing applied.
                     properties:
+                      arbitration:
+                        description: |-
+                          Arbitration tunes the two-node arbitration, and is carried to the
+                          cluster's spec.arbitration. Only valid when clusterMode is Dual.
+                        properties:
+                          holdMs:
+                            description: |-
+                              HoldMs is how long a node holds writes after losing its peer before it
+                              acts on its own. It must stay below the hosts' NVMe keep-alive timeout
+                              (5000 ms), or clients fail I/O before the verdict arrives.
+                            format: int32
+                            maximum: 4500
+                            minimum: 500
+                            type: integer
+                          leaseTtlMs:
+                            description: |-
+                              LeaseTtlMs is how long a lease from the arbiter stays valid. It only
+                              matters while a node is holding; a healthy pair is never fenced by a
+                              late renewal.
+                            format: int32
+                            maximum: 10000
+                            minimum: 500
+                            type: integer
+                        type: object
+                        x-kubernetes-validations:
+                        - message: leaseTtlMs must be shorter than holdMs
+                          rule: '!has(self.holdMs) || !has(self.leaseTtlMs) || self.leaseTtlMs
+                            < self.holdMs'
                       backup:
                         description: |-
                           Backup is where this cluster's backups live, and it expands into
@@ -12159,6 +12566,21 @@ spec:
                         - credentialsSecretRef
                         - endpoint
                         type: object
+                      clusterMode:
+                        default: Standard
+                        description: |-
+                          ClusterMode is how many storage nodes the cluster is built for: Single
+                          runs every erasure-coding scheme on exactly one storage node, each chunk of
+                          a stripe on its own device, so the node needs dataChunks+parityChunks
+                          devices and the parity protects against device failures rather than the
+                          loss of the node; Dual runs 1+1 on exactly two storage nodes; Standard,
+                          the default, keeps every scheme at its usual minimum. It is carried to the
+                          cluster's spec.clusterMode.
+                        enum:
+                        - Single
+                        - Dual
+                        - Standard
+                        type: string
                       containerResources:
                         description: |-
                           ContainerResources sizes the storage-node container, and expands into the
@@ -12239,6 +12661,12 @@ spec:
                               More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                             type: object
                         type: object
+                      enableArbitration:
+                        description: |-
+                          EnableArbitration turns on the control plane's two-node arbitration, and
+                          is carried to the cluster's spec.enableArbitration. Only valid when
+                          clusterMode is Dual.
+                        type: boolean
                       enableAtomicity4K:
                         description: |-
                           EnableAtomicity4K enforces 4K write atomicity on every device this
@@ -12647,6 +13075,12 @@ spec:
                     - name
                     - vcpuCount
                     type: object
+                    x-kubernetes-validations:
+                    - message: enableArbitration and arbitration are only valid when
+                        clusterMode is Dual
+                      rule: (has(self.clusterMode) && self.clusterMode == 'Dual')
+                        || (!has(self.arbitration) && !(has(self.enableArbitration)
+                        && self.enableArbitration))
                   message:
                     description: |-
                       Message is what the site says about the draft: validation findings while
@@ -13964,6 +14398,14 @@ rules:
   - update
   - watch
 - apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingadmissionpolicies
+  - validatingadmissionpolicybindings
+  verbs:
+  - create
+  - get
+- apiGroups:
   - apiextensions.k8s.io
   resources:
   - customresourcedefinitions
@@ -14027,6 +14469,12 @@ rules:
   - authentication.k8s.io
   resources:
   - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
   verbs:
   - create
 - apiGroups:
@@ -15101,6 +15549,7 @@ webhooks:
     - v1alpha2
     operations:
     - CREATE
+    - UPDATE
     resources:
     - simplyblockdrivers
   sideEffects: None
