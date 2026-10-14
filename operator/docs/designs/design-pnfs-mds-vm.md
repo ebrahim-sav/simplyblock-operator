@@ -166,7 +166,7 @@ The type's full text is in Appendix A. The `MDS` printcolumn shows `mdsPodName`.
 MDS *DriverPNFSMDS `json:"mds,omitempty"`
 ```
 
-`DriverPNFSMDS` carries the image, resources, scheduling constraints, and the state volume's size and class. Its full text is in Appendix B. `MDS` is the only field of `DriverPNFS`. With it unset, an export waits in `Pending` with a `NoMetadataServer` event.
+`DriverPNFSMDS` carries the image, resources, scheduling constraints, the state volume's size and class, and the optional storage data network the pod is attached to (§8.4). Its full text is in Appendix B. `MDS` is the only field of `DriverPNFS`. With it unset, an export waits in `Pending` with a `NoMetadataServer` event.
 
 ---
 
@@ -206,6 +206,8 @@ Kubernetes has no permission for using a StorageClass, so the class is reserved 
 The pod is privileged. The container needs `/dev/kvm` and `/dev/net/tun`, and without a device plugin the only way to open them is the host device nodes through a privileged container. The pod has no `hostNetwork` and no `hostPID`, and it mounts no host directory other than the two device nodes.
 
 Scheduling uses `storage.simplyblock.io/kvm-capable=true`, a node label published by the csi-node plugin from a probe that opens `/dev/kvm` for reading and writing (`AdvertiseKVMCapability`). It follows the VDO probe and shares its publishing step: it runs once at plugin start, stamps its value with `storage.simplyblock.io/kvm-capable-managed-by: auto-detect`, and leaves a hand-set label (one without that annotation) alone, so a golden-image node can assert capability. The pod's `nodeSelector` is that label merged with `spec.pnfs.mds.nodeSelector`, and its tolerations come from `spec.pnfs.mds.tolerations`.
+
+A pod attached to the storage data network (§8.4) also carries a required node affinity on the subnet label of the interface its macvlan sits on, and a preference for nodes without `io.simplyblock.storagenodeset`, the label of a node running a storage node.
 
 A pod that cannot schedule leaves its exports in `Pending`, and the reconciler reads the pod's `PodScheduled` condition to emit the `NoKVMCapableNode` event rather than waiting silently.
 
@@ -346,6 +348,10 @@ The operator's ClusterRole gains:
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // The MDS pod's state disk.
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create
+// The attachment to the storage data network (§8.4): the NetworkAttachmentDefinition,
+// and the nodes whose subnet labels choose its host interface.
+// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;create;update
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 ```
 
 The MDS pod's own ServiceAccount has no Kubernetes permissions. It exists to carry the projected token csi-link authenticates.
@@ -362,7 +368,7 @@ A pod that is terminating or gone has its address withdrawn at once: each bound 
 
 ### 8.2 Inside the pod
 
-The runner creates a bridge with a tap device for the guest and gives the guest a link-local address on it: the bridge is `169.254.100.1/30` and the guest `169.254.100.2`, a subnet that cannot collide with a pod, Service, or node CIDR and stays clear of the cloud metadata address `169.254.169.254`. The pod's own interface is the one carrying the default route, whatever the CNI names it. Inbound traffic to the pod's port 2049 is DNATed to the guest, so nfsd is reachable at the pod IP, and the guest agent's gRPC port is reachable only from the runner on the bridge. Outbound traffic from the guest (NVMe/TCP to the storage cluster) is masqueraded behind the pod IP. The masquerade rule matches only the guest's source address leaving through the pod's interface, so replies to DNATed clients keep their addresses. The runner enables IPv4 forwarding in the pod's network namespace and installs each rule only when it is absent, since a restarted runner container finds the previous one's bridge, tap, and rules in the namespace the pod kept. The technique is `neonvm-runner/cmd/net.go`, without dnsmasq, because the guest's address is static.
+The runner creates a bridge with a tap device for the guest and gives the guest a link-local address on it: the bridge is `169.254.100.1/30` and the guest `169.254.100.2`, a subnet that cannot collide with a pod, Service, or node CIDR and stays clear of the cloud metadata address `169.254.169.254`. The pod's own interface is the one carrying the default route, whatever the CNI names it. Inbound traffic to the pod's port 2049 is DNATed to the guest, so nfsd is reachable at the pod IP, and the guest agent's gRPC port is reachable only from the runner on the bridge. Outbound traffic from the guest (NVMe/TCP to the storage cluster) is masqueraded behind the pod IP, or, in a pod attached to the storage data network, behind the pod's address on that network when it leaves through the attachment (§8.4). Each masquerade rule matches only the guest's source address leaving through one of the pod's own interfaces, so replies to DNATed clients keep their addresses. The runner enables IPv4 forwarding in the pod's network namespace and installs each rule only when it is absent, since a restarted runner container finds the previous one's bridge, tap, and rules in the namespace the pod kept. The technique is `neonvm-runner/cmd/net.go`, without dnsmasq, because the guest's address is static.
 
 Only port 2049 is forwarded. NFSv4.1 needs no portmapper, and `rpc.mountd` and `rpc.statd` serve only earlier protocol versions (Open Question 5). The guest agent's port, TCP 7070, is not forwarded and is reached only by the runner.
 
@@ -371,6 +377,18 @@ Only port 2049 is forwarded. NFSv4.1 needs no portmapper, and `rpc.mountd` and `
 The exports entry lists client addresses. DNAT preserves the source address of a connection, so the guest sees whatever address the pod network delivers, and a node's traffic to a pod is rewritten by the CNI to the node's own address in its pod CIDR: a tunnel address across nodes and a bridge address on the same node, both depending on the CNI. Seen on the lab cluster, every node reached the MDS pod from its pod-network address and never from its InternalIP, so an entry of InternalIPs alone refused every mount with `access denied`.
 
 An export therefore lists each node's pod CIDR (`spec.podCIDRs`) beside its InternalIP. The CIDR covers both of the node's source addresses whichever the CNI uses, and it also admits the node's own pods. Which client moves data through the metadata server is therefore not decided by this entry. The design requires the node plugin to verify after mounting that the client holds a layout, and to refuse a mount whose I/O would route through the MDS (not implemented yet).
+
+### 8.4 Storage data network
+
+A storage node binds its NVMe/TCP listeners to its data interfaces, so the kernel hands a connection to a listener only when it arrives on that interface. A guest connection masqueraded behind the pod IP leaves the pod node through the host's routing table and arrives on the target's data interface, provided the pod's node has forwarding enabled on its own data interface, where the replies come back. Talos and K3s enable forwarding on every interface. OpenShift's OVN-Kubernetes defaults to `ipForwarding: Restricted`, which enables it only on the interfaces it manages, so the replies are dropped and every connection times out. A connection to the pod node's own data address arrives through the CNI's interface instead of the data interface and is refused on every distribution, so a guest never reaches the storage node on its own node through the pod network.
+
+`spec.pnfs.mds.dataNetwork` attaches the pod to the data network itself, through a Multus macvlan on the host interface carrying the data subnet. The guest's NVMe/TCP to that subnet leaves through the macvlan, masqueraded behind the pod's address there, and arrives on the targets' data interfaces without passing through the host's forwarding. The field names the subnet and the address range the pods take on it, which the whereabouts IPAM plugin allocates from. Nothing else in the cluster knows which addresses on the data network are free, so the range is the administrator's.
+
+The host interface is chosen from node labels. The csi-node plugin publishes one label per IPv4 subnet its node's interfaces hold, `subnet.storage.simplyblock.io/<network>_<bits>=<interface>`, at plugin start, and removes the labels of subnets the node no longer has. The operator counts, among the KVM-capable nodes matching `spec.pnfs.mds.nodeSelector`, the interface each carries the subnet on, and takes the most common one, the first by name on a tie. It writes the driver's NetworkAttachmentDefinition, `<driver>-csi-mds-data`, owned by the driver, with a bridge-mode macvlan on that interface and whereabouts over the range. The interface it names is kept while any eligible node still carries it, because choosing another changes the pod template, which restarts the guest. The pod requires that interface on the subnet (§5.4) and prefers a node without a storage node, since a macvlan does not reach its own host's address and the guest would lose the path to that node's storage node. The runner is told the attachment's name in the pod (`--data-interface=net1`), refuses to start when it is missing, and masquerades the guest's traffic leaving through it.
+
+Multus is not part of every distribution, and a driver spec can be shared across clusters. A data network the cluster cannot attach therefore does not hold the metadata server back: without the NetworkAttachmentDefinition kind, or with no eligible node on the subnet, the pod runs on the pod network as it does with the field unset, and each export the metadata server serves gets a `MDSDataNetworkUnavailable` or `NoDataNetworkNode` warning saying why. On OpenShift without the attachment, the nodes have to forward on their data interfaces (`net.ipv4.conf.<data interface>.forwarding=1`) for the guest to reach the storage nodes.
+
+The attachment carries only the guest's storage traffic. NFS clients still reach the metadata server at its pod IP through the export's Service (§8.1), and the DNAT rule matches only the pod network's interface, so nothing is served on the data network. The guest's MTU stays the pod network's.
 
 ---
 
@@ -387,7 +405,9 @@ An export therefore lists each node's pod CIDR (`spec.podCIDRs`) beside its Inte
 | MDS pod's node is lost                                   | Pod stuck `Terminating` until the API server force-deletes                                                          | A second pod is not started while the first is `Terminating`, because it is a StatefulSet. Exports are unserved until it is gone                                              |
 | Control plane unreachable from the runner                | Connection resolution fails                                                                                         | `CreateExport` returns an error and is retried with backoff. A TLS failure is reported as the error, not retried silently                                                     |
 | Control plane refuses the guest's host NQN               | Connect returns an authorization error                                                                              | Assembly fails and times out into `Degraded` after five minutes                                                                                                               |
-| Guest cannot reach the storage cluster over NVMe/TCP     | `nvme connect` fails in the guest                                                                                   | Assembly fails and times out into `Degraded`                                                                                                                                  |
+| Guest cannot reach the storage cluster over NVMe/TCP     | `nvme connect` fails in the guest                                                                                   | Assembly fails and times out into `Degraded`. On the pod network this is a node that does not forward on its data interface (§8.4)                                            |
+| `dataNetwork` set on a cluster without Multus            | No NetworkAttachmentDefinition kind                                                                                 | The pod runs on the pod network. `MDSDataNetworkUnavailable` event on each export                                                                                             |
+| `dataNetwork` set and no eligible node on the subnet     | No KVM-capable node matching the selector carries the subnet label                                                  | The pod runs on the pod network. `NoDataNetworkNode` event on each export                                                                                                     |
 | Reconnect after a restart refused for a stale controller | Connect returns a duplicate host error                                                                              | Assembly retries until the target ages out the old controller. Open Question 4                                                                                                |
 | Image pull fails                                         | Pod `ErrImagePull`                                                                                                  | Exports stay `Pending`. `MDSBootTimeout` event                                                                                                                                |
 | Export deleted while the MDS pod is down                 | No pod, no session                                                                                                  | The finalizer is released, since the guest's mounts left with it (§7.7)                                                                                                       |
@@ -397,7 +417,7 @@ An export therefore lists each node's pod CIDR (`spec.podCIDRs`) beside its Inte
 
 ## 10. Security
 
-The MDS pod is privileged, as csi-node is, but its blast radius differs. The pod holds the host device nodes `/dev/kvm` and `/dev/net/tun` and runs QEMU, and an escape from the guest into the runner is an escape into a privileged container. Nothing in the pod mounts a host directory, uses `hostNetwork`, or uses `hostPID`, so a compromised guest reaches the node only through the runner.
+The MDS pod is privileged, as csi-node is, but its blast radius differs. The pod holds the host device nodes `/dev/kvm` and `/dev/net/tun` and runs QEMU, and an escape from the guest into the runner is an escape into a privileged container. Nothing in the pod mounts a host directory, uses `hostNetwork`, or uses `hostPID`, so a compromised guest reaches the node only through the runner. A pod attached to the storage data network (§8.4) has an interface on that network, so a compromised runner reaches every address on it directly. The guest already reaches every storage node's listeners through the masquerade, so the attachment adds the other hosts on the data network to what the runner can reach, not the targets.
 
 The guest holds no Kubernetes token and no control-plane secret (§6.4). It holds the connection details of the volumes it serves, which are the same details any client of those volumes holds, and the guest's host NQN, which the control plane authorizes per volume.
 
@@ -415,14 +435,16 @@ The `NFSExport` reconciler already emits `MDSSelected`, `NoEligibleMDS`, `NoAllo
 
 Events land on the `NFSExport`, the object a user owns and looks at, and one that outlives the MDS pod whose condition is being reported. When one storage cluster's MDS affects many exports, each export receives the event.
 
-| Event                                                                                             | Type      | Reason                |
-|---------------------------------------------------------------------------------------------------|-----------|-----------------------|
-| No node offers KVM, so the MDS pod cannot be scheduled and the export is waiting                  | `Warning` | `NoKVMCapableNode`    |
-| The MDS pod's state volume has not bound                                                          | `Warning` | `MDSStateUnavailable` |
-| The MDS guest did not answer within the boot deadline                                             | `Warning` | `MDSBootTimeout`      |
-| The MDS pod restarted and its exports were reassembled                                            | `Normal`  | `MDSResynced`         |
-| The MDS pod is terminating or gone, and its address was withdrawn from the export's EndpointSlice | `Normal`  | `MDSAddressWithdrawn` |
-| The MDS pod's address changed and the export's EndpointSlice was repointed                        | `Normal`  | `MDSAddressChanged`   |
+| Event                                                                                             | Type      | Reason                      |
+|---------------------------------------------------------------------------------------------------|-----------|-----------------------------|
+| No node offers KVM, so the MDS pod cannot be scheduled and the export is waiting                  | `Warning` | `NoKVMCapableNode`          |
+| The MDS pod's state volume has not bound                                                          | `Warning` | `MDSStateUnavailable`       |
+| The MDS guest did not answer within the boot deadline                                             | `Warning` | `MDSBootTimeout`            |
+| The MDS pod restarted and its exports were reassembled                                            | `Normal`  | `MDSResynced`               |
+| The MDS pod is terminating or gone, and its address was withdrawn from the export's EndpointSlice | `Normal`  | `MDSAddressWithdrawn`       |
+| The MDS pod's address changed and the export's EndpointSlice was repointed                        | `Normal`  | `MDSAddressChanged`         |
+| `dataNetwork` is set, but the cluster has no NetworkAttachmentDefinition kind (Multus)            | `Warning` | `MDSDataNetworkUnavailable` |
+| `dataNetwork` is set, but no node the MDS pod can run on is attached to its subnet                | `Warning` | `NoDataNetworkNode`         |
 
 ### Prometheus Metrics
 
@@ -631,5 +653,31 @@ type DriverPNFSMDS struct {
 	// class of its own, reserved for the state disk.
 	// +optional
 	StateStorageClassName *string `json:"stateStorageClassName,omitempty"`
+
+	// DataNetwork attaches the pod to the storage data network (§8.4). Unset,
+	// the guest reaches the storage nodes through the pod network.
+	// +optional
+	DataNetwork *DriverPNFSDataNetwork `json:"dataNetwork,omitempty"`
+}
+
+// DriverPNFSDataNetwork is the storage data network the metadata server is
+// attached to, and the addresses it may take on it.
+// +kubebuilder:validation:XValidation:rule="!isCIDR(self.subnet) || !isIP(self.rangeStart) || cidr(self.subnet).containsIP(self.rangeStart)",message="rangeStart must be an address in subnet"
+// +kubebuilder:validation:XValidation:rule="!isCIDR(self.subnet) || !isIP(self.rangeEnd) || cidr(self.subnet).containsIP(self.rangeEnd)",message="rangeEnd must be an address in subnet"
+type DriverPNFSDataNetwork struct {
+	// Subnet is the data network in CIDR form, such as 10.10.10.0/24.
+	// +kubebuilder:validation:XValidation:rule="isCIDR(self) && cidr(self).ip().family() == 4",message="subnet must be an IPv4 CIDR"
+	// +required
+	Subnet string `json:"subnet"`
+
+	// RangeStart is the first address the metadata server pods may take.
+	// +kubebuilder:validation:XValidation:rule="isIP(self) && ip(self).family() == 4",message="rangeStart must be an IPv4 address"
+	// +required
+	RangeStart string `json:"rangeStart"`
+
+	// RangeEnd is the last address the metadata server pods may take.
+	// +kubebuilder:validation:XValidation:rule="isIP(self) && ip(self).family() == 4",message="rangeEnd must be an IPv4 address"
+	// +required
+	RangeEnd string `json:"rangeEnd"`
 }
 ```

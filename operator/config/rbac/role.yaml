@@ -257,6 +257,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - k8s.cni.cncf.io
+  resources:
+  - network-attachment-definitions
+  verbs:
+  - create
+  - get
+  - update
+- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
