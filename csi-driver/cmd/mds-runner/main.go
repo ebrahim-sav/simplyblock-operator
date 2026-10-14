@@ -67,6 +67,10 @@ type config struct {
 	linkCAFile     string
 	linkTokenFile  string
 	podUID         string
+
+	// dataInterface is the pod's attachment to the storage data network, or
+	// empty for a pod on the pod network alone.
+	dataInterface string
 }
 
 func parseFlags() config {
@@ -88,6 +92,8 @@ func parseFlags() config {
 		"Pod CPU limit in millicores (downward API limits.cpu, divisor 1m)")
 	flag.Int64Var(&c.memoryLimitMiB, "memory-limit-mib", envInt("MDS_MEMORY_LIMIT_MIB"),
 		"Pod memory limit in MiB (downward API limits.memory, divisor 1Mi)")
+	flag.StringVar(&c.dataInterface, "data-interface", "",
+		"The pod's interface on the storage data network; the guest's traffic to it leaves through it")
 	flag.BoolVar(&c.vhostNet, "vhost-net", false, "Use vhost-net for the guest NIC; needs /dev/vhost-net")
 	flag.BoolVar(&c.zeroedLayouts, "zeroed-layouts", true,
 		"Zero and write the blocks of a pNFS write layout at allocation, so data a client wrote "+
@@ -161,6 +167,7 @@ func run(ctx context.Context, c config) error {
 		return err
 	}
 	plan := netsetup.DefaultPlan(uplink)
+	plan.DataInterface = c.dataInterface
 	if err := netsetup.Apply(ctx, plan, netsetup.ExecIPTables); err != nil {
 		return err
 	}

@@ -53,7 +53,7 @@ func TestAdvertiseSubnetsLabelsEachInterfaceSubnet(t *testing.T) {
 func TestAdvertiseSubnetsRemovesSubnetsTheNodeLost(t *testing.T) {
 	stale := kube.LabelSubnetPrefix + "10.20.0.0_16"
 	client := kfake.NewSimpleClientset(testNode(map[string]string{
-		stale: "ens17", kube.LabelKVMCapable: "true",
+		stale: "ens17", kube.LabelKVMCapable: vdoCapableTrue,
 	}, nil))
 	read := interfacesOf(inventory.Interface{Name: "ens16np0", Addresses: []string{"10.10.10.247/24"}})
 	if err := advertiseSubnets(context.Background(), client, "node-a", read); err != nil {
@@ -63,7 +63,7 @@ func TestAdvertiseSubnetsRemovesSubnetsTheNodeLost(t *testing.T) {
 	if _, found := labels[stale]; found {
 		t.Errorf("stale label %s still present: %v", stale, labels)
 	}
-	if labels[kube.LabelKVMCapable] != "true" {
+	if labels[kube.LabelKVMCapable] != vdoCapableTrue {
 		t.Errorf("label %s was touched: %v", kube.LabelKVMCapable, labels)
 	}
 }

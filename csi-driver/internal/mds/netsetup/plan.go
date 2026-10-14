@@ -71,6 +71,12 @@ type Plan struct {
 	// it to collide with, and a stable MAC keeps ARP state valid across a
 	// guest restart within the same pod.
 	GuestMAC net.HardwareAddr
+
+	// DataInterface is the pod's attachment to the storage data network, or
+	// empty for a pod on the pod network alone. Its subnet is a connected
+	// route in the pod, so the guest's traffic to the storage nodes leaves
+	// through it rather than the uplink.
+	DataInterface string
 }
 
 // DefaultPlan returns the plan for a pod whose own interface is uplink.
@@ -95,7 +101,7 @@ func (p Plan) GuestAddress() netip.Prefix {
 // applied.
 func (p Plan) Rules() []Rule {
 	nfs := strconv.Itoa(NFSPort)
-	return []Rule{
+	rules := []Rule{
 		// Clients reach nfsd at the pod IP. DNAT rewrites only the
 		// destination, so the guest sees the client's own address.
 		{Table: "nat", Chain: "PREROUTING", Spec: []string{
@@ -109,6 +115,15 @@ func (p Plan) Rules() []Rule {
 			"-s", p.Guest.String() + "/32", "-o", p.Uplink, "-j", "MASQUERADE",
 		}},
 	}
+	if p.DataInterface != "" {
+		// The same for connections to the data network, which leave as the
+		// pod's address there and so arrive at the storage nodes on their data
+		// interfaces, where their listeners are bound.
+		rules = append(rules, Rule{Table: "nat", Chain: "POSTROUTING", Spec: []string{
+			"-s", p.Guest.String() + "/32", "-o", p.DataInterface, "-j", "MASQUERADE",
+		}})
+	}
+	return rules
 }
 
 // noPayloadMax is the longest packet that carries no TCP payload: a 20-byte IP

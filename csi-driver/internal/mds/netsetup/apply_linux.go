@@ -37,6 +37,15 @@ func Apply(ctx context.Context, p Plan, run Runner) error {
 		return fmt.Errorf("enabling IPv4 forwarding: %w", err)
 	}
 
+	// Multus attaches the interface before the container starts. Without it,
+	// the rule for it would match nothing and the guest's traffic to the
+	// storage nodes would leave through the uplink without anything saying so.
+	if p.DataInterface != "" {
+		if _, err := netlink.LinkByName(p.DataInterface); err != nil {
+			return fmt.Errorf("the data network interface %s is missing from the pod: %w", p.DataInterface, err)
+		}
+	}
+
 	bridge, err := ensureBridge(p)
 	if err != nil {
 		return err
