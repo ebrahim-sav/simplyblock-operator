@@ -31,6 +31,8 @@ from sbtest.core import (  # noqa: E402
     FioJob,
     IopsSample,
     LogSpan,
+    MdsInstance,
+    MdsPlacement,
     MetadataCheck,
     MetadataOp,
     MetadataWorker,
@@ -96,6 +98,7 @@ class FakeEvidence:
         metadata_checks: list[MetadataCheck] | None = None,
         metadata_workers: list[MetadataWorker] | None = None,
         volume_ops: list[VolumeOp] | None = None,
+        mds_placement: MdsPlacement | None = None,
     ) -> None:
         self.run_id = run_id
         self.outdir = outdir
@@ -125,6 +128,7 @@ class FakeEvidence:
         self._metadata_checks = metadata_checks or []
         self._metadata_workers = metadata_workers or []
         self._volume_ops = volume_ops or []
+        self._mds_placement = mds_placement
 
     def migrations(self) -> list[Migration]:
         return list(self._migrations)
@@ -149,6 +153,9 @@ class FakeEvidence:
 
     def nvme_controllers(self) -> list[NvmeController]:
         return list(self._ctrls)
+
+    def mds_placement(self) -> MdsPlacement | None:
+        return self._mds_placement
 
     def pods(self) -> list[str]:
         return sorted(set(self._fio_logs) | {j.pod for j in self._jobs} | set(self._series)
@@ -2200,3 +2207,35 @@ class PnfsMultipath(unittest.TestCase):
         ev = FakeEvidence(controllers=self.CLIENTS)
         with self.assertRaises(SkipDetector):
             list(build_detector("pnfs.multipath").detect(ev))
+
+
+def mds_at(pod: str, node: str, start: int, end: int) -> MdsInstance:
+    return MdsInstance(pod=pod, node=node, ip="10.0.0.1", first=ts(start), last=ts(end))
+
+
+class PnfsMdsPlacement(unittest.TestCase):
+    """A run in which the metadata server never ran on a storage node never tested its path
+    to its own node's storage. On Talos the scheduler put it on the control-plane node in
+    every run on disk, and every run passed without that case ever running."""
+
+    STORAGE = ["worker-1", "worker-2"]
+
+    def _found(self, placement: MdsPlacement | None) -> list:
+        return list(build_detector("pnfs.mds-placement").detect(FakeEvidence(mds_placement=placement)))
+
+    def test_no_instance_on_a_storage_node_is_critical(self):
+        placement = MdsPlacement(pinned=False, storage_nodes=self.STORAGE,
+                                 instances=[mds_at("mds-0", "control-plane", 0, 60),
+                                            mds_at("mds-0", "control-plane", 70, 120)])
+        found = [f for f in self._found(placement) if f.severity == Severity.CRITICAL]
+        self.assertEqual([f.subject for f in found], ["placement"])
+
+    def test_one_instance_on_a_storage_node_covers_the_case(self):
+        placement = MdsPlacement(pinned=True, storage_nodes=self.STORAGE,
+                                 instances=[mds_at("mds-0", "control-plane", 0, 60),
+                                            mds_at("mds-0", "worker-2", 70, 120)])
+        self.assertEqual([f for f in self._found(placement) if f.severity != Severity.INFO], [])
+
+    def test_without_a_placement_record_it_skips(self):
+        with self.assertRaises(SkipDetector):
+            self._found(None)

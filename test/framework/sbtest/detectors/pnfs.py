@@ -448,3 +448,38 @@ class Multipath(Detector):
         yield info(self.name, f"{len(guest)} volume(s) attached in the guest, {paths} path(s) each "
                    "expected", subject="coverage",
                    detail=f"{len(guest) - len(short)} with every path, {len(short)} short")
+
+
+@detector
+class MdsPlacementCoverage(Detector):
+    """Whether the metadata server ran on a storage node at least once.
+
+    Its guest reaches the storage nodes on other nodes as a client does, and the one on its
+    own node by another way or not at all. A run in which it never shared a node with a
+    storage node never exercised that, and passing it says nothing about it. On the Talos
+    lab the scheduler preferred the control-plane node, which runs no storage node, in every
+    run on disk.
+    """
+
+    name = "pnfs.mds-placement"
+    summary = "a run in which the metadata server never ran on a storage node"
+
+    def detect(self, ev: Evidence) -> Iterable[Finding]:
+        placement = ev.mds_placement()
+        if placement is None:
+            raise SkipDetector("the run did not record where the metadata server ran "
+                               "(enable the pnfs.mds-placement component)")
+        if not placement.instances:
+            raise SkipDetector("no metadata server instance was seen running")
+        on_storage = [i for i in placement.instances if i.node in placement.storage_nodes]
+        nodes = sorted({i.node for i in placement.instances})
+        if not on_storage:
+            yield critical(
+                self.name, "the metadata server never ran on a storage node", subject="placement",
+                detail=f"{len(placement.instances)} instance(s) on {', '.join(nodes)}; storage nodes: "
+                       f"{', '.join(placement.storage_nodes) or 'none recorded'}",
+                note="Its guest's path to its own node's storage was never exercised. Set "
+                     "pin_to_storage_node on pnfs.mds-placement to run that case on purpose.")
+        yield info(self.name, f"{len(on_storage)} of {len(placement.instances)} metadata server "
+                   f"instance(s) ran on a storage node", subject="placement",
+                   detail=f"nodes: {', '.join(nodes)}; pinned: {placement.pinned}")
