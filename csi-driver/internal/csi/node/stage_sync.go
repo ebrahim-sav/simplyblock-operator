@@ -49,7 +49,9 @@ const (
 // cache: a not-found read on synced caches is an ordinary volume. It fails
 // closed only while the caches have not synced, which is the one window a
 // not-found could be a sync volume the cache has not seen yet (design §6.6).
-func (ns *Server) detectSyncReplication(ctx context.Context, vc map[string]string) (kube.VolumeReplicationRef, bool, error) {
+func (ns *Server) detectSyncReplication(
+	ctx context.Context, vc map[string]string,
+) (kube.VolumeReplicationRef, bool, error) {
 	if ns.syncResolver == nil {
 		// Sync replication is not configured on this node, so every volume stages
 		// as it does today: no lookup, no gate.

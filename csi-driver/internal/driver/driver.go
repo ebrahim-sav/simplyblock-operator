@@ -41,9 +41,9 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog"
 
-	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/conntrack"
 	"github.com/simplyblock/atlas/conntrack/conntrackrpc"
+	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/link"
 	"github.com/simplyblock/atlas/nvme"
 	"github.com/simplyblock/atlas/storage"
@@ -259,7 +259,9 @@ func startLink(ctx context.Context, conf *config.Config) error {
 // every poll, so a single instance means a single PV watch and a single PVC
 // watch. It serves reads from cache once synced and falls back to the API until
 // then, so neither consumer needs a fallback of its own.
-func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface, dynClient dynamic.Interface) (*node.Server, error) {
+func startNodeServer(
+	cd *csicommon.CSIDriver, kubeClient kubernetes.Interface, dynClient dynamic.Interface,
+) (*node.Server, error) {
 	manager := sbkube.NewManager(kubeClient)
 	manager.Start(context.Background())
 
@@ -295,7 +297,9 @@ func startNodeServer(cd *csicommon.CSIDriver, kubeClient kubernetes.Interface, d
 // ordinary, site-unaware path, exactly as before. The informers run for the
 // process lifetime; the node's cache-synced gate holds staging of a sync volume
 // until they have synced.
-func enableSyncReplication(ctx context.Context, ns *node.Server, kubeClient kubernetes.Interface, dynClient dynamic.Interface) {
+func enableSyncReplication(
+	ctx context.Context, ns *node.Server, kubeClient kubernetes.Interface, dynClient dynamic.Interface,
+) {
 	if dynClient == nil || kubeClient == nil {
 		return
 	}

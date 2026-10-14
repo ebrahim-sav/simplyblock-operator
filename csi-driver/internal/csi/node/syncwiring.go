@@ -17,8 +17,8 @@ import (
 	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/lvol"
 
-	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
 	"github.com/simplyblock/csi-driver/internal/clusters"
+	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
 )
 
 // EnableSyncReplication turns on the scheduling-driven switchover for this node
@@ -26,7 +26,9 @@ import (
 // until the informers behind it have synced, and dyn is the client the VR patch
 // uses. The driver calls this only when the cluster carries the VolumeReplication
 // CRD; until it does, every volume stages on the ordinary, site-unaware path.
-func (ns *Server) EnableSyncReplication(resolver *kube.InformerResolver, cachesSynced func() bool, dyn dynamic.Interface) {
+func (ns *Server) EnableSyncReplication(
+	resolver *kube.InformerResolver, cachesSynced func() bool, dyn dynamic.Interface,
+) {
 	ns.syncResolver = resolver
 	ns.syncCachesSynced = cachesSynced
 	ns.syncNodeSite = ns.readNodeSite
