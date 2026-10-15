@@ -1,7 +1,8 @@
 // The mds-proxy as design-pnfs-mds-vm.md §8.5 and §10 need it: on the host's
 // network wherever the metadata server may run, from the metadata server's
-// image, without privilege; the runner told where it is; and the driver
-// reconciler applying it while spec.pnfs.mds is set and removing it after.
+// image, and without privilege. The runner is told where it is, the driver
+// reconciler applies it while spec.pnfs.mds is set and removes it after, and
+// on OpenShift its ServiceAccount may use the hostnetwork-v2 SCC.
 
 package driver
 
@@ -13,7 +14,9 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -22,7 +25,7 @@ import (
 
 func mdsProxy(t *testing.T) *appsv1.DaemonSet {
 	t.Helper()
-	ds, err := MDSProxyDaemonSet(withMDS(testDriver("simplyblock")))
+	ds, err := MDSProxyDaemonSet(withMDS(testDriver("simplyblock")), false)
 	if err != nil {
 		t.Fatalf("MDSProxyDaemonSet: %v", err)
 	}
@@ -47,8 +50,8 @@ func TestTheMDSProxyRunsOnTheHostNetworkWhereverTheMDSMay(t *testing.T) {
 	if !slices.Equal(pod.Tolerations, sts.Spec.Template.Spec.Tolerations) {
 		t.Errorf("tolerations = %v, want the metadata server's %v", pod.Tolerations, sts.Spec.Template.Spec.Tolerations)
 	}
-	if pod.ServiceAccountName != sts.Spec.Template.Spec.ServiceAccountName {
-		t.Errorf("ServiceAccount %q, want the metadata server's %q, which carries no permissions",
+	if pod.ServiceAccountName != "simplyblock-csi-mds-proxy-sa" {
+		t.Errorf("ServiceAccount %q, want the proxy's own, not the metadata server's %q, which links as the MDS",
 			pod.ServiceAccountName, sts.Spec.Template.Spec.ServiceAccountName)
 	}
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
@@ -73,6 +76,13 @@ func TestTheMDSProxyRunsOnTheHostNetworkWhereverTheMDSMay(t *testing.T) {
 	}
 	if !hasHostIPEnv(c.Env) {
 		t.Errorf("env = %v, want HOST_IP from status.hostIP", c.Env)
+	}
+	// Measured at 5Mi carrying six volumes' local paths, and 1-3Mi idle.
+	if mem := c.Resources.Requests[corev1.ResourceMemory]; mem.String() != "16Mi" {
+		t.Errorf("memory request %s, want 16Mi", mem.String())
+	}
+	if mem := c.Resources.Limits[corev1.ResourceMemory]; mem.String() != "256Mi" {
+		t.Errorf("memory limit %s, want 256Mi", mem.String())
 	}
 	if cpu, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
 		t.Errorf("CPU limit %s: the proxy carries a volume path, which a CPU limit would throttle", cpu.String())
@@ -141,30 +151,54 @@ func TestADriverWithAMetadataServerRunsTheProxy(t *testing.T) {
 	if owner := metav1ControllerOf(&ds); owner != d.Name {
 		t.Errorf("owned by %q, want the driver %q, so deleting the driver removes it", owner, d.Name)
 	}
+
+	// The DaemonSet runs before any export has created the metadata server, so
+	// its ServiceAccount has to exist without one.
+	var sa corev1.ServiceAccount
+	key := client.ObjectKey{Namespace: d.Namespace, Name: ds.Spec.Template.Spec.ServiceAccountName}
+	if err := c.Get(context.Background(), key, &sa); err != nil {
+		t.Fatalf("the proxy's ServiceAccount %s: %v", key.Name, err)
+	}
+	if owner := metav1ControllerOf(&sa); owner != d.Name {
+		t.Errorf("ServiceAccount owned by %q, want the driver %q", owner, d.Name)
+	}
+	if sa.AutomountServiceAccountToken == nil || *sa.AutomountServiceAccountToken {
+		t.Error("the proxy's ServiceAccount offers a token to mount")
+	}
 }
 
 func TestADriverWithoutAMetadataServerRemovesTheProxy(t *testing.T) {
 	withProxy := withMDS(testDriver("simplyblock"))
-	stale, err := MDSProxyDaemonSet(withProxy)
+	stale, err := MDSProxyDaemonSet(withProxy, false)
 	if err != nil {
 		t.Fatalf("MDSProxyDaemonSet: %v", err)
 	}
-	if err := setOwnership(withProxy, stale, reconcilerScheme(t)); err != nil {
-		t.Fatalf("setOwnership: %v", err)
+	staleSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Namespace: withProxy.Namespace, Name: stale.Spec.Template.Spec.ServiceAccountName,
+	}}
+	for _, obj := range []client.Object{stale, staleSA} {
+		if err := setOwnership(withProxy, obj, reconcilerScheme(t)); err != nil {
+			t.Fatalf("setOwnership: %v", err)
+		}
 	}
 
 	d := testDriver("simplyblock")
-	c := reconcileDriver(t, d, stale)
+	c := reconcileDriver(t, d, stale, staleSA)
 
 	var ds appsv1.DaemonSet
 	err = c.Get(context.Background(), client.ObjectKeyFromObject(stale), &ds)
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("the proxy DaemonSet is still there (%v) after spec.pnfs.mds was unset", err)
 	}
+	var sa corev1.ServiceAccount
+	err = c.Get(context.Background(), client.ObjectKeyFromObject(staleSA), &sa)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("the proxy's ServiceAccount is still there (%v) after spec.pnfs.mds was unset", err)
+	}
 }
 
 func TestAProxyDaemonSetTheDriverDoesNotOwnIsLeftAlone(t *testing.T) {
-	stale, err := MDSProxyDaemonSet(withMDS(testDriver("simplyblock")))
+	stale, err := MDSProxyDaemonSet(withMDS(testDriver("simplyblock")), false)
 	if err != nil {
 		t.Fatalf("MDSProxyDaemonSet: %v", err)
 	}
@@ -174,6 +208,83 @@ func TestAProxyDaemonSetTheDriverDoesNotOwnIsLeftAlone(t *testing.T) {
 	var ds appsv1.DaemonSet
 	if err := c.Get(context.Background(), client.ObjectKeyFromObject(stale), &ds); err != nil {
 		t.Errorf("a DaemonSet the driver does not own was removed: %v", err)
+	}
+}
+
+// openShiftSCCRole is the ClusterRole OpenShift ships for the hostnetwork-v2
+// SCC, and what tells the reconciler it runs on OpenShift.
+func openShiftSCCRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "system:openshift:scc:hostnetwork-v2"}}
+}
+
+const proxySCCBinding = "simplyblock-csi-mds-proxy-scc-binding"
+
+func proxyContainer(t *testing.T, c client.Client, d *simplyblockv1alpha2.SimplyblockDriver) corev1.Container {
+	t.Helper()
+	var ds appsv1.DaemonSet
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: d.Namespace, Name: "simplyblock-csi-mds-proxy"}, &ds); err != nil {
+		t.Fatalf("the proxy DaemonSet: %v", err)
+	}
+	return ds.Spec.Template.Spec.Containers[0]
+}
+
+// Without the binding, a host-network pod is refused by every SCC a
+// ServiceAccount holds by default, and the DaemonSet gets no pods.
+func TestOnOpenShiftTheProxyMayUseTheHostNetworkSCC(t *testing.T) {
+	d := withMDS(testDriver("simplyblock"))
+	c := reconcileDriver(t, d, openShiftSCCRole())
+
+	var rb rbacv1.RoleBinding
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: d.Namespace, Name: proxySCCBinding}, &rb); err != nil {
+		t.Fatalf("the proxy's SCC RoleBinding: %v", err)
+	}
+	if rb.RoleRef.Kind != "ClusterRole" || rb.RoleRef.Name != "system:openshift:scc:hostnetwork-v2" {
+		t.Errorf("roleRef = %+v, want the hostnetwork-v2 SCC's ClusterRole", rb.RoleRef)
+	}
+	want := rbacv1.Subject{Kind: "ServiceAccount", Name: "simplyblock-csi-mds-proxy-sa", Namespace: d.Namespace}
+	if len(rb.Subjects) != 1 || rb.Subjects[0] != want {
+		t.Errorf("subjects = %+v, want only the proxy's ServiceAccount", rb.Subjects)
+	}
+	if owner := metav1ControllerOf(&rb); owner != d.Name {
+		t.Errorf("RoleBinding owned by %q, want the driver %q", owner, d.Name)
+	}
+
+	// hostnetwork-v2 assigns a user from the namespace's range and refuses
+	// any other.
+	sc := proxyContainer(t, c, d).SecurityContext
+	if sc.RunAsUser != nil {
+		t.Errorf("runAsUser = %d, want it left to the SCC", *sc.RunAsUser)
+	}
+	if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+		t.Error("runAsNonRoot is not set")
+	}
+}
+
+func TestOffOpenShiftTheProxyGetsNoSCCBinding(t *testing.T) {
+	d := withMDS(testDriver("simplyblock"))
+	c := reconcileDriver(t, d)
+
+	var rb rbacv1.RoleBinding
+	err := c.Get(context.Background(), client.ObjectKey{Namespace: d.Namespace, Name: proxySCCBinding}, &rb)
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("an SCC RoleBinding on a cluster without SCCs (%v)", err)
+	}
+	if sc := proxyContainer(t, c, d).SecurityContext; sc.RunAsUser == nil || *sc.RunAsUser != 65534 {
+		t.Errorf("runAsUser = %v, want 65534, which the image's root user needs set", sc.RunAsUser)
+	}
+}
+
+func TestADriverWithoutAMetadataServerRemovesTheSCCBinding(t *testing.T) {
+	withProxy := withMDS(testDriver("simplyblock"))
+	stale := &rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Namespace: withProxy.Namespace, Name: proxySCCBinding}}
+	if err := setOwnership(withProxy, stale, reconcilerScheme(t)); err != nil {
+		t.Fatalf("setOwnership: %v", err)
+	}
+	c := reconcileDriver(t, testDriver("simplyblock"), stale, openShiftSCCRole())
+
+	var rb rbacv1.RoleBinding
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(stale), &rb); !apierrors.IsNotFound(err) {
+		t.Errorf("the SCC RoleBinding is still there (%v) after spec.pnfs.mds was unset", err)
 	}
 }
 
