@@ -1,6 +1,8 @@
 // Unit tests for the sync/async method dispatch read from a
 // VolumeReplicationClass (design-sync-replication-csi-addons.md §5, test plan
-// U-01..U-06). Pure driver logic: no cluster and no backend.
+// U-01..U-04). Pure driver logic: no cluster and no backend. The site is no
+// longer a class parameter (design §5.1): it rides on the VolumeReplication's
+// SyncSiteAnnotation, so resolveMethod resolves only the method.
 package controller
 
 import (
@@ -15,7 +17,6 @@ func TestResolveMethod(t *testing.T) {
 		name       string
 		params     map[string]string
 		wantMethod string
-		wantSite   string
 		wantCode   codes.Code // OK when no error expected
 	}{
 		{ // U-01
@@ -30,17 +31,17 @@ func TestResolveMethod(t *testing.T) {
 			wantMethod: methodAsync,
 			wantCode:   codes.OK,
 		},
-		{ // U-03, U-05
-			name:       "sync with site",
-			params:     map[string]string{methodParam: "sync", siteParam: "site-a"},
+		{ // U-03
+			name:       "explicit sync",
+			params:     map[string]string{methodParam: "sync"},
 			wantMethod: methodSync,
-			wantSite:   "site-a",
 			wantCode:   codes.OK,
 		},
-		{ // U-06
-			name:     "sync without site is InvalidArgument",
-			params:   map[string]string{methodParam: "sync"},
-			wantCode: codes.InvalidArgument,
+		{ // U-03: a stray site parameter is ignored, not read as the method's site
+			name:       "sync ignores a site parameter",
+			params:     map[string]string{methodParam: "sync", siteParam: "site-a"},
+			wantMethod: methodSync,
+			wantCode:   codes.OK,
 		},
 		{ // U-04
 			name:     "unknown method is rejected, not treated as async",
@@ -51,18 +52,15 @@ func TestResolveMethod(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			method, site, err := resolveMethod(tc.params)
+			method, err := resolveMethod(tc.params)
 			if got := status.Code(err); got != tc.wantCode {
 				t.Fatalf("code = %v, want %v (err=%v)", got, tc.wantCode, err)
 			}
 			if tc.wantCode != codes.OK {
-				return // an error case: method/site are not meaningful
+				return // an error case: method is not meaningful
 			}
 			if method != tc.wantMethod {
 				t.Errorf("method = %q, want %q", method, tc.wantMethod)
-			}
-			if site != tc.wantSite {
-				t.Errorf("site = %q, want %q", site, tc.wantSite)
 			}
 		})
 	}

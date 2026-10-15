@@ -56,12 +56,12 @@ type Server struct {
 	syncResolver     syncReplicationResolver
 	syncCachesSynced func() bool
 	// syncNodeSite reads the site of the node this plugin runs on (its zone
-	// label), and syncPatchVR re-points a VolumeReplication at a site's class as
-	// primary (the write half of the switchover, §6.2). Both are seams so staging
-	// is testable without a node object or a dynamic client, and are set together
-	// with syncResolver when sync replication is configured.
+	// label), and syncPatchVR sets a VolumeReplication's sync-site annotation to a
+	// site as primary (the write half of the switchover, §6.2). Both are seams so
+	// staging is testable without a node object or a dynamic client, and are set
+	// together with syncResolver when sync replication is configured.
 	syncNodeSite func(context.Context) (string, error)
-	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, className string) error
+	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error
 	// syncDemote quiesces a sync volume's site as it is unstaged (§6.5), a
 	// site-keyed backend demote. It is a seam for the same reason the others are,
 	// and is best-effort: unstage never fails on it.

@@ -13,6 +13,8 @@ import (
 	"github.com/csi-addons/spec/lib/go/replication"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/simplyblock/atlas/lvol"
 )
 
 func syncParams(site string) map[string]string {
@@ -82,12 +84,18 @@ func TestSyncPromoteMissingSite(t *testing.T) {
 	mock := newMockSBCLI()
 	defer mock.Close()
 	cs := newReplicationTestServer(t, mock)
+	// The volume's VolumeReplication carries no sync-site annotation: the resolver
+	// returns an empty site, and the promote must refuse (FailedPrecondition)
+	// rather than reach the backend without a site (design §5.2).
+	cs.EnableSyncSiteResolution(func(context.Context, lvol.VolumeHandle) (string, error) {
+		return "", nil
+	})
 
 	_, err := cs.PromoteVolume(context.Background(), &replication.PromoteVolumeRequest{
 		VolumeId: testReplVolID, Parameters: map[string]string{methodParam: methodSync},
 	})
-	if got := status.Code(err); got != codes.InvalidArgument {
-		t.Fatalf("code = %v, want InvalidArgument", got)
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", got)
 	}
 	if mock.lastFailoverQuery != "" {
 		t.Errorf("a missing site must not reach the backend, query = %q", mock.lastFailoverQuery)

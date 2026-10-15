@@ -101,9 +101,8 @@ func NewResolver(cfg ResolverConfig) (*InformerResolver, error) {
 	if cfg.VolumeReplicationClasses != nil {
 		if err := cfg.VolumeReplicationClasses.AddIndexers(cache.Indexers{
 			IndexVRClassByName: indexVRClassByName,
-			IndexVRClassBySite: indexVRClassBySite,
 		}); err != nil {
-			return nil, fmt.Errorf("kube: add VolumeReplicationClass indexers: %w", err)
+			return nil, fmt.Errorf("kube: add VolumeReplicationClass indexer: %w", err)
 		}
 	}
 	return &InformerResolver{
@@ -145,9 +144,8 @@ func NewSyncResolver(volumeReplications, volumeReplicationClasses cache.SharedIn
 	}
 	if err := volumeReplicationClasses.AddIndexers(cache.Indexers{
 		IndexVRClassByName: indexVRClassByName,
-		IndexVRClassBySite: indexVRClassBySite,
 	}); err != nil {
-		return nil, fmt.Errorf("kube: add VolumeReplicationClass indexers: %w", err)
+		return nil, fmt.Errorf("kube: add VolumeReplicationClass indexer: %w", err)
 	}
 	return &InformerResolver{vr: volumeReplications, vrClass: volumeReplicationClasses}, nil
 }
@@ -190,6 +188,27 @@ func (r *InformerResolver) PVForClaim(ctx context.Context, claim types.Namespace
 		return nil, fmt.Errorf("pvc %q not bound: %w", claim, errs.ErrNotFound)
 	}
 	return r.pvByName(pvc.Spec.VolumeName)
+}
+
+// VolumeReplicationForVolumeHandle returns the VolumeReplication protecting the
+// volume with backend handle h, resolved through the PV that carries the handle
+// and the PVC it is bound to. It is the controller-side entry point into the
+// VolumeReplication (the node side starts from the PVC identity in the CSI volume
+// context, VolumeReplicationForClaim), so the driver's promote and demote can
+// read the active site (SyncSiteAnnotation) off the object. It returns
+// errs.ErrUnsupported when the resolver lacks the PV or VolumeReplication
+// informer, and errs.ErrNotFound when no PV carries the handle, the PV names no
+// claim, or no VolumeReplication protects that claim.
+func (r *InformerResolver) VolumeReplicationForVolumeHandle(ctx context.Context, h lvol.VolumeHandle) (VolumeReplicationRef, error) {
+	pv, err := r.PVByVolumeHandle(ctx, h)
+	if err != nil {
+		return VolumeReplicationRef{}, err
+	}
+	ref := pv.Spec.ClaimRef
+	if ref == nil || ref.Namespace == "" || ref.Name == "" {
+		return VolumeReplicationRef{}, fmt.Errorf("kube: pv %s for volume %q names no claim: %w", pv.GetName(), h, errs.ErrNotFound)
+	}
+	return r.VolumeReplicationForClaim(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name})
 }
 
 // AttachmentsForPV lists the VolumeAttachments referencing pvName. It

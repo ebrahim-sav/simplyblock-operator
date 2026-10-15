@@ -15,7 +15,6 @@ const (
 	IndexSCByName         = "atlas.simplyblock.io/sc-by-name"
 	IndexVRByClaim        = "atlas.simplyblock.io/vr-by-claim"
 	IndexVRClassByName    = "atlas.simplyblock.io/vrclass-by-name"
-	IndexVRClassBySite    = "atlas.simplyblock.io/vrclass-by-site"
 )
 
 // VolumeHandleKeys returns the index keys for a PV: its CSI volume handle

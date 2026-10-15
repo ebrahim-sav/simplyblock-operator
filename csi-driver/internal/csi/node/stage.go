@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/simplyblock/atlas/bounded"
 	"github.com/simplyblock/atlas/lvm"
 	"github.com/simplyblock/atlas/lvol"
 	"github.com/simplyblock/atlas/nqn"
@@ -219,9 +220,27 @@ func (ns *Server) NodeUnstageVolume(
 	}
 
 	devicePath := volumeContext["devicePath"]
+	disconnectAbandoned := false
 	if err := ns.stack.runner.Down(cleanupCtx, volumeID, plan); err != nil {
-		klog.Errorf("failed to release the stack, volumeID: %s err: %v", volumeID, err)
-		return nil, status.Error(codes.Internal, err.Error())
+		// A disconnect abandoned at its deadline (bounded.Error: the kernel
+		// delete_controller write wedged on a dead fabric) must not wedge the
+		// unstage with it. If it did, the single-writer VolumeAttachment would stay
+		// held on this node and the volume could never attach elsewhere, which is
+		// the move-blocked-at-the-attach-layer failure in design §12. The kernel
+		// operation is stuck, so the device is already non-functional: completing
+		// the unstage releases the attachment and lets the volume move, and the
+		// abandoned controller is reaped by the kernel. Any other release failure
+		// still fails the unstage, so a merely slow or misconfigured path is not
+		// mistaken for a wedged one.
+		var abandoned *bounded.Error
+		if !errors.As(err, &abandoned) {
+			klog.Errorf("failed to release the stack, volumeID: %s err: %v", volumeID, err)
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		klog.Errorf("volume %s: the NVMe-oF disconnect was abandoned at its deadline (%v); "+
+			"completing the unstage so the single-writer attachment releases and the volume "+
+			"can attach elsewhere (design §12), leaving the stuck controller to the kernel", volumeID, err)
+		disconnectAbandoned = true
 	}
 	if devicePath != "" {
 		// A device this node tore down itself is forgotten rather than left to
@@ -229,7 +248,10 @@ func (ns *Server) NodeUnstageVolume(
 		initiator.ForgetDevice(devicePath)
 	}
 
-	if ns.volumeIsBeingDeleted(ctx, volumeID) {
+	// Destroy only after a clean release: destroying the node-local objects of a
+	// stack whose release was abandoned would act on layers that may still be up.
+	// The deleted volume's objects are left for a later unstage or node cleanup.
+	if !disconnectAbandoned && ns.volumeIsBeingDeleted(ctx, volumeID) {
 		// The only caller of Destroy. A volume that is going away for good takes
 		// the node-local objects its stack built with it, because nothing will
 		// stage it again and nothing else on this host knows they are there.

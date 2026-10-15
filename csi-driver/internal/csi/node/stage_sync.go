@@ -24,11 +24,11 @@ import (
 
 // syncReplicationResolver is the narrow slice of the atlas-lib resolver the node
 // plugin needs: the per-PVC lookup of the synchronous VolumeReplication that
-// protects a claim, and the class that names a site. *kube.InformerResolver
-// satisfies it.
+// protects a claim. *kube.InformerResolver satisfies it. The site is carried on
+// the VolumeReplication itself (its SyncSiteAnnotation), not selected from a
+// class, so no class lookup is needed (design §6.2).
 type syncReplicationResolver interface {
 	SyncVolumeReplicationForClaim(ctx context.Context, claim types.NamespacedName) (kube.VolumeReplicationRef, error)
-	VolumeReplicationClassForSite(ctx context.Context, site string) (kube.VolumeReplicationClassRef, error)
 }
 
 // The VolumeReplication spec.replicationState and status.state values the
@@ -84,7 +84,7 @@ func (ns *Server) detectSyncReplication(
 
 // ensureSyncPromoted drives the switchover for a sync-managed volume so it is
 // served on this node's site before the ordinary attach runs (design §6.2-§6.4).
-// It re-points the VolumeReplication at the class that names this node's site, as
+// It sets the VolumeReplication's SyncSiteAnnotation to this node's site, as
 // primary, and then gates: it returns nil only once the controller reports the
 // promote complete, at which point staging falls through to the ordinary attach,
 // which connects to the now-led (this) site. Every other outcome is a retryable
@@ -99,19 +99,13 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 	if err != nil {
 		return status.Errorf(codes.Unavailable, "read this node's site: %v", err)
 	}
-	class, err := ns.syncResolver.VolumeReplicationClassForSite(ctx, site)
-	if errors.Is(err, errs.ErrNotFound) {
-		return status.Errorf(codes.FailedPrecondition,
-			"no sync VolumeReplicationClass names this node's site %q", site)
-	}
-	if err != nil {
-		return status.Errorf(codes.Unavailable, "resolve the sync class for site %q: %v", site, err)
-	}
 
-	// Signal the site: re-point the VolumeReplication at the class that names it,
-	// as primary. Idempotent, so a re-stage after the patch takes the gate below.
-	if vr.ClassName != class.Name || vr.ReplicationState != replicationStatePrimary {
-		if err := ns.syncPatchVR(ctx, vr, class.Name); err != nil {
+	// Signal the site: set the VolumeReplication's sync-site annotation (and
+	// replicationState: primary) to this node's site. A single mutable patch, so
+	// the class never changes. Idempotent, so a re-stage after the patch takes the
+	// gate below.
+	if vr.Site != site || vr.ReplicationState != replicationStatePrimary {
+		if err := ns.syncPatchVR(ctx, vr, site); err != nil {
 			return status.Errorf(codes.Unavailable,
 				"signal site %q onto VolumeReplication %s/%s: %v", site, vr.Namespace, vr.Name, err)
 		}
@@ -119,7 +113,7 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 			"switchover to site %q requested for %s/%s; retrying", site, vr.Namespace, vr.Name)
 	}
 
-	// Already pointed at this site's class: the promote is done when the volume is
+	// Already annotated with this site: the promote is done when the volume is
 	// Primary and the Completed condition is set (design §6.4, §8).
 	if vr.ObservedState == observedStatePrimary && vr.Completed {
 		return nil

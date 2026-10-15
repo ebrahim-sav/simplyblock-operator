@@ -27,6 +27,13 @@ var VolumeReplicationGVR = schema.GroupVersionResource{
 	Resource: "volumereplications",
 }
 
+// SyncSiteAnnotation is the annotation the node plugin sets on a sync
+// VolumeReplication to name the site the volume is served from. The site rides
+// on the object rather than in its (immutable) class, so it can follow the pod
+// (design-sync-replication-csi-addons.md §6.2). The driver's promote and demote
+// read the target site from it.
+const SyncSiteAnnotation = "simplyblock.io/sync-site"
+
 // VolumeReplicationRef is the slice of a VolumeReplication the node plugin acts
 // on: which class names its site, and its current replicationState, plus its own
 // identity. Extracted from the unstructured object so callers never touch the
@@ -41,6 +48,10 @@ type VolumeReplicationRef struct {
 	// Completed condition is true (design §6.4, §8).
 	ObservedState string // status.state (Primary|Secondary|Unknown)
 	Completed     bool   // status.conditions[type=Completed].status == True
+	// Site is the value of the SyncSiteAnnotation: the site the node set this
+	// volume to be served from, which the promote and demote address (design
+	// §6.2). Empty when the annotation is absent.
+	Site string
 }
 
 // VolumeReplicationRefFrom extracts the fields of interest, spec and status, from
@@ -59,6 +70,7 @@ func VolumeReplicationRefFrom(u *unstructured.Unstructured) VolumeReplicationRef
 		ReplicationState: state,
 		ObservedState:    observed,
 		Completed:        conditionTrue(u, "Completed"),
+		Site:             u.GetAnnotations()[SyncSiteAnnotation],
 	}
 }
 

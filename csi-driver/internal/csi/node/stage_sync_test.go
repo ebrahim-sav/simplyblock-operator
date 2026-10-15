@@ -17,12 +17,9 @@ import (
 )
 
 type fakeSyncResolver struct {
-	ref      kube.VolumeReplicationRef
-	err      error
-	last     types.NamespacedName
-	class    kube.VolumeReplicationClassRef
-	classErr error
-	lastSite string
+	ref  kube.VolumeReplicationRef
+	err  error
+	last types.NamespacedName
 }
 
 func (f *fakeSyncResolver) SyncVolumeReplicationForClaim(
@@ -30,13 +27,6 @@ func (f *fakeSyncResolver) SyncVolumeReplicationForClaim(
 ) (kube.VolumeReplicationRef, error) {
 	f.last = claim
 	return f.ref, f.err
-}
-
-func (f *fakeSyncResolver) VolumeReplicationClassForSite(
-	_ context.Context, site string,
-) (kube.VolumeReplicationClassRef, error) {
-	f.lastSite = site
-	return f.class, f.classErr
 }
 
 // claimCtx is the volume context external-provisioner stamps with a PVC's
@@ -111,42 +101,40 @@ func TestDetectSyncReplication(t *testing.T) {
 }
 
 func TestEnsureSyncPromoted(t *testing.T) {
-	siteClass := kube.VolumeReplicationClassRef{Name: "sb-sync-a", Site: "site-a", Method: kube.ReplicationMethodSync}
-
-	// serverFor builds a node whose site is site-a, recording any VR patches.
-	serverFor := func(fr *fakeSyncResolver, patched *[]string) *Server {
+	// serverFor builds a node whose site is site-a, recording the site of any VR
+	// patch the node makes.
+	serverFor := func(patched *[]string) *Server {
 		return &Server{
-			syncResolver:     fr,
 			syncCachesSynced: func() bool { return true },
 			syncNodeSite:     func(context.Context) (string, error) { return "site-a", nil },
-			syncPatchVR: func(_ context.Context, _ kube.VolumeReplicationRef, className string) error {
+			syncPatchVR: func(_ context.Context, _ kube.VolumeReplicationRef, site string) error {
 				if patched != nil {
-					*patched = append(*patched, className)
+					*patched = append(*patched, site)
 				}
 				return nil
 			},
 		}
 	}
 
-	t.Run("not yet pointed at the site: patches and asks for a retry", func(t *testing.T) {
+	t.Run("not yet on the site: patches the annotation and asks for a retry", func(t *testing.T) {
 		var patched []string
-		ns := serverFor(&fakeSyncResolver{class: siteClass}, &patched)
-		// A VR currently on the other site's class.
-		vr := kube.VolumeReplicationRef{Namespace: "app", Name: "vr1", ClassName: "sb-sync-b", ReplicationState: "secondary"}
+		ns := serverFor(&patched)
+		// A VR currently annotated for the other site.
+		vr := kube.VolumeReplicationRef{Namespace: "app", Name: "vr1", Site: "site-b", ReplicationState: "secondary"}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (switch requested)", status.Code(err))
 		}
-		if len(patched) != 1 || patched[0] != "sb-sync-a" {
-			t.Errorf("patched = %v, want [sb-sync-a]", patched)
+		if len(patched) != 1 || patched[0] != "site-a" {
+			t.Errorf("patched = %v, want [site-a]", patched)
 		}
 	})
 
-	t.Run("pointed at the site but promote still converging: retry, no patch", func(t *testing.T) {
+	t.Run("on the site but promote still converging: retry, no patch", func(t *testing.T) {
 		var patched []string
-		ns := serverFor(&fakeSyncResolver{class: siteClass}, &patched)
+		ns := serverFor(&patched)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", ClassName: "sb-sync-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
 			ObservedState: "Secondary", Completed: false,
 		}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
@@ -159,9 +147,9 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	})
 
 	t.Run("Primary but Completed not yet set: still converging, retry", func(t *testing.T) {
-		ns := serverFor(&fakeSyncResolver{class: siteClass}, nil)
+		ns := serverFor(nil)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", ClassName: "sb-sync-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
 			ObservedState: "Primary", Completed: false,
 		}
 		if status.Code(ns.ensureSyncPromoted(context.Background(), vr)) != codes.Unavailable {
@@ -170,9 +158,9 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	})
 
 	t.Run("promoted and complete on this site: proceed", func(t *testing.T) {
-		ns := serverFor(&fakeSyncResolver{class: siteClass}, nil)
+		ns := serverFor(nil)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", ClassName: "sb-sync-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
 			ObservedState: "Primary", Completed: true,
 		}
 		if err := ns.ensureSyncPromoted(context.Background(), vr); err != nil {
@@ -180,17 +168,8 @@ func TestEnsureSyncPromoted(t *testing.T) {
 		}
 	})
 
-	t.Run("no class names this node's site: misconfiguration", func(t *testing.T) {
-		fr := &fakeSyncResolver{classErr: fmt.Errorf("none: %w", errs.ErrNotFound)}
-		ns := serverFor(fr, nil)
-		err := ns.ensureSyncPromoted(context.Background(), kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"})
-		if status.Code(err) != codes.FailedPrecondition {
-			t.Fatalf("code = %v, want FailedPrecondition", status.Code(err))
-		}
-	})
-
 	t.Run("node site unreadable: retryable", func(t *testing.T) {
-		ns := serverFor(&fakeSyncResolver{class: siteClass}, nil)
+		ns := serverFor(nil)
 		ns.syncNodeSite = func(context.Context) (string, error) { return "", fmt.Errorf("node gone") }
 		err := ns.ensureSyncPromoted(context.Background(), kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"})
 		if status.Code(err) != codes.Unavailable {
@@ -199,7 +178,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	})
 
 	t.Run("half-configured seams: internal error", func(t *testing.T) {
-		ns := &Server{syncResolver: &fakeSyncResolver{class: siteClass}, syncCachesSynced: func() bool { return true }}
+		ns := &Server{syncCachesSynced: func() bool { return true }}
 		err := ns.ensureSyncPromoted(context.Background(), kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"})
 		if status.Code(err) != codes.Internal {
 			t.Fatalf("code = %v, want Internal", status.Code(err))

@@ -29,22 +29,22 @@ func TestReadNodeSite(t *testing.T) {
 	}
 }
 
-func TestPatchVolumeReplicationToSite(t *testing.T) {
+func TestPatchVolumeReplicationSite(t *testing.T) {
 	vr := &unstructured.Unstructured{Object: map[string]interface{}{
 		"apiVersion": "replication.storage.openshift.io/v1alpha1",
 		"kind":       "VolumeReplication",
 		"metadata":   map[string]interface{}{"name": "vr1", "namespace": "app"},
 		"spec": map[string]interface{}{
-			"volumeReplicationClass": "sb-sync-b",
-			"replicationState":           "secondary",
-			"dataSource":                 map[string]interface{}{"kind": "PersistentVolumeClaim", "name": "claim1"},
+			"volumeReplicationClass": "sb-sync",
+			"replicationState":       "secondary",
+			"dataSource":             map[string]interface{}{"kind": "PersistentVolumeClaim", "name": "claim1"},
 		},
 	}}
 	dc := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{kube.VolumeReplicationGVR: "VolumeReplicationList"}, vr)
 
-	err := patchVolumeReplicationToSite(context.Background(), dc,
-		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, "sb-sync-a")
+	err := patchVolumeReplicationSite(context.Background(), dc,
+		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, "site-a")
 	if err != nil {
 		t.Fatalf("patch: %v", err)
 	}
@@ -54,12 +54,16 @@ func TestPatchVolumeReplicationToSite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	class, _, _ := unstructured.NestedString(got.Object, "spec", "volumeReplicationClass")
+	site := got.GetAnnotations()[kube.SyncSiteAnnotation]
 	state, _, _ := unstructured.NestedString(got.Object, "spec", "replicationState")
-	if class != "sb-sync-a" || state != "primary" {
-		t.Errorf("after patch: class=%q state=%q, want sb-sync-a/primary", class, state)
+	if site != "site-a" || state != "primary" {
+		t.Errorf("after patch: site=%q state=%q, want site-a/primary", site, state)
 	}
-	// The merge touches only the two fields; the dataSource the admin set stays.
+	// The merge leaves the immutable class and the admin's dataSource untouched.
+	class, _, _ := unstructured.NestedString(got.Object, "spec", "volumeReplicationClass")
+	if class != "sb-sync" {
+		t.Errorf("class was disturbed: %q, want sb-sync", class)
+	}
 	ds, _, _ := unstructured.NestedString(got.Object, "spec", "dataSource", "name")
 	if ds != "claim1" {
 		t.Errorf("dataSource was disturbed: %q, want claim1", ds)

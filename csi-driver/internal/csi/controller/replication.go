@@ -19,6 +19,7 @@ import (
 
 	atlascp "github.com/simplyblock/atlas/controlplane"
 	"github.com/simplyblock/atlas/errs"
+	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/lvol"
 	"github.com/simplyblock/csi-driver/internal/clusters"
 	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
@@ -261,7 +262,7 @@ func (cs *Server) EnableVolumeReplication(
 	ctx context.Context,
 	req *replication.EnableVolumeReplicationRequest,
 ) (*replication.EnableVolumeReplicationResponse, error) {
-	method, _, err := resolveMethod(req.GetParameters())
+	method, err := resolveMethod(req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +343,7 @@ func (cs *Server) DisableVolumeReplication(
 	ctx context.Context,
 	req *replication.DisableVolumeReplicationRequest,
 ) (*replication.DisableVolumeReplicationResponse, error) {
-	method, _, err := resolveMethod(req.GetParameters())
+	method, err := resolveMethod(req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
@@ -449,22 +450,41 @@ func (cs *Server) GetVolumeReplicationInfo(
 // requested -- the split matters because the vendored csi-addons controller
 // auto-escalates ANY FAILED_PRECONDITION from a force=false promote to
 // force=true inline, with no wait-and-retry grace period of its own.
+func (cs *Server) resolveSyncSite(ctx context.Context, h lvol.VolumeHandle) (string, error) {
+	if cs.syncVolumeSite == nil {
+		return "", status.Error(codes.Internal, "sync site resolution is not configured on the controller")
+	}
+	site, err := cs.syncVolumeSite(ctx, h)
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable,
+			"resolve the site of %s from its VolumeReplication: %v", h, err)
+	}
+	if site == "" {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"volume %s carries no %s annotation naming its site", h, kube.SyncSiteAnnotation)
+	}
+	return site, nil
+}
+
 func (cs *Server) PromoteVolume(
 	ctx context.Context,
 	req *replication.PromoteVolumeRequest,
 ) (*replication.PromoteVolumeResponse, error) {
-	method, site, err := resolveMethod(req.GetParameters())
+	method, err := resolveMethod(req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
 	if method == methodSync {
 		if gh, ok := lvol.ParseGroupHandle(lvol.VolumeHandle(volumeIDFrom(req))); ok {
 			// The whole consistency group promotes as one unit (design §13).
+			// Phase-2 transitional: the group's site is read from the class
+			// parameter until it moves to the VolumeGroupReplication annotation
+			// (design §14); the single-volume path below reads the annotation.
 			client, err := clusters.ReplicationClient(ctx, gh.ClusterID)
 			if err != nil {
 				return nil, status.Error(codes.Unavailable, err.Error())
 			}
-			if _, err := client.SyncPromoteGroup(ctx, gh, site, !req.GetForce()); err != nil {
+			if _, err := client.SyncPromoteGroup(ctx, gh, req.GetParameters()[siteParam], !req.GetForce()); err != nil {
 				return nil, classifySyncError(err)
 			}
 			return &replication.PromoteVolumeResponse{}, nil
@@ -472,6 +492,10 @@ func (cs *Server) PromoteVolume(
 		h, err := csicommon.ParseVolumeHandle(volumeIDFrom(req))
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		site, err := cs.resolveSyncSite(ctx, h.Handle())
+		if err != nil {
+			return nil, err
 		}
 		client, err := clusters.ReplicationClient(ctx, h.ClusterID)
 		if err != nil {
@@ -555,18 +579,21 @@ func (cs *Server) DemoteVolume(
 	ctx context.Context,
 	req *replication.DemoteVolumeRequest,
 ) (*replication.DemoteVolumeResponse, error) {
-	method, site, err := resolveMethod(req.GetParameters())
+	method, err := resolveMethod(req.GetParameters())
 	if err != nil {
 		return nil, err
 	}
 	if method == methodSync {
 		if gh, ok := lvol.ParseGroupHandle(lvol.VolumeHandle(volumeIDFrom(req))); ok {
 			// The whole consistency group fences as one unit (design §13).
+			// Phase-2 transitional: the group's site is read from the class
+			// parameter until it moves to the VolumeGroupReplication annotation
+			// (design §14); the single-volume path below reads the annotation.
 			client, err := clusters.ReplicationClient(ctx, gh.ClusterID)
 			if err != nil {
 				return nil, status.Error(codes.Unavailable, err.Error())
 			}
-			if err := client.SyncDemoteGroup(ctx, gh, site); err != nil {
+			if err := client.SyncDemoteGroup(ctx, gh, req.GetParameters()[siteParam]); err != nil {
 				return nil, classifySyncError(err)
 			}
 			return &replication.DemoteVolumeResponse{}, nil
@@ -574,6 +601,10 @@ func (cs *Server) DemoteVolume(
 		h, err := csicommon.ParseVolumeHandle(volumeIDFrom(req))
 		if err != nil {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		site, err := cs.resolveSyncSite(ctx, h.Handle())
+		if err != nil {
+			return nil, err
 		}
 		client, err := clusters.ReplicationClient(ctx, h.ClusterID)
 		if err != nil {
@@ -644,7 +675,7 @@ func (cs *Server) ResyncVolume(
 	ctx context.Context,
 	req *replication.ResyncVolumeRequest,
 ) (*replication.ResyncVolumeResponse, error) {
-	if method, _, err := resolveMethod(req.GetParameters()); err != nil {
+	if method, err := resolveMethod(req.GetParameters()); err != nil {
 		return nil, err
 	} else if method == methodSync {
 		// A sync volume catches up automatically after a desync; there is nothing

@@ -1,7 +1,7 @@
 // The two node-side implementations the driver wires onto a sync-configured
 // node Server (design-sync-replication-csi-addons.md §6.1, §6.2): reading this
-// node's site from its zone label, and re-pointing a VolumeReplication at a
-// site's class. They are kept apart from the stage-time logic in stage_sync.go
+// node's site from its zone label, and setting a VolumeReplication's site
+// annotation. They are kept apart from the stage-time logic in stage_sync.go
 // because they touch the Kubernetes API (a node read and a dynamic-client
 // patch), and because the driver assembles them with the clients it owns.
 package node
@@ -32,8 +32,8 @@ func (ns *Server) EnableSyncReplication(
 	ns.syncResolver = resolver
 	ns.syncCachesSynced = cachesSynced
 	ns.syncNodeSite = ns.readNodeSite
-	ns.syncPatchVR = func(ctx context.Context, vr kube.VolumeReplicationRef, className string) error {
-		return patchVolumeReplicationToSite(ctx, dyn, vr, className)
+	ns.syncPatchVR = func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error {
+		return patchVolumeReplicationSite(ctx, dyn, vr, site)
 	}
 	ns.syncDemote = func(ctx context.Context, h lvol.VolumeHandle, site string) error {
 		cluster, _, _, err := h.Split()
@@ -69,21 +69,25 @@ func (ns *Server) readNodeSite(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("node %s carries no %s zone label", name, csicommon.TopologyKeyZoneStable)
 }
 
-// patchVolumeReplicationToSite re-points a VolumeReplication at the class that
-// names a site, as primary: the write half of the switchover the node performs
-// at stage time (design §6.2). The driver wraps this with its dynamic client
-// into Server.syncPatchVR. The patch is a JSON merge, so it touches only the two
-// fields and leaves the rest of the spec the administrator set.
-func patchVolumeReplicationToSite(
-	ctx context.Context, dyn dynamic.Interface, vr kube.VolumeReplicationRef, className string,
+// patchVolumeReplicationSite sets a VolumeReplication's SyncSiteAnnotation to a
+// site, as primary: the write half of the switchover the node performs at stage
+// time (design §6.2). The driver wraps this with its dynamic client into
+// Server.syncPatchVR. The patch is a JSON merge, so it touches only the
+// annotation and replicationState and leaves the rest of the object, the class
+// included, as the administrator set it. The class is immutable, so the site has
+// to ride on this mutable annotation rather than on the class. A re-apply of the
+// administrator's spec does not carry the annotation, so it does not revert the
+// node's site (design §6.2, co-ownership).
+func patchVolumeReplicationSite(
+	ctx context.Context, dyn dynamic.Interface, vr kube.VolumeReplicationRef, site string,
 ) error {
 	patch := []byte(fmt.Sprintf(
-		`{"spec":{"volumeReplicationClass":%q,"replicationState":%q}}`,
-		className, replicationStatePrimary))
+		`{"metadata":{"annotations":{%q:%q}},"spec":{"replicationState":%q}}`,
+		kube.SyncSiteAnnotation, site, replicationStatePrimary))
 	_, err := dyn.Resource(kube.VolumeReplicationGVR).Namespace(vr.Namespace).
 		Patch(ctx, vr.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
-		return fmt.Errorf("patch VolumeReplication %s/%s to class %s: %w", vr.Namespace, vr.Name, className, err)
+		return fmt.Errorf("patch VolumeReplication %s/%s to site %s: %w", vr.Namespace, vr.Name, site, err)
 	}
 	return nil
 }

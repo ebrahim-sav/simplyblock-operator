@@ -7,6 +7,8 @@ import (
 	"github.com/csi-addons/spec/lib/go/replication"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/simplyblock/atlas/lvol"
 )
 
 const (
@@ -19,7 +21,15 @@ const (
 func newReplicationTestServer(t *testing.T, mock *mockSBCLI) *Server {
 	t.Helper()
 	mock.volumes[testReplVolumeID] = &mockVolume{UUID: testReplVolumeID, Name: "repl-vol", Size: 1 << 30}
-	return newTestControllerServer(t, mock)
+	cs := newTestControllerServer(t, mock)
+	// The single-volume sync verbs read a volume's active site from its
+	// VolumeReplication annotation through this seam (design §5.2); in production
+	// the driver wires a resolver. The default names site-b, the switchover target
+	// the dispatch tests assert; a test exercising a missing annotation overrides it.
+	cs.EnableSyncSiteResolution(func(context.Context, lvol.VolumeHandle) (string, error) {
+		return "site-b", nil
+	})
+	return cs
 }
 
 // replicationSourceFor builds the ReplicationSource the real

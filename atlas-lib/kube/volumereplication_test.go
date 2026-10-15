@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
@@ -13,6 +14,72 @@ import (
 
 	"github.com/simplyblock/atlas/errs"
 )
+
+// withVRSite sets the SyncSiteAnnotation on a VolumeReplication unstructured,
+// the way the node plugin records the active site (design §6.2).
+func withVRSite(u *unstructured.Unstructured, site string) *unstructured.Unstructured {
+	u.SetAnnotations(map[string]string{SyncSiteAnnotation: site})
+	return u
+}
+
+func TestVolumeReplicationRefFromSite(t *testing.T) {
+	plain := VolumeReplicationRefFrom(vrUnstructured("vr1", "app", "claim1", "sb-sync", "primary"))
+	if plain.Site != "" {
+		t.Errorf("no annotation: Site = %q, want empty", plain.Site)
+	}
+	sited := VolumeReplicationRefFrom(withVRSite(vrUnstructured("vr1", "app", "claim1", "sb-sync", "primary"), "site-a"))
+	if sited.Site != "site-a" {
+		t.Errorf("Site = %q, want site-a", sited.Site)
+	}
+}
+
+func TestInformerResolver_VolumeReplicationForVolumeHandle(t *testing.T) {
+	kf := informers.NewSharedInformerFactory(kfake.NewSimpleClientset(), 0)
+	pvInf := kf.Core().V1().PersistentVolumes().Informer()
+	vrInf := newUnstructuredInformer()
+	r, err := NewResolver(ResolverConfig{
+		PersistentVolumes:      pvInf,
+		PersistentVolumeClaims: kf.Core().V1().PersistentVolumeClaims().Informer(),
+		VolumeReplications:     vrInf,
+	})
+	if err != nil {
+		t.Fatalf("NewResolver: %v", err)
+	}
+
+	pv := managedPV("c:p:v", "sb")
+	pv.Name = "pv1"
+	pv.Spec.ClaimRef = &corev1.ObjectReference{Namespace: "app", Name: "claim1"}
+	if err := pvInf.GetStore().Add(pv); err != nil {
+		t.Fatal(err)
+	}
+	if err := vrInf.GetStore().Add(
+		withVRSite(vrUnstructured("vr1", "app", "claim1", "sb-sync", "primary"), "site-b")); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := r.VolumeReplicationForVolumeHandle(context.Background(), "c:p:v")
+	if err != nil {
+		t.Fatalf("VolumeReplicationForVolumeHandle: %v", err)
+	}
+	if got.Name != "vr1" || got.Site != "site-b" {
+		t.Errorf("ref = %+v, want Name=vr1 Site=site-b", got)
+	}
+
+	// A handle no PV carries resolves to ErrNotFound.
+	if _, err := r.VolumeReplicationForVolumeHandle(context.Background(), "no:such:handle"); !errors.Is(err, errs.ErrNotFound) {
+		t.Errorf("missing handle: err = %v, want ErrNotFound", err)
+	}
+
+	// A PV with no claimRef cannot resolve a VolumeReplication.
+	bare := managedPV("d:e:f", "sb")
+	bare.Name = "pv-bare"
+	if err := pvInf.GetStore().Add(bare); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.VolumeReplicationForVolumeHandle(context.Background(), "d:e:f"); !errors.Is(err, errs.ErrNotFound) {
+		t.Errorf("no claimRef: err = %v, want ErrNotFound", err)
+	}
+}
 
 // vrUnstructured builds a VolumeReplication the way a dynamic informer would
 // hand it to the resolver, protecting the named PVC in the same namespace.
@@ -147,10 +214,10 @@ func TestInformerResolver_SyncVolumeReplicationForClaim(t *testing.T) {
 	}
 	// A sync VR: its class carries method sync.
 	add(vrInf, vrUnstructured("vr-sync", "app", "claim-sync", "sb-sync-a", "primary"))
-	add(vrClassInf, vrClassUnstructured("sb-sync-a", DriverName, ReplicationMethodSync, "site-a"))
+	add(vrClassInf, vrClassUnstructured("sb-sync-a", DriverName, ReplicationMethodSync))
 	// An async VR: a VR whose class is async stages as an ordinary volume.
 	add(vrInf, vrUnstructured("vr-async", "app", "claim-async", "sb-async", "primary"))
-	add(vrClassInf, vrClassUnstructured("sb-async", DriverName, "async", ""))
+	add(vrClassInf, vrClassUnstructured("sb-async", DriverName, "async"))
 	// A VR whose class is absent (never resolves to sync).
 	add(vrInf, vrUnstructured("vr-orphan", "app", "claim-orphan", "gone", "primary"))
 

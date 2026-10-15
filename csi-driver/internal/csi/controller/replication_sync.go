@@ -23,41 +23,33 @@ const (
 	// "async" keeps the snapshot-replication path (design-csi-addons-replication.md).
 	// "sync" drives the two-site synchronous backend (sync-replication.md).
 	methodParam = "replication.storage.simplyblock.io/method"
-	// siteParam is the site a sync switchover targets, passed as ?site= on every
-	// sync write route. Required when the method is sync, ignored otherwise.
+	// siteParam is a transitional, Phase-2 bridge: the consistency-group sync
+	// verbs still read the site from the class parameter until it moves to the
+	// VolumeGroupReplication annotation (design §14). The single-volume path takes
+	// the site from the VolumeReplication's SyncSiteAnnotation (design §5.1, §6.2),
+	// not from this parameter.
 	siteParam = "replication.storage.simplyblock.io/site"
 
 	methodAsync = "async"
 	methodSync  = "sync"
 )
 
-// resolveMethod reads the replication method from a class's parameters and, for
-// the sync method, the site. An absent method is async, so every existing class
-// keeps its behavior. A sync method without a site, or an unrecognized method
-// value, is an InvalidArgument the RPC surfaces rather than a silent wrong path
-// (design §5.1, §10).
-func resolveMethod(params map[string]string) (method, site string, err error) {
+// resolveMethod reads the replication method from a class's parameters. An absent
+// method is async, so every existing class keeps its behavior; an unrecognized
+// value is an InvalidArgument the RPC surfaces rather than a silent wrong path.
+// The site is not a class parameter: it rides on the VolumeReplication's
+// SyncSiteAnnotation and the sync write verbs read it from there (design §5.1).
+func resolveMethod(params map[string]string) (method string, err error) {
 	switch params[methodParam] {
 	case "", methodAsync:
-		return methodAsync, "", nil
+		return methodAsync, nil
 	case methodSync:
-		site := params[siteParam]
-		if site == "" {
-			return "", "", errSyncClassMissingSite()
-		}
-		return methodSync, site, nil
+		return methodSync, nil
 	default:
-		return "", "", status.Error(codes.InvalidArgument, fmt.Sprintf(
+		return "", status.Error(codes.InvalidArgument, fmt.Sprintf(
 			"unknown replication method %q (want %q or %q)",
 			params[methodParam], methodAsync, methodSync))
 	}
-}
-
-// errSyncClassMissingSite is the InvalidArgument returned when a sync class
-// omits the required site parameter.
-func errSyncClassMissingSite() error {
-	return status.Error(codes.InvalidArgument, fmt.Sprintf(
-		"sync replication class requires the %q parameter", siteParam))
 }
 
 // classifySyncError maps a sync route's HTTP status onto the gRPC code the

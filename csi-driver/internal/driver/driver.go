@@ -36,6 +36,7 @@ import (
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -45,6 +46,7 @@ import (
 	"github.com/simplyblock/atlas/conntrack/conntrackrpc"
 	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/link"
+	"github.com/simplyblock/atlas/lvol"
 	"github.com/simplyblock/atlas/nvme"
 	"github.com/simplyblock/atlas/storage"
 	"github.com/simplyblock/atlas/storage/storagerpc"
@@ -139,6 +141,10 @@ func Run(conf *config.Config) {
 		if err != nil {
 			klog.Fatalf("failed to create controller server: %s", err)
 		}
+		// The sync write verbs read a volume's active site from its
+		// VolumeReplication annotation (design §5.2, §6.3); wire the resolver that
+		// reads it, when the cluster carries the CRD.
+		enableControllerSyncSite(context.Background(), cs, kubeClient, dynClient)
 		// The membership label is live for the volume's whole life (design
 		// §4.5): a PVC watcher joins a volume when the label is added and
 		// detaches it when the label is removed. Degrades to a logged no-op
@@ -354,6 +360,67 @@ func volumeReplicationCRDPresent(disc discovery.DiscoveryInterface) bool {
 		}
 	}
 	return false
+}
+
+// enableControllerSyncSite wires the resolver the controller's sync write verbs
+// (PromoteVolume, DemoteVolume) use to read a volume's active site from its
+// VolumeReplication's SyncSiteAnnotation (design §5.2, §6.3). Best-effort, like
+// enableSyncReplication on the node: with no client, or on a cluster without the
+// CRD, the seam stays unset and the sync verbs refuse rather than guess a site.
+//
+// The controller needs a full resolver, not the node's sync-only one: it maps a
+// CSI volume handle to its PV, the PV to its claim, and the claim to its
+// VolumeReplication, so it watches PVs and PVCs in addition to VolumeReplications.
+func enableControllerSyncSite(
+	ctx context.Context, cs *controller.Server, kubeClient kubernetes.Interface, dynClient dynamic.Interface,
+) {
+	if dynClient == nil || kubeClient == nil {
+		return
+	}
+	if !volumeReplicationCRDPresent(kubeClient.Discovery()) {
+		klog.Info("sync replication: VolumeReplication CRD absent; controller sync verbs stay site-unaware")
+		return
+	}
+	typed := informers.NewSharedInformerFactory(kubeClient, 0)
+	pv := typed.Core().V1().PersistentVolumes().Informer()
+	pvc := typed.Core().V1().PersistentVolumeClaims().Informer()
+	dynFactory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
+	vr := dynFactory.ForResource(kube.VolumeReplicationGVR).Informer()
+	resolver, err := kube.NewResolver(kube.ResolverConfig{
+		PersistentVolumes:      pv,
+		PersistentVolumeClaims: pvc,
+		VolumeReplications:     vr,
+	})
+	if err != nil {
+		klog.Errorf("sync replication: build controller resolver: %v; sync verbs stay site-unaware", err)
+		return
+	}
+	typed.Start(ctx.Done())
+	dynFactory.Start(ctx.Done())
+	cs.EnableSyncSiteResolution(func(ctx context.Context, h lvol.VolumeHandle) (string, error) {
+		ref, err := resolver.VolumeReplicationForVolumeHandle(ctx, h)
+		if err != nil {
+			return "", err
+		}
+		return ref.Site, nil
+	})
+	klog.Info("sync replication: controller sync verbs read the active site from the VolumeReplication annotation")
+
+	// Report whether the caches actually sync, bounded, without blocking startup,
+	// for the same reason the node path does: a wait that never completes is almost
+	// always a missing controller RBAC, and a loud log names the cause.
+	go func() {
+		wctx, cancel := context.WithTimeout(context.Background(), syncCacheSyncTimeout)
+		defer cancel()
+		if cache.WaitForCacheSync(wctx.Done(), pv.HasSynced, pvc.HasSynced, vr.HasSynced) {
+			klog.Info("sync replication: controller caches synced; site resolution is ready")
+			return
+		}
+		klog.Errorf("sync replication: controller caches did not sync within %s; "+
+			"sync write verbs error until they do "+
+			"(check the controller RBAC for persistentvolumes, persistentvolumeclaims, and volumereplications)",
+			syncCacheSyncTimeout)
+	}()
 }
 
 // advertiseVDOCapability runs once in the background, same as the guardian

@@ -1,8 +1,10 @@
 // The csi-addons VolumeReplicationClass, read as unstructured, so the node plugin
 // can learn whether a VolumeReplication is synchronous (its class's method
-// parameter) and, for the switchover, which site a class names
-// (design-sync-replication-csi-addons.md §5.1, §6.2). The parameter keys are the
-// cross-component contract between the driver's class dispatch and this lookup.
+// parameter) (design-sync-replication-csi-addons.md §5.1, §9.1). The site a sync
+// volume is served from is not a class parameter: it rides on the
+// VolumeReplication's SyncSiteAnnotation, so one site-agnostic class serves both
+// sites. The method parameter key is the cross-component contract between the
+// driver's class dispatch and this lookup.
 package kube
 
 import (
@@ -16,11 +18,9 @@ import (
 )
 
 const (
-	// ReplicationMethodParam selects the replication backend a class drives, and
-	// ReplicationSiteParam is the site a sync switchover targets. They are read
-	// from a VolumeReplicationClass's spec.parameters.
+	// ReplicationMethodParam selects the replication backend a class drives. It is
+	// read from a VolumeReplicationClass's spec.parameters.
 	ReplicationMethodParam = "replication.storage.simplyblock.io/method"
-	ReplicationSiteParam   = "replication.storage.simplyblock.io/site"
 	// ReplicationMethodSync is the method value that marks a synchronous class.
 	ReplicationMethodSync = "sync"
 )
@@ -34,12 +34,11 @@ var VolumeReplicationClassGVR = schema.GroupVersionResource{
 }
 
 // VolumeReplicationClassRef is the slice of a VolumeReplicationClass the node
-// plugin reads: its provisioner, and the method and site its parameters carry.
+// plugin reads: its provisioner, and the method its parameters carry.
 type VolumeReplicationClassRef struct {
 	Name        string
 	Provisioner string
 	Method      string // parameters[ReplicationMethodParam]
-	Site        string // parameters[ReplicationSiteParam]
 }
 
 // IsSync reports whether the class drives the synchronous backend.
@@ -57,7 +56,6 @@ func VolumeReplicationClassRefFrom(u *unstructured.Unstructured) VolumeReplicati
 		Name:        u.GetName(),
 		Provisioner: prov,
 		Method:      params[ReplicationMethodParam],
-		Site:        params[ReplicationSiteParam],
 	}
 }
 
@@ -83,49 +81,6 @@ func indexVRClassByName(obj interface{}) ([]string, error) {
 		return nil, nil
 	}
 	return VolumeReplicationClassNameKeys(u), nil
-}
-
-// VolumeReplicationClassSiteKeys returns the index key for a
-// VolumeReplicationClass: the site it names, when the class is this driver's and
-// synchronous and carries a site. This is what lets the node plugin find the
-// class that names its node's site to re-point a VolumeReplication at
-// (design §6.2). An async or foreign class gets no key.
-func VolumeReplicationClassSiteKeys(u *unstructured.Unstructured) []string {
-	ref := VolumeReplicationClassRefFrom(u)
-	if ref.Provisioner != DriverName || !ref.IsSync() || ref.Site == "" {
-		return nil
-	}
-	return []string{ref.Site}
-}
-
-// indexVRClassBySite adapts VolumeReplicationClassSiteKeys to cache.IndexFunc.
-func indexVRClassBySite(obj interface{}) ([]string, error) {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return nil, nil
-	}
-	return VolumeReplicationClassSiteKeys(u), nil
-}
-
-// VolumeReplicationClassForSite returns the synchronous VolumeReplicationClass
-// that names site, which the node plugin re-points a VolumeReplication at so the
-// switchover targets the pod's site (design §6.2). It returns errs.ErrNotFound
-// when no sync class names the site, and errs.ErrUnsupported when the resolver
-// has no VolumeReplicationClass informer.
-func (r *InformerResolver) VolumeReplicationClassForSite(ctx context.Context, site string) (VolumeReplicationClassRef, error) {
-	if r.vrClass == nil {
-		return VolumeReplicationClassRef{}, fmt.Errorf("kube: no VolumeReplicationClass informer configured: %w", errs.ErrUnsupported)
-	}
-	objs, err := r.vrClass.GetIndexer().ByIndex(IndexVRClassBySite, site)
-	if err != nil {
-		return VolumeReplicationClassRef{}, fmt.Errorf("kube: index VolumeReplicationClass by site %q: %w", site, err)
-	}
-	for _, o := range objs {
-		if u, ok := o.(*unstructured.Unstructured); ok {
-			return VolumeReplicationClassRefFrom(u), nil
-		}
-	}
-	return VolumeReplicationClassRef{}, fmt.Errorf("kube: no sync VolumeReplicationClass names site %q: %w", site, errs.ErrNotFound)
 }
 
 // VolumeReplicationClassByName returns the VolumeReplicationClass named name, or
