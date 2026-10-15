@@ -13,11 +13,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/klog"
 
 	"github.com/simplyblock/atlas/errs"
 	"github.com/simplyblock/atlas/kube"
-	"github.com/simplyblock/atlas/lvol"
 
 	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
 )
@@ -120,34 +118,4 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 	}
 	return status.Errorf(codes.Unavailable,
 		"promote of %s/%s on site %q is converging; retrying", vr.Namespace, vr.Name, site)
-}
-
-// demoteSyncOnUnstage quiesces a sync-managed volume's site as it is unstaged
-// (design §6.5): a site-keyed demote, so an idle volume whose pod is gone does
-// not linger as the led site. It is best-effort and never fatal — unstage must
-// free the volume regardless, the switch's own fencing on the next promote
-// already covers correctness, and a demote of a not-served volume is a backend
-// no-op. It does nothing when sync replication is not configured or the volume
-// is not sync-managed.
-func (ns *Server) demoteSyncOnUnstage(ctx context.Context, volumeID string, vc map[string]string) {
-	if ns.syncResolver == nil || ns.syncDemote == nil || ns.syncNodeSite == nil {
-		return
-	}
-	_, isSync, err := ns.detectSyncReplication(ctx, vc)
-	if err != nil {
-		klog.Warningf("sync unstage %s: cannot determine membership, skipping demote: %v", volumeID, err)
-		return
-	}
-	if !isSync {
-		return
-	}
-	site, err := ns.syncNodeSite(ctx)
-	if err != nil {
-		klog.Warningf("sync unstage %s: cannot read this node's site, skipping demote: %v", volumeID, err)
-		return
-	}
-	if err := ns.syncDemote(ctx, lvol.VolumeHandle(volumeID), site); err != nil {
-		klog.Warningf("sync unstage %s: demote on site %q failed (harmless; the next promote fences): %v",
-			volumeID, site, err)
-	}
 }

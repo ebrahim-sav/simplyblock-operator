@@ -210,10 +210,6 @@ func (ns *Server) NodeUnstageVolume(
 		return &csi.NodeUnstageVolumeResponse{}, nil
 	}
 
-	// A sync-managed volume's site is quiesced as its device goes away (design
-	// §6.5). Best-effort: it never blocks the teardown below.
-	ns.demoteSyncOnUnstage(cleanupCtx, volumeID, volumeContext)
-
 	plan, err := ns.teardownPlan(ctx, volumeID, stagingTargetPath, volumeContext)
 	if err != nil {
 		// Idempotency (CSI spec): if the volume is no longer staged at the target

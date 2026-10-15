@@ -15,9 +15,7 @@ import (
 	"k8s.io/client-go/dynamic"
 
 	"github.com/simplyblock/atlas/kube"
-	"github.com/simplyblock/atlas/lvol"
 
-	"github.com/simplyblock/csi-driver/internal/clusters"
 	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
 )
 
@@ -34,17 +32,6 @@ func (ns *Server) EnableSyncReplication(
 	ns.syncNodeSite = ns.readNodeSite
 	ns.syncPatchVR = func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error {
 		return patchVolumeReplicationSite(ctx, dyn, vr, site)
-	}
-	ns.syncDemote = func(ctx context.Context, h lvol.VolumeHandle, site string) error {
-		cluster, _, _, err := h.Split()
-		if err != nil {
-			return err
-		}
-		client, err := clusters.ReplicationClient(ctx, cluster.String())
-		if err != nil {
-			return err
-		}
-		return client.SyncDemote(ctx, h, site)
 	}
 }
 

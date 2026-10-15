@@ -62,10 +62,6 @@ type Server struct {
 	// together with syncResolver when sync replication is configured.
 	syncNodeSite func(context.Context) (string, error)
 	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error
-	// syncDemote quiesces a sync volume's site as it is unstaged (§6.5), a
-	// site-keyed backend demote. It is a seam for the same reason the others are,
-	// and is best-effort: unstage never fails on it.
-	syncDemote func(ctx context.Context, h lvol.VolumeHandle, site string) error
 }
 
 // New builds the node service. It performs no I/O and starts nothing: the

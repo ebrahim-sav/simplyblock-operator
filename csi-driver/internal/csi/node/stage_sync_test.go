@@ -11,7 +11,6 @@ import (
 
 	"github.com/simplyblock/atlas/errs"
 	"github.com/simplyblock/atlas/kube"
-	"github.com/simplyblock/atlas/lvol"
 
 	csicommon "github.com/simplyblock/csi-driver/internal/csi/common"
 )
@@ -186,67 +185,6 @@ func TestEnsureSyncPromoted(t *testing.T) {
 		err := ns.ensureSyncPromoted(context.Background(), kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"})
 		if status.Code(err) != codes.Internal {
 			t.Fatalf("code = %v, want Internal", status.Code(err))
-		}
-	})
-}
-
-func TestDemoteSyncOnUnstage(t *testing.T) {
-	synced := func() bool { return true }
-
-	// demoted records the (handle, site) a demote landed on, or stays empty.
-	serverFor := func(fr *fakeSyncResolver, demoteErr error, demoted *[]string) *Server {
-		return &Server{
-			syncResolver:     fr,
-			syncCachesSynced: synced,
-			syncNodeSite:     func(context.Context) (string, error) { return testSiteA, nil },
-			syncDemote: func(_ context.Context, h lvol.VolumeHandle, site string) error {
-				if demoted != nil {
-					*demoted = append(*demoted, string(h)+"@"+site)
-				}
-				return demoteErr
-			},
-		}
-	}
-
-	t.Run("sync volume: demotes this node's site", func(t *testing.T) {
-		var demoted []string
-		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, nil, &demoted)
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
-		if len(demoted) != 1 || demoted[0] != "c:p:v@site-a" {
-			t.Errorf("demoted = %v, want [c:p:v@site-a]", demoted)
-		}
-	})
-
-	t.Run("ordinary volume: no demote", func(t *testing.T) {
-		var demoted []string
-		ns := serverFor(&fakeSyncResolver{err: fmt.Errorf("none: %w", errs.ErrNotFound)}, nil, &demoted)
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
-		if len(demoted) != 0 {
-			t.Errorf("an ordinary volume must not be demoted, demoted = %v", demoted)
-		}
-	})
-
-	t.Run("sync not configured: no-op, no panic", func(t *testing.T) {
-		(&Server{}).demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
-	})
-
-	t.Run("detection error: skips demote (best-effort)", func(t *testing.T) {
-		var demoted []string
-		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, nil, &demoted)
-		ns.syncCachesSynced = func() bool { return false } // not synced -> detection returns retryable error
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
-		if len(demoted) != 0 {
-			t.Errorf("an undetermined volume must not be demoted, demoted = %v", demoted)
-		}
-	})
-
-	t.Run("demote error is swallowed (best-effort, never fatal)", func(t *testing.T) {
-		var demoted []string
-		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, fmt.Errorf("backend down"), &demoted)
-		// Must not panic or surface the error; unstage proceeds regardless.
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
-		if len(demoted) != 1 {
-			t.Errorf("the demote should have been attempted once, demoted = %v", demoted)
 		}
 	})
 }
