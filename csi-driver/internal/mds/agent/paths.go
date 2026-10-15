@@ -49,7 +49,7 @@ type ReconcileFunc func(ctx context.Context, conn lvol.Connection, hostNQN strin
 type PathKeeper struct {
 	Reconcile ReconcileFunc
 	Log       Logger
-	// Concurrency is how many subsystems a tick reconciles at once; zero is
+	// Concurrency is how many subsystems a tick reconciles at once. Zero is
 	// DefaultPathConcurrency.
 	Concurrency int
 
