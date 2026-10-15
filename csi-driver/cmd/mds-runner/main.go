@@ -281,14 +281,21 @@ func linkWhenReady(ctx context.Context, c config, sup *runner.Supervisor, agentA
 		klog.Errorf("guest agent client for %s: %v", agentAddress, err)
 		return
 	}
-	exports, err := nfsexportrpc.NewServer(relay.Relay{
-		Guest:   nfsexportrpc.Remote(guest),
-		Resolve: nfsexport.PublishedConnection,
-	})
+	// The tracker hands the guest a volume's new endpoints when the control
+	// plane publishes it elsewhere. The guest reconnects missing paths itself.
+	tracker := &relay.Tracker{
+		Relay: relay.Relay{
+			Guest:   nfsexportrpc.Remote(guest),
+			Resolve: nfsexport.PublishedConnection,
+		},
+		Log: klog.Infof,
+	}
+	exports, err := nfsexportrpc.NewServer(tracker)
 	if err != nil {
 		klog.Errorf("export relay: %v", err)
 		return
 	}
+	go tracker.Run(ctx, relay.DefaultTrackInterval)
 	if _, err := csilink.Start(ctx, csilink.Config{
 		HubAddress:   c.linkHubAddress,
 		CAFile:       c.linkCAFile,
