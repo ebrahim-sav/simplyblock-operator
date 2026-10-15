@@ -107,6 +107,7 @@ File: `csi-driver/internal/csi/node/stage_sync_test.go` and `syncwiring_test.go`
 | U-48     | A `NodeUnstageVolume` whose NVMe-oF disconnect is abandoned at its deadline (`bounded.Error`; the disconnect itself is bounded in `atlas-lib/bounded`) still completes, releasing the single-writer attachment so the volume can attach elsewhere, rather than failing with `Internal` (§12) | Boundary   | TestUnstageCompletesWhenTheDisconnectIsAbandoned       |
 | U-49     | `NodeUnstageVolume` identifies the volume's namespace from the stack record when the stashed volume context is missing, so the teardown completes instead of erroring (§12)                                                                                                                  | Regression | TestTeardownConnectionNamesTheSubsystemFromTheRecord   |
 | U-50     | A `NodeUnstageVolume` whose release fails for any reason other than a bounded-out abandonment still fails, so a slow or misconfigured path is not mistaken for a wedged one (§12)                                                                                                            | Negative   | TestUnstageStillFailsOnAnOrdinaryDownError             |
+| U-51     | A `NodeUnstageVolume` for a volume no longer staged at the target path (staging directory removed; no stash, no record, nothing the host can name) is a completed no-op per the CSI spec, not an `Internal` that wedges the external-attacher's detach and blocks the volume moving (§12)    | Regression | TestUnstageIsIdempotentWhenNothingIsStaged             |
 
 ### Misconfiguration and transport (§11, §12)
 
@@ -207,14 +208,14 @@ The consistency-group variant (design §14). A planned block: the type of each s
 
 | Class                 | Scenarios | Covered | Not covered |
 |-----------------------|-----------|---------|-------------|
-| Unit (`U-`)           | 43        | 41      | 2           |
+| Unit (`U-`)           | 44        | 42      | 2           |
 | Integration (`I-`)    | 15        | 1       | 14          |
 | End-to-end (`E-`)     | 5         | 0       | 5           |
 | Group, Phase 2 (`G-`) | 5         | 0       | 5           |
 | Manual (`M-`)         | 1         | 0       | 1           |
-| **Total**             | **69**    | **42**  | **27**      |
+| **Total**             | **70**    | **43**  | **27**      |
 
-The method dispatch and sync write verbs including the edge cases (`U-01`–`U-20`), the status read (`U-25`, `U-26`), the baseline node-stage path with the gate and demote-on-unstage (`U-27`, `U-30`, `U-32`–`U-35`, `U-37`, `U-40`, `U-41`), the misconfiguration and transport cases (`U-38`, `U-39`), the mutable site-annotation signal and the driver reading the site from it (`U-42`, `U-43`, `U-46`, `U-47`, §6.2, §5.2, §6.3, superseding the struck patch-the-class path `U-29`, `U-31`, `U-36`), and the unstage-teardown robustness (`U-48`, `U-49`, `U-50`, §12) are covered. They span the controller package, the node package (`TestDetectSyncReplication`, `TestEnsureSyncPromoted`, `TestReadNodeSite`, `TestPatchVolumeReplicationSite`, `TestDemoteSyncOnUnstage`, `TestUnstageCompletesWhenTheDisconnectIsAbandoned`), and the `atlas-lib/kube` resolver tests (`TestInformerResolver_VolumeReplicationForVolumeHandle`). The two uncovered unit scenarios are the crash-idempotency of the site patch (`U-44`) and the server-side-apply co-ownership of the annotation (`U-45`, §6.2, §6.7, §9.1), which need an envtest harness against a real API server rather than a fake client. `I-14` is the sync-site provisioning check. See the [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status) in the design.
+The method dispatch and sync write verbs including the edge cases (`U-01`–`U-20`), the status read (`U-25`, `U-26`), the baseline node-stage path with the gate and demote-on-unstage (`U-27`, `U-30`, `U-32`–`U-35`, `U-37`, `U-40`, `U-41`), the misconfiguration and transport cases (`U-38`, `U-39`), the mutable site-annotation signal and the driver reading the site from it (`U-42`, `U-43`, `U-46`, `U-47`, §6.2, §5.2, §6.3, superseding the struck patch-the-class path `U-29`, `U-31`, `U-36`), and the unstage-teardown robustness (`U-48`, `U-49`, `U-50`, `U-51`, §12) are covered. They span the controller package, the node package (`TestDetectSyncReplication`, `TestEnsureSyncPromoted`, `TestReadNodeSite`, `TestPatchVolumeReplicationSite`, `TestDemoteSyncOnUnstage`, `TestUnstageCompletesWhenTheDisconnectIsAbandoned`), and the `atlas-lib/kube` resolver tests (`TestInformerResolver_VolumeReplicationForVolumeHandle`). The two uncovered unit scenarios are the crash-idempotency of the site patch (`U-44`) and the server-side-apply co-ownership of the annotation (`U-45`, §6.2, §6.7, §9.1), which need an envtest harness against a real API server rather than a fake client. `I-14` is the sync-site provisioning check. See the [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status) in the design.
 
 ---
 

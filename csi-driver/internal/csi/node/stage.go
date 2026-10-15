@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -215,6 +216,23 @@ func (ns *Server) NodeUnstageVolume(
 
 	plan, err := ns.teardownPlan(ctx, volumeID, stagingTargetPath, volumeContext)
 	if err != nil {
+		// Idempotency (CSI spec): if the volume is no longer staged at the target
+		// path, the unstage is a completed no-op. A volume whose staging directory
+		// kubelet has already removed leaves no stash, no record, and nothing the
+		// host can name, so teardownPlan cannot identify it -- but there is also
+		// nothing to release. Returning Internal here instead would wedge the
+		// external-attacher's detach forever, so the volume could never attach on
+		// another node and a pod move would hang in ContainerCreating. A volume
+		// that is still staged (its directory present) keeps failing, because then
+		// the unidentifiable state is a real fault rather than an absent volume.
+		if _, statErr := os.Stat(stagingTargetPath); errors.Is(statErr, os.ErrNotExist) {
+			klog.Warningf("volume %s is not staged at %s and names itself nowhere (%v); "+
+				"treating the unstage as a completed no-op", volumeID, stagingTargetPath, err)
+			if err := cleanUpVolumeContext(stagingParentPath); err != nil {
+				klog.Warningf("volume %s: clean up residual volume context: %v", volumeID, err)
+			}
+			return &csi.NodeUnstageVolumeResponse{}, nil
+		}
 		klog.Errorf("failed to read what was staged for %s: %v", volumeID, err)
 		return nil, status.Error(codes.Internal, err.Error())
 	}

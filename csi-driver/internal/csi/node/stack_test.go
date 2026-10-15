@@ -399,6 +399,32 @@ func TestUnstageKeepsARetainedVolume(t *testing.T) {
 	}
 }
 
+// Regression: 2026-10-15-unstage-idempotent-when-unstaged -- a NodeUnstageVolume
+// for a volume no longer staged at the target path (kubelet already removed the
+// staging directory; no stash, no record, nothing the host can name) returned
+// codes.Internal from teardownPlan ("neither the stashed volume context nor the
+// stack record names this volume's namespace"). The CSI spec requires OK when
+// the volume is not staged, and an Internal here wedges the external-attacher's
+// detach forever, so the volume can never attach on another node and a pod move
+// hangs in ContainerCreating.
+func TestUnstageIsIdempotentWhenNothingIsStaged(t *testing.T) {
+	runner := newRecordingRunner()
+	ns, _ := newStackedServer(t, runner)
+	// A bare staging parent: no stash file, no stack record, and no per-volume
+	// staging subdirectory (<parent>/<volumeID>) -- nothing is staged here.
+	parent := t.TempDir()
+
+	if _, err := ns.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+		VolumeId:          pvcTestHandle,
+		StagingTargetPath: parent,
+	}); err != nil {
+		t.Fatalf("NodeUnstageVolume of a volume that is not staged must be a no-op success, got: %v", err)
+	}
+	if runner.called("down") {
+		t.Error("a volume that is not staged was torn down; the unstage must identify nothing to release")
+	}
+}
+
 // Regression: 2026-10-15-unstage-abandoned-disconnect -- a bounded-out NVMe-oF
 // disconnect (bounded.Error, the kernel delete_controller write wedged on a dead
 // fabric) failed NodeUnstageVolume with codes.Internal, so the single-writer
