@@ -29,12 +29,16 @@ func (f *fakeSyncResolver) SyncVolumeReplicationForClaim(
 	return f.ref, f.err
 }
 
+// testSiteA is the node's site in these cases, reused across the sync fixtures.
+const testSiteA = "site-a"
+
 // claimCtx is the volume context external-provisioner stamps with a PVC's
-// identity; the namespace is fixed because the cases vary only the claim name.
-func claimCtx(name string) map[string]string {
+// identity; namespace and name are fixed because the cases vary the VR, not the
+// claim they correlate through.
+func claimCtx() map[string]string {
 	return map[string]string{
 		csicommon.CSIStorageNamespaceKey: "app",
-		csicommon.CSIStorageNameKey:      name,
+		csicommon.CSIStorageNameKey:      "claim1",
 	}
 }
 
@@ -43,7 +47,7 @@ func TestDetectSyncReplication(t *testing.T) {
 
 	t.Run("sync not configured: ordinary volume, no lookup", func(t *testing.T) {
 		ns := &Server{} // syncResolver nil
-		_, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx("claim1"))
+		_, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx())
 		if err != nil || isSync {
 			t.Fatalf("isSync=%v err=%v, want false/nil", isSync, err)
 		}
@@ -52,7 +56,7 @@ func TestDetectSyncReplication(t *testing.T) {
 	t.Run("sync-managed volume is detected", func(t *testing.T) {
 		fr := &fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1", Namespace: "app", ClassName: "sb-sync-a"}}
 		ns := &Server{syncResolver: fr, syncCachesSynced: synced}
-		ref, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx("claim1"))
+		ref, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx())
 		if err != nil || !isSync {
 			t.Fatalf("isSync=%v err=%v, want true/nil", isSync, err)
 		}
@@ -67,7 +71,7 @@ func TestDetectSyncReplication(t *testing.T) {
 	t.Run("ordinary volume: not-found on synced caches is trusted", func(t *testing.T) {
 		fr := &fakeSyncResolver{err: fmt.Errorf("none: %w", errs.ErrNotFound)}
 		ns := &Server{syncResolver: fr, syncCachesSynced: synced}
-		_, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx("claim1"))
+		_, isSync, err := ns.detectSyncReplication(context.Background(), claimCtx())
 		if err != nil || isSync {
 			t.Fatalf("isSync=%v err=%v, want false/nil (ordinary volume)", isSync, err)
 		}
@@ -76,7 +80,7 @@ func TestDetectSyncReplication(t *testing.T) {
 	t.Run("caches not synced: fail closed, retryable", func(t *testing.T) {
 		fr := &fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}
 		ns := &Server{syncResolver: fr, syncCachesSynced: func() bool { return false }}
-		_, _, err := ns.detectSyncReplication(context.Background(), claimCtx("claim1"))
+		_, _, err := ns.detectSyncReplication(context.Background(), claimCtx())
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (fail closed until synced)", status.Code(err))
 		}
@@ -93,7 +97,7 @@ func TestDetectSyncReplication(t *testing.T) {
 	t.Run("resolver infra error is retryable", func(t *testing.T) {
 		fr := &fakeSyncResolver{err: fmt.Errorf("api down")}
 		ns := &Server{syncResolver: fr, syncCachesSynced: synced}
-		_, _, err := ns.detectSyncReplication(context.Background(), claimCtx("claim1"))
+		_, _, err := ns.detectSyncReplication(context.Background(), claimCtx())
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable", status.Code(err))
 		}
@@ -106,7 +110,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	serverFor := func(patched *[]string) *Server {
 		return &Server{
 			syncCachesSynced: func() bool { return true },
-			syncNodeSite:     func(context.Context) (string, error) { return "site-a", nil },
+			syncNodeSite:     func(context.Context) (string, error) { return testSiteA, nil },
 			syncPatchVR: func(_ context.Context, _ kube.VolumeReplicationRef, site string) error {
 				if patched != nil {
 					*patched = append(*patched, site)
@@ -125,7 +129,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (switch requested)", status.Code(err))
 		}
-		if len(patched) != 1 || patched[0] != "site-a" {
+		if len(patched) != 1 || patched[0] != testSiteA {
 			t.Errorf("patched = %v, want [site-a]", patched)
 		}
 	})
@@ -134,7 +138,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 		var patched []string
 		ns := serverFor(&patched)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "primary",
 			ObservedState: "Secondary", Completed: false,
 		}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
@@ -149,7 +153,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	t.Run("Primary but Completed not yet set: still converging, retry", func(t *testing.T) {
 		ns := serverFor(nil)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "primary",
 			ObservedState: "Primary", Completed: false,
 		}
 		if status.Code(ns.ensureSyncPromoted(context.Background(), vr)) != codes.Unavailable {
@@ -160,7 +164,7 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	t.Run("promoted and complete on this site: proceed", func(t *testing.T) {
 		ns := serverFor(nil)
 		vr := kube.VolumeReplicationRef{
-			Namespace: "app", Name: "vr1", Site: "site-a", ReplicationState: "primary",
+			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "primary",
 			ObservedState: "Primary", Completed: true,
 		}
 		if err := ns.ensureSyncPromoted(context.Background(), vr); err != nil {
@@ -194,7 +198,7 @@ func TestDemoteSyncOnUnstage(t *testing.T) {
 		return &Server{
 			syncResolver:     fr,
 			syncCachesSynced: synced,
-			syncNodeSite:     func(context.Context) (string, error) { return "site-a", nil },
+			syncNodeSite:     func(context.Context) (string, error) { return testSiteA, nil },
 			syncDemote: func(_ context.Context, h lvol.VolumeHandle, site string) error {
 				if demoted != nil {
 					*demoted = append(*demoted, string(h)+"@"+site)
@@ -207,7 +211,7 @@ func TestDemoteSyncOnUnstage(t *testing.T) {
 	t.Run("sync volume: demotes this node's site", func(t *testing.T) {
 		var demoted []string
 		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, nil, &demoted)
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx("claim1"))
+		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
 		if len(demoted) != 1 || demoted[0] != "c:p:v@site-a" {
 			t.Errorf("demoted = %v, want [c:p:v@site-a]", demoted)
 		}
@@ -216,21 +220,21 @@ func TestDemoteSyncOnUnstage(t *testing.T) {
 	t.Run("ordinary volume: no demote", func(t *testing.T) {
 		var demoted []string
 		ns := serverFor(&fakeSyncResolver{err: fmt.Errorf("none: %w", errs.ErrNotFound)}, nil, &demoted)
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx("claim1"))
+		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
 		if len(demoted) != 0 {
 			t.Errorf("an ordinary volume must not be demoted, demoted = %v", demoted)
 		}
 	})
 
 	t.Run("sync not configured: no-op, no panic", func(t *testing.T) {
-		(&Server{}).demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx("claim1"))
+		(&Server{}).demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
 	})
 
 	t.Run("detection error: skips demote (best-effort)", func(t *testing.T) {
 		var demoted []string
 		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, nil, &demoted)
 		ns.syncCachesSynced = func() bool { return false } // not synced -> detection returns retryable error
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx("claim1"))
+		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
 		if len(demoted) != 0 {
 			t.Errorf("an undetermined volume must not be demoted, demoted = %v", demoted)
 		}
@@ -240,7 +244,7 @@ func TestDemoteSyncOnUnstage(t *testing.T) {
 		var demoted []string
 		ns := serverFor(&fakeSyncResolver{ref: kube.VolumeReplicationRef{Name: "vr1"}}, fmt.Errorf("backend down"), &demoted)
 		// Must not panic or surface the error; unstage proceeds regardless.
-		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx("claim1"))
+		ns.demoteSyncOnUnstage(context.Background(), "c:p:v", claimCtx())
 		if len(demoted) != 1 {
 			t.Errorf("the demote should have been attempted once, demoted = %v", demoted)
 		}

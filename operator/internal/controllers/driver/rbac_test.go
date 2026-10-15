@@ -464,10 +464,13 @@ func TestControllerRoleCanReadVolumeReplications(t *testing.T) {
 			continue
 		}
 		for _, v := range r.Verbs {
-			switch v {
-			case "create", "update", "patch", "delete", "deletecollection":
+			if slices.Contains(writeVerbs, v) {
 				t.Errorf("the controller role grants %q on volumereplications; it must only read them", v)
 			}
 		}
 	}
 }
+
+// writeVerbs are the RBAC verbs that mutate an object; a read-only grant must
+// include none of them.
+var writeVerbs = []string{"create", "update", "patch", "delete", "deletecollection"}

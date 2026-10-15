@@ -44,7 +44,7 @@ func TestPatchVolumeReplicationSite(t *testing.T) {
 		map[schema.GroupVersionResource]string{kube.VolumeReplicationGVR: "VolumeReplicationList"}, vr)
 
 	err := patchVolumeReplicationSite(context.Background(), dc,
-		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, "site-a")
+		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, testSiteA)
 	if err != nil {
 		t.Fatalf("patch: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestPatchVolumeReplicationSite(t *testing.T) {
 	}
 	site := got.GetAnnotations()[kube.SyncSiteAnnotation]
 	state, _, _ := unstructured.NestedString(got.Object, "spec", "replicationState")
-	if site != "site-a" || state != "primary" {
+	if site != testSiteA || state != "primary" {
 		t.Errorf("after patch: site=%q state=%q, want site-a/primary", site, state)
 	}
 	// The merge leaves the immutable class and the admin's dataSource untouched.
