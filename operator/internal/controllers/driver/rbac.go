@@ -80,6 +80,19 @@ var clusterRoleRules = map[string][]rbacv1.PolicyRule{
 		// The status carries the backing volume's identity, which only this
 		// plugin knows, and the operator reads it back.
 		rule(simplyblock, []string{"nfsexports/status"}, "get", "update", "patch"),
+		// Synchronous replication: the controller resolves a sync volume's active
+		// site from its VolumeReplication's simplyblock.io/sync-site annotation
+		// before PromoteVolume/DemoteVolume address the backend site route
+		// (design-sync-replication-csi-addons.md §5.2, §6.3). It runs informers
+		// over PersistentVolumes, PersistentVolumeClaims, and VolumeReplications to
+		// correlate a CSI volume handle to its VolumeReplication (PV-by-handle to
+		// claim to VR), so it needs cluster-wide read on all three. It reads these
+		// in its own right rather than through a co-bound sidecar role, which may
+		// not always be present. It never writes a VolumeReplication: the node owns
+		// the annotation and the administrator owns the object.
+		rule(core, []string{"persistentvolumes"}, "get", "list", "watch"),
+		rule(core, []string{"persistentvolumeclaims"}, "get", "list", "watch"),
+		rule(replication, []string{"volumereplications"}, "get", "list", "watch"),
 	},
 	"provisioner": {
 		rule(core, []string{"secrets"}, "get", "list"),

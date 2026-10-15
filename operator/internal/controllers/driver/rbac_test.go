@@ -425,3 +425,49 @@ func TestControllerCanRecordANewSizeOnAnExport(t *testing.T) {
 	}
 	t.Error("the controller cannot update nfsexports, so expanding a pNFS volume always fails")
 }
+
+// Regression: 2026-10-15 -- the controller resolves a sync volume's active site
+// from its VolumeReplication's simplyblock.io/sync-site annotation before
+// PromoteVolume/DemoteVolume address the backend site route (design §5.2, §6.3).
+// It runs informers over PersistentVolumes, PersistentVolumeClaims, and
+// VolumeReplications to correlate a volume handle to its VR. Without read on
+// those, the informer cache stays empty, resolveSyncSite returns not-found, the
+// csi-addons controller's promote fails Unavailable, and a sync pod hangs in
+// ContainerCreating behind a gate that never releases:
+//
+//	volumereplications.replication.storage.openshift.io is forbidden: User
+//	"system:serviceaccount:simplyblock:simplyblock-csi-controller-sa" cannot
+//	list resource "volumereplications" at the cluster scope
+func TestControllerRoleCanReadVolumeReplications(t *testing.T) {
+	need := []string{"volumereplications", "persistentvolumes", "persistentvolumeclaims"}
+	for _, resource := range need {
+		var got []string
+		for _, r := range clusterRoleRules[controllerComponent] {
+			if slices.Contains(r.Resources, resource) {
+				got = r.Verbs
+			}
+		}
+		if got == nil {
+			t.Errorf("the controller role carries no rule for %s; its site-resolution informer cannot sync", resource)
+			continue
+		}
+		for _, v := range []string{"get", "list", "watch"} {
+			if !slices.Contains(got, v) {
+				t.Errorf("controller role on %s is missing verb %q (has %v)", resource, v, got)
+			}
+		}
+	}
+	// It must never write a VolumeReplication: the node owns the sync-site
+	// annotation and the administrator owns the object.
+	for _, r := range clusterRoleRules[controllerComponent] {
+		if !slices.Contains(r.Resources, "volumereplications") {
+			continue
+		}
+		for _, v := range r.Verbs {
+			switch v {
+			case "create", "update", "patch", "delete", "deletecollection":
+				t.Errorf("the controller role grants %q on volumereplications; it must only read them", v)
+			}
+		}
+	}
+}
