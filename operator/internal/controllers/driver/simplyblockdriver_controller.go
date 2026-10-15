@@ -11,6 +11,7 @@ package driver
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"time"
 
@@ -203,6 +204,10 @@ func (r *SimplyblockDriverReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	if err := r.ensureMDSProxy(ctx, &d); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.recordOrigin(ctx, &d, met); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -245,6 +250,17 @@ func (r *SimplyblockDriverReconciler) refreshMDS(ctx context.Context, d *simplyb
 	if err := r.List(ctx, &list, client.InNamespace(d.Namespace), client.HasLabels{MDSClusterLabel}); err != nil {
 		return fmt.Errorf("listing the metadata server StatefulSets: %w", err)
 	}
+	if len(list.Items) == 0 {
+		return nil
+	}
+	data, err := EnsureMDSDataNetwork(ctx, r.Client, d)
+	var fallback *MDSDataNetworkFallback
+	switch {
+	case stderrors.As(err, &fallback):
+		r.event(d, corev1.EventTypeWarning, fallback.Reason, fallback.Message)
+	case err != nil:
+		return err
+	}
 	for i := range list.Items {
 		sts := &list.Items[i]
 		if problem := MDSResourcesProblem(d.Spec.PNFS.MDS); problem != "" {
@@ -252,7 +268,7 @@ func (r *SimplyblockDriverReconciler) refreshMDS(ctx context.Context, d *simplyb
 				fmt.Sprintf("cannot update the metadata server StatefulSet %s: %s", sts.Name, problem))
 			return nil
 		}
-		updated, err := UpdateMDS(ctx, r.Client, d, sts)
+		updated, err := UpdateMDS(ctx, r.Client, d, sts, data)
 		if err != nil {
 			return err
 		}

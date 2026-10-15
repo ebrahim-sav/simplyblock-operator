@@ -461,6 +461,34 @@ driver:
     nodeDriverRegistrar: ""
     csiAddons: ""
 
+  # pNFS: ReadWriteMany volumes served by an NFS metadata server, whose clients
+  # read and write the volume's NVMe-oF namespace directly.
+  pnfs:
+    # The metadata server: one pod per storage cluster, running the NFS server in
+    # a QEMU guest on a node with /dev/kvm. On by default, so a ReadWriteMany
+    # volume needs nothing beyond the install. Off, no pNFS volume can be
+    # exported and its export waits in Pending.
+    mds:
+      enabled: true
+      # Merged with the kvm-capable label the pod always requires.
+      nodeSelector: {}
+      tolerations: []
+      # The pod's requests and limits. Empty takes the driver's defaults: 2 CPUs
+      # and 2Gi of memory as limits.
+      resources: {}
+      # The guest's state disk, which holds the NFS client-recovery database.
+      # Empty takes 1Gi.
+      stateSize: ""
+      # The storage data network the metadata server is attached to, through a
+      # Multus macvlan on the host interface carrying the subnet. All three are
+      # needed, and the range must hold no address anything else on the network
+      # uses. Empty, the guest reaches the storage nodes through the pod network.
+      # A cluster without Multus runs it on the pod network either way.
+      dataNetwork:
+        subnet: ""
+        rangeStart: ""
+        rangeEnd: ""
+
 controlplane:
   # deployment.profile: standalone options -- this cluster's own control plane.
   local:

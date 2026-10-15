@@ -360,7 +360,7 @@ func staleMDSStatefulSet(t *testing.T, keepHash bool) *appsv1.StatefulSet {
 	t.Helper()
 	old := mdsDriver()
 	old.Spec.PNFS.MDS.Image = "quay.io/simplyblock-io/spdkcsi:pnfs-mds-v26.2.0"
-	_, sts, err := driver.MDSObjects(old, testExportClusterID, "old-state-class")
+	_, sts, err := driver.MDSObjects(old, testExportClusterID, "old-state-class", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func staleMDSStatefulSet(t *testing.T, keepHash bool) *appsv1.StatefulSet {
 // currentMDSHash is the template hash the current driver's StatefulSet carries.
 func currentMDSHash(t *testing.T) string {
 	t.Helper()
-	_, sts, err := driver.MDSObjects(mdsDriver(), testExportClusterID, "old-state-class")
+	_, sts, err := driver.MDSObjects(mdsDriver(), testExportClusterID, "old-state-class", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +480,7 @@ func TestReadyExportUpdatesAnOutdatedMDSStatefulSet(t *testing.T) {
 // path's, which also picks the state disk class.
 func TestReadyExportLeavesTheMDSStatefulSetAsItIs(t *testing.T) {
 	t.Run("up to date", func(t *testing.T) {
-		_, current, err := driver.MDSObjects(mdsDriver(), testExportClusterID, testStateClass)
+		_, current, err := driver.MDSObjects(mdsDriver(), testExportClusterID, testStateClass, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -540,7 +540,7 @@ func (c *conflictingUpdates) Update(ctx context.Context, obj client.Object, opts
 // than failing its reconcile.
 func TestAnMDSUpdateThatLostTheRaceToTheCurrentTemplateSucceeds(t *testing.T) {
 	r, cl, _ := newPodHostedReconciler(t, readyMDSExport(), mdsDriver(), mdsPod(), staleMDSStatefulSet(t, false))
-	_, current, err := driver.MDSObjects(mdsDriver(), testExportClusterID, "old-state-class")
+	_, current, err := driver.MDSObjects(mdsDriver(), testExportClusterID, "old-state-class", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

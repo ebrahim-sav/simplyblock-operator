@@ -253,6 +253,48 @@ checkLogCollector() {
   fi
 }
 
+# driverDocument prints the rendered SimplyblockDriver, with the extra settings given.
+driverDocument() {
+  helm template sb "$CHART" --namespace simplyblock \
+    "${CAPABILITIES[@]}" \
+    --set deployment.profile=standalone \
+    "$@" 2>/dev/null |
+    awk '/^---/ { if (doc ~ /\nkind: SimplyblockDriver\n/) print doc; doc = ""; next }
+         { doc = doc "\n" $0 }
+         END { if (doc ~ /\nkind: SimplyblockDriver\n/) print doc }'
+}
+
+# checkDriverPNFS asserts that the chart's SimplyblockDriver configures the pNFS
+# metadata server by default, so a ReadWriteMany volume needs no patch of the
+# driver after the install, that the value declining it removes it, and that a
+# data network set in the values reaches the driver.
+checkDriverPNFS() {
+  local doc
+  doc="$(driverDocument)"
+  # A bare "mds:" is YAML for null, which leaves the metadata server off as
+  # surely as no key at all, so the value has to be {} or an indented child.
+  if ! awk '/^    mds:/ { if ($0 ~ /^    mds: \{\}$/) ok = 1; else want = 1; next }
+            want { if ($0 ~ /^      [^ #]/) ok = 1; want = 0 }
+            END { exit !ok }' <<<"$doc"; then
+    echo "  pnfs: the SimplyblockDriver renders no spec.pnfs.mds object by default"
+    fail=1
+  fi
+  doc="$(driverDocument --set driver.pnfs.mds.enabled=false)"
+  if grep -qE '^  pnfs:' <<<"$doc"; then
+    echo "  pnfs: spec.pnfs is rendered with driver.pnfs.mds.enabled=false"
+    fail=1
+  fi
+  doc="$(driverDocument --set driver.pnfs.mds.dataNetwork.subnet=10.10.10.0/24 \
+    --set driver.pnfs.mds.dataNetwork.rangeStart=10.10.10.100 \
+    --set driver.pnfs.mds.dataNetwork.rangeEnd=10.10.10.109)"
+  if ! grep -qE '^        subnet: "?10\.10\.10\.0/24"?$' <<<"$doc" ||
+     ! grep -qE '^        rangeStart: "?10\.10\.10\.100"?$' <<<"$doc"; then
+    echo "  pnfs: driver.pnfs.mds.dataNetwork does not reach spec.pnfs.mds.dataNetwork"
+    fail=1
+  fi
+  [ "$fail" -eq 0 ] && echo "  pnfs: the metadata server is configured by default"
+}
+
 # checkClusterStorageClasses asserts that a storage cluster given at install time,
 # with a pool, gets a block StorageClass naming that cluster and pool.
 #
@@ -421,6 +463,7 @@ check empty "${OPERATOR[@]}"
 checkEmpty
 checkVendoredCRDs
 checkLogCollector
+checkDriverPNFS
 checkClusterStorageClasses
 
 exit "$fail"
