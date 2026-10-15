@@ -106,39 +106,43 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 	// controller never re-issues PromoteVolume and the backend's leadership never
 	// moves. Driving replicationState primary -> secondary -> primary is a real
 	// spec transition the controller acts on, re-issuing DemoteVolume then
-	// PromoteVolume -- the latter the backend failover to this site (design §6.3,
-	// §6.4). The gate below can only release once that fresh promote completes,
-	// because the status it reads is site-agnostic and would otherwise be stale.
+	// PromoteVolume (design §6.3, §6.4). The gate below can only release once that
+	// fresh promote completes, because the status it reads is site-agnostic and
+	// would otherwise be stale.
 	//
-	// Step 1 -- begin the move: the volume is promoted (Primary, Completed) on
-	// another site. Demote it (replicationState: secondary) and move the annotation
-	// to this site. The demote targets this site and is a backend no-op; the switch
-	// fences the old site through the failover, not here.
-	if vr.Site != site && vr.ObservedState == observedStatePrimary && vr.Completed {
-		if err := ns.syncPatchVR(ctx, vr, site, replicationStateSecondary); err != nil {
+	// Step 1 -- demote the OLD site: the volume is promoted (Primary, Completed) on
+	// the site the annotation currently names. Set replicationState: secondary while
+	// KEEPING that annotation, so DemoteVolume targets the old site. The backend's
+	// planned promote to this site is refused ("409 not demoted on site <old>")
+	// until the old site is demoted -- the failover does not fence it for us -- so
+	// the demote has to land on the old site, not this one.
+	if vr.Site != site && vr.ReplicationState == replicationStatePrimary &&
+		vr.ObservedState == observedStatePrimary && vr.Completed {
+		if err := ns.syncPatchVR(ctx, vr, vr.Site, replicationStateSecondary); err != nil {
 			return status.Errorf(codes.Unavailable,
-				"begin switchover to site %q on %s/%s: %v", site, vr.Namespace, vr.Name, err)
+				"demote old site %q of %s/%s before switchover: %v", vr.Site, vr.Namespace, vr.Name, err)
 		}
 		return status.Errorf(codes.Unavailable,
-			"switchover to site %q started on %s/%s; retrying", site, vr.Namespace, vr.Name)
+			"demoting old site %q of %s/%s before switchover to %q; retrying", vr.Site, vr.Namespace, vr.Name, site)
 	}
 
-	// Step 2 -- re-promote: we asked for secondary. Once the controller has
-	// observed the demote (status Secondary), ask for primary, which it turns into
-	// PromoteVolume -> failover?site=<this site>. Waiting for the demote to be
-	// observed is what makes secondary -> primary a transition the controller sees,
-	// rather than a no-op that collapses back to primary.
-	if vr.Site == site && vr.ReplicationState == replicationStateSecondary {
+	// Step 2 -- promote THIS site: the old site's demote is in flight. Once the
+	// controller has observed it (status Secondary), move the annotation here and
+	// set primary, which it turns into PromoteVolume -> failover?site=<this site>;
+	// the old site is demoted now, so the planned promote is accepted. Waiting for
+	// the demote to be observed is what makes secondary -> primary a transition the
+	// controller sees, rather than a no-op that collapses back to primary.
+	if vr.ReplicationState == replicationStateSecondary {
 		if vr.ObservedState != observedStateSecondary {
 			return status.Errorf(codes.Unavailable,
-				"demote before re-promote on site %q of %s/%s is converging; retrying", site, vr.Namespace, vr.Name)
+				"demote before switchover to site %q of %s/%s is converging; retrying", site, vr.Namespace, vr.Name)
 		}
 		if err := ns.syncPatchVR(ctx, vr, site, replicationStatePrimary); err != nil {
 			return status.Errorf(codes.Unavailable,
-				"re-promote to site %q on %s/%s: %v", site, vr.Namespace, vr.Name, err)
+				"promote site %q on %s/%s: %v", site, vr.Namespace, vr.Name, err)
 		}
 		return status.Errorf(codes.Unavailable,
-			"re-promote to site %q started on %s/%s; retrying", site, vr.Namespace, vr.Name)
+			"promote to site %q started on %s/%s; retrying", site, vr.Namespace, vr.Name)
 	}
 
 	// First promote (or the annotation/state not yet set to this site): set the

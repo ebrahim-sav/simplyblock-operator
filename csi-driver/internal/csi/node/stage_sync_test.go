@@ -122,8 +122,9 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	t.Run("first promote: not yet on the site, not Completed -> annotation + primary", func(t *testing.T) {
 		var patched []string
 		ns := serverFor(&patched)
-		// A fresh VR annotated for the other site, not yet promoted anywhere.
-		vr := kube.VolumeReplicationRef{Namespace: "app", Name: "vr1", Site: "site-b", ReplicationState: "secondary"}
+		// A fresh VR as the administrator creates it: primary, no site annotation yet,
+		// not promoted anywhere.
+		vr := kube.VolumeReplicationRef{Namespace: "app", Name: "vr1", Site: "", ReplicationState: "primary"}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (switch requested)", status.Code(err))
@@ -138,13 +139,13 @@ func TestEnsureSyncPromoted(t *testing.T) {
 	// controller never re-issued PromoteVolume, the backend's failover never fired,
 	// and leadership never moved (sbcli sync_active_site stayed put). The gate then
 	// released on the stale, site-agnostic Primary/Completed status. A move must
-	// instead force the promote to re-run by demoting first (RamenDR-style
-	// primary -> secondary -> primary).
-	t.Run("move: promoted on another site -> demote first (secondary)", func(t *testing.T) {
+	// force the promote to re-run RamenDR-style (primary -> secondary -> primary),
+	// and the secondary step must demote the OLD site, not this one, or the backend
+	// refuses the planned promote ("409 not demoted on site <old>").
+	t.Run("move: promoted on another site -> demote the OLD site (secondary)", func(t *testing.T) {
 		var patched []string
 		ns := serverFor(&patched)
-		// Promoted and Completed, but annotated for the other site: this node is the
-		// move target.
+		// Promoted and Completed on site-b; this node (site-a) is the move target.
 		vr := kube.VolumeReplicationRef{
 			Namespace: "app", Name: "vr1", Site: "site-b", ReplicationState: "primary",
 			ObservedState: "Primary", Completed: true,
@@ -153,8 +154,10 @@ func TestEnsureSyncPromoted(t *testing.T) {
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (switch started)", status.Code(err))
 		}
-		if len(patched) != 1 || patched[0] != testSiteA+"/secondary" {
-			t.Errorf("patched = %v, want [site-a/secondary] (demote before re-promote)", patched)
+		// The demote keeps the old site's annotation (site-b), so DemoteVolume
+		// targets the old site; this site is promoted only after it is demoted.
+		if len(patched) != 1 || patched[0] != "site-b/secondary" {
+			t.Errorf("patched = %v, want [site-b/secondary] (demote the old site first)", patched)
 		}
 	})
 
