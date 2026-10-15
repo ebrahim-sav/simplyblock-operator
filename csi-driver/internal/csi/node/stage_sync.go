@@ -33,8 +33,10 @@ type syncReplicationResolver interface {
 // switchover sets and the gate reads (csi-addons: lowercase spec verb, titled
 // status).
 const (
-	replicationStatePrimary = "primary"
-	observedStatePrimary    = "Primary"
+	replicationStatePrimary   = "primary"
+	replicationStateSecondary = "secondary"
+	observedStatePrimary      = "Primary"
+	observedStateSecondary    = "Secondary"
 )
 
 // detectSyncReplication decides, per PVC at stage time, whether vc's volume is
@@ -98,12 +100,54 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 		return status.Errorf(codes.Unavailable, "read this node's site: %v", err)
 	}
 
-	// Signal the site: set the VolumeReplication's sync-site annotation (and
-	// replicationState: primary) to this node's site. A single mutable patch, so
-	// the class never changes. Idempotent, so a re-stage after the patch takes the
-	// gate below.
+	// A move forces the promote to re-run, the way RamenDR drives a failover: the
+	// site rides on the mutable sync-site annotation, but an annotation-only change
+	// leaves the VolumeReplication already `primary`/Completed, so the csi-addons
+	// controller never re-issues PromoteVolume and the backend's leadership never
+	// moves. Driving replicationState primary -> secondary -> primary is a real
+	// spec transition the controller acts on, re-issuing DemoteVolume then
+	// PromoteVolume -- the latter the backend failover to this site (design §6.3,
+	// §6.4). The gate below can only release once that fresh promote completes,
+	// because the status it reads is site-agnostic and would otherwise be stale.
+	//
+	// Step 1 -- begin the move: the volume is promoted (Primary, Completed) on
+	// another site. Demote it (replicationState: secondary) and move the annotation
+	// to this site. The demote targets this site and is a backend no-op; the switch
+	// fences the old site through the failover, not here.
+	if vr.Site != site && vr.ObservedState == observedStatePrimary && vr.Completed {
+		if err := ns.syncPatchVR(ctx, vr, site, replicationStateSecondary); err != nil {
+			return status.Errorf(codes.Unavailable,
+				"begin switchover to site %q on %s/%s: %v", site, vr.Namespace, vr.Name, err)
+		}
+		return status.Errorf(codes.Unavailable,
+			"switchover to site %q started on %s/%s; retrying", site, vr.Namespace, vr.Name)
+	}
+
+	// Step 2 -- re-promote: we asked for secondary. Once the controller has
+	// observed the demote (status Secondary), ask for primary, which it turns into
+	// PromoteVolume -> failover?site=<this site>. Waiting for the demote to be
+	// observed is what makes secondary -> primary a transition the controller sees,
+	// rather than a no-op that collapses back to primary.
+	if vr.Site == site && vr.ReplicationState == replicationStateSecondary {
+		if vr.ObservedState != observedStateSecondary {
+			return status.Errorf(codes.Unavailable,
+				"demote before re-promote on site %q of %s/%s is converging; retrying", site, vr.Namespace, vr.Name)
+		}
+		if err := ns.syncPatchVR(ctx, vr, site, replicationStatePrimary); err != nil {
+			return status.Errorf(codes.Unavailable,
+				"re-promote to site %q on %s/%s: %v", site, vr.Namespace, vr.Name, err)
+		}
+		return status.Errorf(codes.Unavailable,
+			"re-promote to site %q started on %s/%s; retrying", site, vr.Namespace, vr.Name)
+	}
+
+	// First promote (or the annotation/state not yet set to this site): set the
+	// sync-site annotation and replicationState: primary. On a fresh
+	// VolumeReplication the controller promotes naturally, so there is nothing to
+	// re-trigger and no demote step. A single mutable patch, so the class never
+	// changes.
 	if vr.Site != site || vr.ReplicationState != replicationStatePrimary {
-		if err := ns.syncPatchVR(ctx, vr, site); err != nil {
+		if err := ns.syncPatchVR(ctx, vr, site, replicationStatePrimary); err != nil {
 			return status.Errorf(codes.Unavailable,
 				"signal site %q onto VolumeReplication %s/%s: %v", site, vr.Namespace, vr.Name, err)
 		}
@@ -111,8 +155,9 @@ func (ns *Server) ensureSyncPromoted(ctx context.Context, vr kube.VolumeReplicat
 			"switchover to site %q requested for %s/%s; retrying", site, vr.Namespace, vr.Name)
 	}
 
-	// Already annotated with this site: the promote is done when the volume is
-	// Primary and the Completed condition is set (design §6.4, §8).
+	// Promoted and complete on this site: the Primary state with the Completed
+	// condition set, reached after the promote above rather than inherited from a
+	// prior site (design §6.4, §8).
 	if vr.ObservedState == observedStatePrimary && vr.Completed {
 		return nil
 	}

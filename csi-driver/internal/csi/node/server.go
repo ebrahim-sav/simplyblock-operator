@@ -57,11 +57,12 @@ type Server struct {
 	syncCachesSynced func() bool
 	// syncNodeSite reads the site of the node this plugin runs on (its zone
 	// label), and syncPatchVR sets a VolumeReplication's sync-site annotation to a
-	// site as primary (the write half of the switchover, §6.2). Both are seams so
-	// staging is testable without a node object or a dynamic client, and are set
-	// together with syncResolver when sync replication is configured.
+	// site and its replicationState to the given value (primary or secondary) --
+	// the write half of the switchover, §6.2, §6.4. Both are seams so staging is
+	// testable without a node object or a dynamic client, and are set together with
+	// syncResolver when sync replication is configured.
 	syncNodeSite func(context.Context) (string, error)
-	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error
+	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, site, state string) error
 }
 
 // New builds the node service. It performs no I/O and starts nothing: the

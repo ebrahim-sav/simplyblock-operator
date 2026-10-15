@@ -104,41 +104,98 @@ func TestDetectSyncReplication(t *testing.T) {
 }
 
 func TestEnsureSyncPromoted(t *testing.T) {
-	// serverFor builds a node whose site is site-a, recording the site of any VR
-	// patch the node makes.
+	// serverFor builds a node whose site is site-a, recording each VR patch the
+	// node makes as "<site>/<replicationState>".
 	serverFor := func(patched *[]string) *Server {
 		return &Server{
 			syncCachesSynced: func() bool { return true },
 			syncNodeSite:     func(context.Context) (string, error) { return testSiteA, nil },
-			syncPatchVR: func(_ context.Context, _ kube.VolumeReplicationRef, site string) error {
+			syncPatchVR: func(_ context.Context, _ kube.VolumeReplicationRef, site, state string) error {
 				if patched != nil {
-					*patched = append(*patched, site)
+					*patched = append(*patched, site+"/"+state)
 				}
 				return nil
 			},
 		}
 	}
 
-	t.Run("not yet on the site: patches the annotation and asks for a retry", func(t *testing.T) {
+	t.Run("first promote: not yet on the site, not Completed -> annotation + primary", func(t *testing.T) {
 		var patched []string
 		ns := serverFor(&patched)
-		// A VR currently annotated for the other site.
+		// A fresh VR annotated for the other site, not yet promoted anywhere.
 		vr := kube.VolumeReplicationRef{Namespace: "app", Name: "vr1", Site: "site-b", ReplicationState: "secondary"}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
 		if status.Code(err) != codes.Unavailable {
 			t.Fatalf("code = %v, want Unavailable (switch requested)", status.Code(err))
 		}
-		if len(patched) != 1 || patched[0] != testSiteA {
-			t.Errorf("patched = %v, want [site-a]", patched)
+		if len(patched) != 1 || patched[0] != testSiteA+"/primary" {
+			t.Errorf("patched = %v, want [site-a/primary]", patched)
 		}
 	})
 
-	t.Run("on the site but promote still converging: retry, no patch", func(t *testing.T) {
+	// Regression: 2026-10-15-sync-switchover-no-op -- a move patched the sync-site
+	// annotation but left replicationState `primary` unchanged, so the csi-addons
+	// controller never re-issued PromoteVolume, the backend's failover never fired,
+	// and leadership never moved (sbcli sync_active_site stayed put). The gate then
+	// released on the stale, site-agnostic Primary/Completed status. A move must
+	// instead force the promote to re-run by demoting first (RamenDR-style
+	// primary -> secondary -> primary).
+	t.Run("move: promoted on another site -> demote first (secondary)", func(t *testing.T) {
+		var patched []string
+		ns := serverFor(&patched)
+		// Promoted and Completed, but annotated for the other site: this node is the
+		// move target.
+		vr := kube.VolumeReplicationRef{
+			Namespace: "app", Name: "vr1", Site: "site-b", ReplicationState: "primary",
+			ObservedState: "Primary", Completed: true,
+		}
+		err := ns.ensureSyncPromoted(context.Background(), vr)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("code = %v, want Unavailable (switch started)", status.Code(err))
+		}
+		if len(patched) != 1 || patched[0] != testSiteA+"/secondary" {
+			t.Errorf("patched = %v, want [site-a/secondary] (demote before re-promote)", patched)
+		}
+	})
+
+	t.Run("mid-switch: on the site, secondary, demote observed -> re-promote (primary)", func(t *testing.T) {
+		var patched []string
+		ns := serverFor(&patched)
+		vr := kube.VolumeReplicationRef{
+			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "secondary",
+			ObservedState: "Secondary", Completed: true,
+		}
+		err := ns.ensureSyncPromoted(context.Background(), vr)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("code = %v, want Unavailable (re-promote started)", status.Code(err))
+		}
+		if len(patched) != 1 || patched[0] != testSiteA+"/primary" {
+			t.Errorf("patched = %v, want [site-a/primary]", patched)
+		}
+	})
+
+	t.Run("mid-switch: secondary but demote not yet observed -> wait, no patch", func(t *testing.T) {
+		var patched []string
+		ns := serverFor(&patched)
+		vr := kube.VolumeReplicationRef{
+			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "secondary",
+			ObservedState: "Primary", Completed: true,
+		}
+		err := ns.ensureSyncPromoted(context.Background(), vr)
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("code = %v, want Unavailable (waiting for demote)", status.Code(err))
+		}
+		if len(patched) != 0 {
+			t.Errorf("must not promote before the demote is observed, patched = %v", patched)
+		}
+	})
+
+	t.Run("on the site, primary, promote still converging: retry, no patch", func(t *testing.T) {
 		var patched []string
 		ns := serverFor(&patched)
 		vr := kube.VolumeReplicationRef{
 			Namespace: "app", Name: "vr1", Site: testSiteA, ReplicationState: "primary",
-			ObservedState: "Secondary", Completed: false,
+			ObservedState: "Unknown", Completed: false,
 		}
 		err := ns.ensureSyncPromoted(context.Background(), vr)
 		if status.Code(err) != codes.Unavailable {

@@ -30,8 +30,8 @@ func (ns *Server) EnableSyncReplication(
 	ns.syncResolver = resolver
 	ns.syncCachesSynced = cachesSynced
 	ns.syncNodeSite = ns.readNodeSite
-	ns.syncPatchVR = func(ctx context.Context, vr kube.VolumeReplicationRef, site string) error {
-		return patchVolumeReplicationSite(ctx, dyn, vr, site)
+	ns.syncPatchVR = func(ctx context.Context, vr kube.VolumeReplicationRef, site, state string) error {
+		return patchVolumeReplicationSite(ctx, dyn, vr, site, state)
 	}
 }
 
@@ -57,20 +57,20 @@ func (ns *Server) readNodeSite(ctx context.Context) (string, error) {
 }
 
 // patchVolumeReplicationSite sets a VolumeReplication's SyncSiteAnnotation to a
-// site, as primary: the write half of the switchover the node performs at stage
-// time (design §6.2). The driver wraps this with its dynamic client into
-// Server.syncPatchVR. The patch is a JSON merge, so it touches only the
-// annotation and replicationState and leaves the rest of the object, the class
-// included, as the administrator set it. The class is immutable, so the site has
-// to ride on this mutable annotation rather than on the class. A re-apply of the
-// administrator's spec does not carry the annotation, so it does not revert the
-// node's site (design §6.2, co-ownership).
+// site and its replicationState to state (primary or secondary): the write half
+// of the switchover the node performs at stage time (design §6.2, §6.4). The
+// driver wraps this with its dynamic client into Server.syncPatchVR. The patch is
+// a JSON merge, so it touches only the annotation and replicationState and leaves
+// the rest of the object, the class included, as the administrator set it. The
+// class is immutable, so the site has to ride on this mutable annotation rather
+// than on the class. A re-apply of the administrator's spec does not carry the
+// annotation, so it does not revert the node's site (design §6.2, co-ownership).
 func patchVolumeReplicationSite(
-	ctx context.Context, dyn dynamic.Interface, vr kube.VolumeReplicationRef, site string,
+	ctx context.Context, dyn dynamic.Interface, vr kube.VolumeReplicationRef, site, state string,
 ) error {
 	patch := []byte(fmt.Sprintf(
 		`{"metadata":{"annotations":{%q:%q}},"spec":{"replicationState":%q}}`,
-		kube.SyncSiteAnnotation, site, replicationStatePrimary))
+		kube.SyncSiteAnnotation, site, state))
 	_, err := dyn.Resource(kube.VolumeReplicationGVR).Namespace(vr.Namespace).
 		Patch(ctx, vr.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {

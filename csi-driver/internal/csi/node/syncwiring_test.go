@@ -44,7 +44,7 @@ func TestPatchVolumeReplicationSite(t *testing.T) {
 		map[schema.GroupVersionResource]string{kube.VolumeReplicationGVR: "VolumeReplicationList"}, vr)
 
 	err := patchVolumeReplicationSite(context.Background(), dc,
-		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, testSiteA)
+		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, testSiteA, "primary")
 	if err != nil {
 		t.Fatalf("patch: %v", err)
 	}
@@ -58,6 +58,17 @@ func TestPatchVolumeReplicationSite(t *testing.T) {
 	state, _, _ := unstructured.NestedString(got.Object, "spec", "replicationState")
 	if site != testSiteA || state != "primary" {
 		t.Errorf("after patch: site=%q state=%q, want site-a/primary", site, state)
+	}
+
+	// The same helper sets secondary when the switch demotes first (§6.4).
+	if err := patchVolumeReplicationSite(context.Background(), dc,
+		kube.VolumeReplicationRef{Namespace: "app", Name: "vr1"}, testSiteA, "secondary"); err != nil {
+		t.Fatalf("patch secondary: %v", err)
+	}
+	got, _ = dc.Resource(kube.VolumeReplicationGVR).Namespace("app").
+		Get(context.Background(), "vr1", metav1.GetOptions{})
+	if state, _, _ := unstructured.NestedString(got.Object, "spec", "replicationState"); state != "secondary" {
+		t.Errorf("after secondary patch: state=%q, want secondary", state)
 	}
 	// The merge leaves the immutable class and the admin's dataSource untouched.
 	class, _, _ := unstructured.NestedString(got.Object, "spec", "volumeReplicationClass")
