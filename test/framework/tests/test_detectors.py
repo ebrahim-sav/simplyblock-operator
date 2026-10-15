@@ -2203,6 +2203,24 @@ class PnfsMultipath(unittest.TestCase):
         found = [f for f in self._found(guest, []) if f.severity == Severity.CRITICAL]
         self.assertEqual([f.subject for f in found], ["paths"])
 
+    def test_an_unrelated_volume_on_another_address_is_clean(self):
+        # Every volume the guest exports has both its paths. A volume it does not export,
+        # such as the metadata server's own state disk, is served from an address none of
+        # the exports use, and says nothing about the guest.
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"), guest_ctrl("lv1", "10.10.10.245:4421")]
+        clients = [client_ctrl("w1", "lv1", "10.10.10.244:4421"), client_ctrl("w1", "lv1", "10.10.10.245:4421"),
+                   client_ctrl("w2", "lvZ", "10.10.10.246:4433"), client_ctrl("w2", "lvZ", "10.10.10.244:4433")]
+        self.assertEqual([f for f in self._found(guest, clients) if f.severity == Severity.CRITICAL], [])
+
+    def test_an_unrelated_volume_with_more_paths_is_clean(self):
+        # The exports have two paths each, all of which the guest holds. A volume the guest
+        # does not export has three, which is not what the exports are owed.
+        guest = [guest_ctrl("lv1", "10.10.10.244:4421"), guest_ctrl("lv1", "10.10.10.245:4421"),
+                 guest_ctrl("lv2", "10.10.10.245:4433"), guest_ctrl("lv2", "10.10.10.246:4433")]
+        clients = [client_ctrl("w1", "lvZ", "10.10.10.244:4435"), client_ctrl("w1", "lvZ", "10.10.10.245:4435"),
+                   client_ctrl("w1", "lvZ", "10.10.10.246:4435")]
+        self.assertEqual([f for f in self._found(guest, clients) if f.severity == Severity.CRITICAL], [])
+
     def test_without_the_metadata_server_log_it_skips(self):
         ev = FakeEvidence(controllers=self.CLIENTS)
         with self.assertRaises(SkipDetector):

@@ -381,10 +381,13 @@ class Multipath(Detector):
     the same paths: a volume left on one path stops when that path does. Two comparisons
     find a missing path, and neither needs the volume's clients to outlive it:
 
-    * A volume the guest attached on fewer paths than volumes have in this cluster, the
-      most any volume has in the guest or on a client.
+    * A volume the guest attached on fewer paths than its clients hold to it, or, for a
+      volume no client holds any more, than the most any of the guest's volumes has in
+      the guest or on a client. Volumes the guest does not export set no count.
     * An address the clients connect to, for any volume, that the guest never connected
-      to, for any volume. It names the path the short volumes are missing.
+      to, for any volume. It names the path the short volumes are missing, and is
+      reported only beside them: a volume the guest does not export, such as its own
+      state disk, can be served from an address no export uses.
 
     The case that produces it is a metadata server on a node that runs a storage node: the
     node's NVMe/TCP listeners are bound to its data interface, and neither the pod network
@@ -417,10 +420,12 @@ class Multipath(Detector):
             if m := _LVOL_NQN.search(c.nqn):
                 clients.setdefault(m["lvol"], set()).add(c.address.rsplit(":", 1)[0])
 
-        paths = max(len(p) for p in [*guest.values(), *clients.values()])
-        short = sorted(lvol for lvol, reached in guest.items() if len(reached) < paths)
+        exported = {lvol: clients[lvol] for lvol in guest if lvol in clients}
+        paths = max(len(p) for p in [*guest.values(), *exported.values()])
+        short = sorted(lvol for lvol, reached in guest.items()
+                       if len(reached) < (len(exported[lvol]) if lvol in exported else paths))
         reached_any = set().union(*guest.values())
-        unreached = sorted(set().union(*clients.values()) - reached_any) if clients else []
+        unreached = sorted(set().union(*clients.values()) - reached_any) if clients and short else []
 
         for ip in unreached:
             yield critical(
