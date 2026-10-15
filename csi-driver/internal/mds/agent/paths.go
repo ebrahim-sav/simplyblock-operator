@@ -15,6 +15,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"sync"
@@ -27,6 +28,12 @@ import (
 
 // DefaultPathInterval is how often every export's paths are reconciled.
 const DefaultPathInterval = 10 * time.Second
+
+// DefaultPathConcurrency is how many subsystems a tick reconciles at once. A
+// path that does not come up holds its reconcile for the connector's per-path
+// timeout, so a storage node that is down would otherwise hold every export
+// behind the first one with a path to it.
+const DefaultPathConcurrency = 8
 
 // Assembler is the export service the keeper wraps.
 type Assembler interface {
@@ -42,6 +49,9 @@ type ReconcileFunc func(ctx context.Context, conn lvol.Connection, hostNQN strin
 type PathKeeper struct {
 	Reconcile ReconcileFunc
 	Log       Logger
+	// Concurrency is how many subsystems a tick reconciles at once; zero is
+	// DefaultPathConcurrency.
+	Concurrency int
 
 	mu      sync.Mutex
 	exports map[string]*kept
@@ -135,21 +145,38 @@ func (k *PathKeeper) forget(path string) {
 	delete(k.exports, path)
 }
 
-// Tick reconciles every kept export once.
+// Tick reconciles every kept export once. Subsystems are reconciled beside
+// each other, and the exports of one subsystem one after another, since both
+// would connect the same missing path.
 func (k *PathKeeper) Tick(ctx context.Context) {
 	k.mu.Lock()
-	paths := make([]string, 0, len(k.exports))
-	for path := range k.exports {
-		paths = append(paths, path)
+	bySubsystem := map[string][]string{}
+	for path, e := range k.exports {
+		bySubsystem[e.conn.NQN] = append(bySubsystem[e.conn.NQN], path)
 	}
 	k.mu.Unlock()
-	slices.Sort(paths)
-	for _, path := range paths {
-		if ctx.Err() != nil {
-			return
-		}
-		k.reconcile(ctx, path)
+
+	limit := k.Concurrency
+	if limit <= 0 {
+		limit = DefaultPathConcurrency
 	}
+	slots := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for _, nqn := range slices.Sorted(maps.Keys(bySubsystem)) {
+		paths := bySubsystem[nqn]
+		slices.Sort(paths)
+		wg.Go(func() {
+			slots <- struct{}{}
+			defer func() { <-slots }()
+			for _, path := range paths {
+				if ctx.Err() != nil {
+					return
+				}
+				k.reconcile(ctx, path)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 func (k *PathKeeper) reconcile(ctx context.Context, path string) {

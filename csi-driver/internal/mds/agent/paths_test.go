@@ -123,7 +123,10 @@ func TestTheKeeperReconcilesWhatWasCreatedUntilItIsDeleted(t *testing.T) {
 		"nqn:lvol:b as nqn.2014-08.io.simplyblock:uuid:guest",
 		"nqn:lvol:b as nqn.2014-08.io.simplyblock:uuid:guest",
 	}
-	if got := r.calls(); !slices.Equal(got, want) {
+	// A tick reconciles exports beside each other, so in no particular order.
+	got := r.calls()
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
 		t.Errorf("reconciled %v, want %v", got, want)
 	}
 }
@@ -271,5 +274,78 @@ func TestTheKeeperSaysWhenAPathDropsAndWhenItIsBack(t *testing.T) {
 	states := k.States()
 	if st, ok := states["/exports/a"]; !ok || st.Live != 2 || st.Expected != 2 {
 		t.Errorf("States() = %+v, want /exports/a at 2 of 2", states)
+	}
+}
+
+// overlap is a reconcile that waits for company: it reports how many
+// reconciles ran at once, and how many of them shared a subsystem.
+type overlap struct {
+	mu      sync.Mutex
+	running map[string]int
+	total   int
+	most    int
+	shared  bool
+	want    int
+	arrived chan struct{}
+}
+
+func (o *overlap) reconcile(ctx context.Context, conn lvol.Connection, _ string) (nvmeof.PathState, error) {
+	o.mu.Lock()
+	o.running[conn.NQN]++
+	o.total++
+	o.most = max(o.most, o.total)
+	o.shared = o.shared || o.running[conn.NQN] > 1
+	if o.total == o.want {
+		close(o.arrived)
+	}
+	o.mu.Unlock()
+	// A path that does not come up holds its reconcile for the connector's
+	// per-path timeout. Here it is held until every reconcile that could run
+	// beside it has started, or for long enough that none will.
+	select {
+	case <-o.arrived:
+	case <-time.After(300 * time.Millisecond):
+	}
+	o.mu.Lock()
+	o.running[conn.NQN]--
+	o.total--
+	o.mu.Unlock()
+	return nvmeof.PathState{NQN: conn.NQN}, nil
+}
+
+// A path that is slow to come up holds only its own export: the other exports'
+// paths are reconciled beside it in the same tick.
+func TestTheKeeperReconcilesExportsBesideEachOther(t *testing.T) {
+	o := &overlap{running: map[string]int{}, want: 3, arrived: make(chan struct{})}
+	k := &PathKeeper{Reconcile: o.reconcile, Log: &recordingLog{}}
+	a := k.Wrap(&fakeAssembler{})
+	ctx := context.Background()
+	for _, name := range []string{"a", "b", "c"} {
+		if err := a.Create(ctx, spec("/exports/"+name, "nqn:lvol:"+name)); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	k.Tick(ctx)
+	if o.most != 3 {
+		t.Errorf("at most %d of 3 exports were reconciled at once, want all 3", o.most)
+	}
+}
+
+// Two exports of one subsystem are never reconciled at once: both would
+// connect the same missing path, and the kernel would get two controllers for
+// one endpoint.
+func TestTheKeeperReconcilesOneSubsystemAtATime(t *testing.T) {
+	o := &overlap{running: map[string]int{}, want: 3, arrived: make(chan struct{})}
+	k := &PathKeeper{Reconcile: o.reconcile, Log: &recordingLog{}}
+	a := k.Wrap(&fakeAssembler{})
+	ctx := context.Background()
+	for path, nqn := range map[string]string{"a": "nqn:lvol:x", "b": "nqn:lvol:x", "c": "nqn:lvol:y"} {
+		if err := a.Create(ctx, spec("/exports/"+path, nqn)); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	k.Tick(ctx)
+	if o.shared {
+		t.Error("two exports of one subsystem were reconciled at once")
 	}
 }
