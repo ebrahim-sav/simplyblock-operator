@@ -103,6 +103,31 @@ func TestMDSPodAttachesToTheDataNetwork(t *testing.T) {
 	}
 }
 
+// Narrowing or moving the address range restarts the metadata server, as the
+// API promises: the range lives in the NetworkAttachmentDefinition, which
+// Multus reads only when a pod starts, so the running pod would keep an
+// address the range no longer holds.
+func TestMDSPodTemplateChangesWithTheAddressRange(t *testing.T) {
+	attachment := &MDSDataAttachment{Network: "simplyblock-mds-data", Interface: testDataIface}
+	hash := func(start, end string) string {
+		t.Helper()
+		d := withDataNetwork(testDriver("simplyblock"))
+		d.Spec.PNFS.MDS.DataNetwork.RangeStart, d.Spec.PNFS.MDS.DataNetwork.RangeEnd = start, end
+		_, sts, err := MDSObjects(d, testClusterID, "simplyblock-state", attachment)
+		if err != nil {
+			t.Fatalf("MDSObjects: %v", err)
+		}
+		return sts.Annotations[MDSTemplateHashAnnotation]
+	}
+	was := hash("10.10.10.200", "10.10.10.209")
+	if got := hash("10.10.10.200", "10.10.10.204"); got == was {
+		t.Error("a new rangeEnd left the template hash as it was, so the pod keeps its address")
+	}
+	if got := hash("10.10.10.210", "10.10.10.219"); got == was {
+		t.Error("a new rangeStart left the template hash as it was, so the pod keeps its address")
+	}
+}
+
 // Without a data network nothing of the attachment appears, so the pod
 // template, and with it the running guest, stays as it was.
 func TestMDSPodWithoutADataNetworkHasNoAttachment(t *testing.T) {

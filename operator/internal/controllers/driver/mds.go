@@ -400,7 +400,7 @@ func MDSObjects(
 		if err != nil {
 			return nil, nil, fmt.Errorf("spec.pnfs.mds.dataNetwork.subnet %q: %w", spec.DataNetwork.Subnet, err)
 		}
-		if err := dataNetworkPodSpec(&sts.Spec.Template, subnet, data); err != nil {
+		if err := dataNetworkPodSpec(&sts.Spec.Template, subnet, spec.DataNetwork, data); err != nil {
 			return nil, nil, err
 		}
 	}

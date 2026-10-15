@@ -40,6 +40,12 @@ const (
 	// its default one.
 	NetworksAnnotation = "k8s.v1.cni.cncf.io/networks"
 
+	// MDSDataRangeAnnotation records the address range of the data network on
+	// the metadata server's pod template. The range lives in the
+	// NetworkAttachmentDefinition, which Multus reads only when a pod starts,
+	// so recording it here is what makes a range edit restart the pod.
+	MDSDataRangeAnnotation = "storage.simplyblock.io/mds-data-range"
+
 	// MDSDataInterface is the name the data-network interface takes in the
 	// metadata server pod.
 	MDSDataInterface = "net1"
@@ -236,15 +242,18 @@ func nadMaster(nad *unstructured.Unstructured) string {
 // annotation, a required node affinity on the attachment's interface carrying
 // the subnet, and a preference for nodes that run no storage node. The path
 // from a macvlan to its own host's address does not work, so on a storage node
-// the metadata server would lose the path to that node.
+// the metadata server would lose the path to that node. The address range is
+// recorded too, so a change to it restarts the pod.
 func dataNetworkPodSpec(
-	template *corev1.PodTemplateSpec, subnet netip.Prefix, data *MDSDataAttachment,
+	template *corev1.PodTemplateSpec, subnet netip.Prefix, network *simplyblockv1alpha2.DriverPNFSDataNetwork,
+	data *MDSDataAttachment,
 ) error {
 	networks, err := json.Marshal([]map[string]string{{"name": data.Network, "interface": MDSDataInterface}})
 	if err != nil {
 		return fmt.Errorf("encoding the networks annotation: %w", err)
 	}
 	template.Annotations[NetworksAnnotation] = string(networks)
+	template.Annotations[MDSDataRangeAnnotation] = network.RangeStart + "-" + network.RangeEnd
 	template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
 			NodeSelectorTerms: []corev1.NodeSelectorTerm{{MatchExpressions: []corev1.NodeSelectorRequirement{{
