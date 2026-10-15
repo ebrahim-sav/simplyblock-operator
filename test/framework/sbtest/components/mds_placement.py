@@ -21,6 +21,7 @@ import json
 import threading
 import time
 from collections import Counter
+from collections.abc import Mapping
 from typing import Any
 
 from ..core import Component, MdsInstance, MdsPlacement, RunContext, component, now_utc
@@ -91,6 +92,7 @@ class MdsPlacementRecorder(Component):
         self._storage: list[str] = []
         self._pinned = False
         self._previous: dict[str, str] | None = None
+        self._applied: dict[str, str] = {}
         self._driver = ""
 
     # -- the cluster ----------------------------------------------------------------
@@ -114,7 +116,7 @@ class MdsPlacementRecorder(Component):
         mds = (json.loads(cp.stdout).get("spec", {}).get("pnfs") or {}).get("mds") or {}
         return dict(mds.get("nodeSelector") or {}) if "nodeSelector" in mds else None
 
-    def _set_selector(self, ns: str, selector: dict[str, str] | None) -> None:
+    def _set_selector(self, ns: str, selector: Mapping[str, str | None] | None) -> None:
         patch = {"spec": {"pnfs": {"mds": {"nodeSelector": selector}}}}
         kube.run(["-n", ns, "patch", "simplyblockdriver", self._driver, "--type=merge",
                   "-p", json.dumps(patch)])
@@ -143,7 +145,8 @@ class MdsPlacementRecorder(Component):
             return
         self._driver = self._driver_name(ns)
         self._previous = self._selector(ns)
-        self._set_selector(ns, {**(self._previous or {}), **selector})
+        self._applied = {**(self._previous or {}), **selector}
+        self._set_selector(ns, self._applied)
         self._pinned = True
         ctx.log.info(f"{self.name}: metadata server pinned to {selector} on driver {self._driver}")
         deadline = time.monotonic() + float(self.opt("pin_timeout_s"))
@@ -185,8 +188,14 @@ class MdsPlacementRecorder(Component):
         if not self._pinned:
             return
         ns = ctx.namespace(str(self.opt("plane")))
+        # A merge patch merges a map into the one there, so a key the pin added is
+        # removed by naming it with null. A selector that was not there at all goes
+        # with a null for the whole field.
+        restore: dict[str, str | None] | None = None
+        if self._previous is not None:
+            restore = {**{k: None for k in self._applied if k not in self._previous}, **self._previous}
         try:
-            self._set_selector(ns, self._previous)
+            self._set_selector(ns, restore)
             ctx.log.info(f"{self.name}: driver {self._driver} node selector restored")
         except Exception as e:  # noqa: BLE001
             ctx.log.warn(f"{self.name}: restoring the node selector on {self._driver} failed: {e}")
