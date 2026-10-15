@@ -71,6 +71,10 @@ type config struct {
 	// dataInterface is the pod's attachment to the storage data network, or
 	// empty for a pod on the pod network alone.
 	dataInterface string
+
+	// hostProxy is the mds-proxy on this pod's node, host:port, or empty to
+	// leave the guest's connections to its own node unredirected.
+	hostProxy string
 }
 
 func parseFlags() config {
@@ -94,6 +98,9 @@ func parseFlags() config {
 		"Pod memory limit in MiB (downward API limits.memory, divisor 1Mi)")
 	flag.StringVar(&c.dataInterface, "data-interface", "",
 		"The pod's interface on the storage data network; the guest's traffic to it leaves through it")
+	flag.StringVar(&c.hostProxy, "host-proxy", "",
+		"The mds-proxy on this pod's node, host:port; the guest's connections to the node's own addresses go "+
+			"through it")
 	flag.BoolVar(&c.vhostNet, "vhost-net", false, "Use vhost-net for the guest NIC; needs /dev/vhost-net")
 	flag.BoolVar(&c.zeroedLayouts, "zeroed-layouts", true,
 		"Zero and write the blocks of a pNFS write layout at allocation, so data a client wrote "+
@@ -168,8 +175,14 @@ func run(ctx context.Context, c config) error {
 	}
 	plan := netsetup.DefaultPlan(uplink)
 	plan.DataInterface = c.dataInterface
+	plan.HostPath = c.hostProxy != ""
 	if err := netsetup.Apply(ctx, plan, netsetup.ExecIPTables); err != nil {
 		return err
+	}
+	if plan.HostPath {
+		if err := startHostPath(ctx, plan, c.hostProxy); err != nil {
+			return err
+		}
 	}
 
 	if err := os.MkdirAll(c.runDir, 0o700); err != nil {

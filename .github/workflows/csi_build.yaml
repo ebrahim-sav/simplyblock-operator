@@ -132,7 +132,7 @@ jobs:
         echo "ref=${image_name}:${tag}" >> "$GITHUB_OUTPUT"
 
   # The pNFS metadata server image (design-pnfs-mds-vm.md §5.6): QEMU, the
-  # pnfs-os guest with mds-agent written into it, and mds-runner. Tagged like
+  # pnfs-os guest with mds-agent written into it, mds-runner, and mds-proxy. Tagged like
   # the driver with a pnfs-mds- prefix in the same repository, which is the
   # tag the operator defaults spec.pnfs.mds.image to. It does not gate the
   # integration suite, which runs no pod-hosted metadata server.

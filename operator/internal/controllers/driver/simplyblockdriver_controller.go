@@ -204,6 +204,10 @@ func (r *SimplyblockDriverReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{}, err
 	}
 
+	if err := r.ensureMDSProxy(ctx, &d); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.recordOrigin(ctx, &d, met); err != nil {
 		return ctrl.Result{}, err
 	}

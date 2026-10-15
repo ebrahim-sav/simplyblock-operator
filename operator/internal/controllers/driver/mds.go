@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"net/netip"
 	"os"
 	"slices"
@@ -334,11 +333,7 @@ func MDSObjects(
 
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name, MDSClusterLabel: clusterID}
-	nodeSelector := maps.Clone(spec.NodeSelector)
-	if nodeSelector == nil {
-		nodeSelector = map[string]string{}
-	}
-	nodeSelector[KVMCapableLabel] = KVMCapableValue
+	nodeSelector := mdsNodeSelector(spec)
 
 	volumes := slices.Concat(
 		[]corev1.Volume{
@@ -439,7 +434,9 @@ func mdsRunnerContainer(
 	d *simplyblockv1alpha2.SimplyblockDriver, image string, data *MDSDataAttachment,
 ) corev1.Container {
 	spec := d.Spec.PNFS.MDS
-	args := linkArgs(d)
+	// The guest reaches its own node's storage node through the mds-proxy
+	// there (design-pnfs-mds-vm.md §8.5).
+	args := append(linkArgs(d), "--host-proxy="+mdsProxyAddress)
 	if data != nil {
 		// The guest's traffic to the data network leaves through it.
 		args = append(args, "--data-interface="+MDSDataInterface)
@@ -453,6 +450,7 @@ func mdsRunnerContainer(
 		Env: slices.Concat(linkEnv(), []corev1.EnvVar{
 			resourceEnv("MDS_CPU_LIMIT_MILLI", "limits.cpu", "1m"),
 			resourceEnv("MDS_MEMORY_LIMIT_MIB", "limits.memory", "1Mi"),
+			hostIPEnvVar(),
 		}, tlsEnv(d)),
 		Resources: mdsResources(spec.Resources),
 		Ports: []corev1.ContainerPort{

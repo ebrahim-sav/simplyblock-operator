@@ -56,6 +56,13 @@ func Apply(ctx context.Context, p Plan, run Runner) error {
 	if err := ensureTap(p, bridge); err != nil {
 		return err
 	}
+	// The jump into the host path's chain names it, and iptables refuses a
+	// jump to a chain that does not exist yet.
+	if p.HostPath {
+		if err := EnsureChain(ctx, run, "nat", HostPathChain); err != nil {
+			return err
+		}
+	}
 	return EnsureRules(ctx, run, p.Rules())
 }
 
