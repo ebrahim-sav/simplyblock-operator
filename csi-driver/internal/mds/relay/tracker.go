@@ -34,15 +34,27 @@ type Tracker struct {
 
 	mu      sync.Mutex
 	exports map[string]tracked
+	locks   map[string]*sync.Mutex
+	// version numbers every track, so a refresh can tell that a Create landed
+	// after it read an export.
+	version uint64
 }
 
 type tracked struct {
-	spec export.Spec
-	conn lvol.Connection
+	spec    export.Spec
+	conn    lvol.Connection
+	version uint64
 }
 
-// Create assembles the export and remembers the connection it was handed.
+// Create assembles the export and remembers the connection it was handed. It
+// holds the export, so no reassembly or Delete of it runs beside it.
 func (t *Tracker) Create(ctx context.Context, spec export.Spec) error {
+	unlock := t.lock(spec.Path)
+	defer unlock()
+	return t.create(ctx, spec)
+}
+
+func (t *Tracker) create(ctx context.Context, spec export.Spec) error {
 	conn, err := t.Relay.create(ctx, spec)
 	if err != nil {
 		return err
@@ -51,8 +63,11 @@ func (t *Tracker) Create(ctx context.Context, spec export.Spec) error {
 	return nil
 }
 
-// Delete tears the export down and forgets it.
+// Delete tears the export down and forgets it, holding the export as Create
+// does.
 func (t *Tracker) Delete(ctx context.Context, spec export.Spec) error {
+	unlock := t.lock(spec.Path)
+	defer unlock()
 	if err := t.Relay.Delete(ctx, spec); err != nil {
 		return err
 	}
@@ -74,7 +89,24 @@ func (t *Tracker) track(spec export.Spec, conn lvol.Connection) {
 	if t.exports == nil {
 		t.exports = map[string]tracked{}
 	}
-	t.exports[spec.Path] = tracked{spec: spec, conn: conn}
+	t.version++
+	t.exports[spec.Path] = tracked{spec: spec, conn: conn, version: t.version}
+}
+
+// lock holds one export's lock and returns its release.
+func (t *Tracker) lock(path string) func() {
+	t.mu.Lock()
+	if t.locks == nil {
+		t.locks = map[string]*sync.Mutex{}
+	}
+	l, ok := t.locks[path]
+	if !ok {
+		l = &sync.Mutex{}
+		t.locks[path] = l
+	}
+	t.mu.Unlock()
+	l.Lock()
+	return l.Unlock
 }
 
 // Refresh asks the control plane where every tracked export's volume is
@@ -100,22 +132,31 @@ func (t *Tracker) Refresh(ctx context.Context) {
 		if samePaths(now, e.conn) {
 			continue
 		}
-		t.logf("export %s: volume %s is published at %v, not %v; reassembling",
-			e.spec.Path, e.spec.VolumeUUID, paths(now), paths(e.conn))
-		if !t.stillTracked(e.spec.Path) {
-			continue
-		}
-		if err := t.Create(ctx, e.spec); err != nil {
-			t.logf("export %s: reassembling: %v", e.spec.Path, err)
-		}
+		t.reassemble(ctx, e, now)
 	}
 }
 
-func (t *Tracker) stillTracked(path string) bool {
+// reassemble hands the guest the export again, unless a Delete or a Create of
+// it landed since the refresh read it: a Delete is final, and a Create carried
+// a newer spec and a connection resolved after this one.
+func (t *Tracker) reassemble(ctx context.Context, e tracked, now lvol.Connection) {
+	unlock := t.lock(e.spec.Path)
+	defer unlock()
+	if cur, ok := t.current(e.spec.Path); !ok || cur.version != e.version {
+		return
+	}
+	t.logf("export %s: volume %s is published at %v, not %v; reassembling",
+		e.spec.Path, e.spec.VolumeUUID, paths(now), paths(e.conn))
+	if err := t.create(ctx, e.spec); err != nil {
+		t.logf("export %s: reassembling: %v", e.spec.Path, err)
+	}
+}
+
+func (t *Tracker) current(path string) (tracked, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_, ok := t.exports[path]
-	return ok
+	e, ok := t.exports[path]
+	return e, ok
 }
 
 // Run refreshes every interval until ctx ends.
