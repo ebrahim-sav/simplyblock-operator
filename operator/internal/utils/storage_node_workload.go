@@ -18,6 +18,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// The two values a boolean reaches the agent's environment as. It reads them
+// as strings, so they are spelled once here.
+const (
+	envTrue  = "true"
+	envFalse = "false"
+)
+
 // defaultInitContainerResources are applied when the cluster states no
 // initContainerResources. The init containers write one env file and run
 // node_configure.py once, so both are sized for a short, small job.
@@ -91,15 +98,15 @@ func BuildStorageNodeDaemonSet(
 	}
 
 	mainEnv := []corev1.EnvVar{
-		{Name: "UBUNTU_HOST", Value: ptr.StringOrDefault(wl.UbuntuHost, "false")},
+		{Name: "UBUNTU_HOST", Value: ptr.StringOrDefault(wl.UbuntuHost, envFalse)},
 		{Name: "OPENSHIFT_CLUSTER", Value: strconv.FormatBool(wl.OpenShift != nil)},
-		{Name: "TALOS_CLUSTER", Value: ptr.StringOrDefault(wl.Talos, "false")},
+		{Name: "TALOS_CLUSTER", Value: ptr.StringOrDefault(wl.Talos, envFalse)},
 		{Name: "SKIP_KUBELET_CONFIGURATION", Value: skipKubeletConfiguration(wl)},
 		{Name: "SIMPLY_BLOCK_DOCKER_IMAGE", Value: image},
 		{Name: "HOSTNAME", ValueFrom: &corev1.EnvVarSource{
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
 		}},
-		{Name: "CPU_TOPOLOGY_ENABLED", Value: ptr.StringOrDefault(wl.EnableCpuTopology, "false")},
+		{Name: "CPU_TOPOLOGY_ENABLED", Value: ptr.StringOrDefault(wl.EnableCpuTopology, envFalse)},
 	}
 	if wl.NodeProvisioningBudget != nil {
 		mainEnv = append(mainEnv, corev1.EnvVar{Name: "MAX_PARALLEL_NODE_ADDS", Value: fmt.Sprintf("%d", *wl.NodeProvisioningBudget)})
@@ -116,14 +123,14 @@ func BuildStorageNodeDaemonSet(
 	}
 	if tlsMutualEnabled {
 		mainEnv = append(mainEnv,
-			corev1.EnvVar{Name: "SB_TLS_SERVE", Value: "true"},
+			corev1.EnvVar{Name: "SB_TLS_SERVE", Value: envTrue},
 			corev1.EnvVar{Name: "SB_TLS_CONNECT", Value: "authenticated"},
 			corev1.EnvVar{Name: "SB_TLS_CLIENT_AUTH", Value: "required"},
 			corev1.EnvVar{Name: "SB_TLS_PROVIDER", Value: NormalizeTLSProvider(tlsProvider)},
 		)
 	} else if tlsEnabled {
 		mainEnv = append(mainEnv,
-			corev1.EnvVar{Name: "SB_TLS_SERVE", Value: "true"},
+			corev1.EnvVar{Name: "SB_TLS_SERVE", Value: envTrue},
 			corev1.EnvVar{Name: "SB_TLS_CONNECT", Value: "anonymous"},
 			corev1.EnvVar{Name: "SB_TLS_CLIENT_AUTH", Value: "optional"},
 			corev1.EnvVar{Name: "SB_TLS_PROVIDER", Value: NormalizeTLSProvider(tlsProvider)},
@@ -273,7 +280,7 @@ func BuildStorageNodeDaemonSet(
 		mainMounts = append(mainMounts, tlsMounts...)
 	}
 
-	podAnnotations := map[string]string{AnnotationLogCollector: "true"}
+	podAnnotations := map[string]string{AnnotationLogCollector: envTrue}
 	if tlsEnabled && tlsSecretResourceVersion != "" {
 		podAnnotations[AnnotationTLSSecretRevision] = tlsSecretResourceVersion
 	}
@@ -746,7 +753,7 @@ func storageNodesOf(cluster *simplyblockv1alpha2.StorageCluster) *simplyblockv1a
 // (design-storagenode.md §15.1).
 func skipKubeletConfiguration(wl *simplyblockv1alpha2.StorageNodesSpec) string {
 	if ptr.BoolFromOrFalse(wl.EnableKubeletConfiguration) {
-		return "false"
+		return envFalse
 	}
-	return "true"
+	return envTrue
 }
