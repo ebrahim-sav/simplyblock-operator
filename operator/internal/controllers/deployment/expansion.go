@@ -395,7 +395,9 @@ func (r *ClusterDeploymentConfigReconciler) buildWorkload(
 	}
 	// The talosctl slot is the fleet's too: one Job image for every Talos worker
 	// the DaemonSet reaches. Unstated leaves the node agent's default in place.
-	workload.TalosctlImage = imageOf(config, talosctlSlot)
+	if images := config.Spec.Images; images != nil && images.Talosctl != nil {
+		workload.TalosctlImage = images.Talosctl.Image
+	}
 
 	for _, set := range config.Spec.NodeSets {
 		for _, group := range set.Groups {
@@ -660,11 +662,6 @@ func spdkSlot(images *simplyblockv1alpha2.DeploymentImages) *simplyblockv1alpha2
 func spdkProxySlot(images *simplyblockv1alpha2.DeploymentImages) *simplyblockv1alpha2.ImageSpec {
 	return images.SPDKProxy
 }
-
-func talosctlSlot(images *simplyblockv1alpha2.DeploymentImages) *simplyblockv1alpha2.ImageSpec {
-	return images.Talosctl
-}
-
 // imageOf and pullPolicyOf read one slot, or the zero value when the document
 // states no images or not that slot. The zero value is what the expansion writes
 // for an unstated slot, so the field downstream keeps its own default rather than
