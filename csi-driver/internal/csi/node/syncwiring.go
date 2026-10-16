@@ -35,6 +35,36 @@ func (ns *Server) EnableSyncReplication(
 	}
 }
 
+// EnableGroupReplication turns on the consistency-group (VolumeGroupReplication)
+// switchover for this node (design §14), the group analog of
+// EnableSyncReplication. It is additive: EnableSyncReplication wires the
+// per-volume path and the shared seams (resolver, cachesSynced, node-site
+// reader), and this wires the two group-only seams on top. syncClaimLabels reads
+// a PVC's labels because a VGR names its members by a label selector, and
+// syncGroupPatchVGR performs the group switchover patch with dyn. The driver
+// calls this only when the cluster carries the VolumeGroupReplication CRD and the
+// group informers are enabled; until then detectSyncGroup is a no-op.
+func (ns *Server) EnableGroupReplication(dyn dynamic.Interface) {
+	ns.syncClaimLabels = ns.readClaimLabels
+	ns.syncGroupPatchVGR = func(ctx context.Context, vgr kube.VolumeGroupReplicationRef, site, state string) error {
+		return patchVolumeGroupReplicationSite(ctx, dyn, vgr, site, state)
+	}
+}
+
+// readClaimLabels reads the labels of a PVC, which a VolumeGroupReplication's
+// member selector matches against (design §14). The driver wires this onto
+// Server.syncClaimLabels. It reads through the API server rather than the PVC
+// informer so that it does not depend on the resolver's cache being warm for a
+// namespace this node has not staged a volume in before.
+func (ns *Server) readClaimLabels(ctx context.Context, claim types.NamespacedName) (map[string]string, error) {
+	pvc, err := ns.kubeClient.CoreV1().PersistentVolumeClaims(claim.Namespace).
+		Get(ctx, claim.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get claim %s: %w", claim, err)
+	}
+	return pvc.Labels, nil
+}
+
 // readNodeSite returns the replication site of the node this plugin runs on,
 // read from its topology zone label: a sync cluster's two sites are its two
 // zones (design §6.1, §9.6). The driver wires this onto Server.syncNodeSite.
@@ -75,6 +105,26 @@ func patchVolumeReplicationSite(
 		Patch(ctx, vr.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		return fmt.Errorf("patch VolumeReplication %s/%s to site %s: %w", vr.Namespace, vr.Name, site, err)
+	}
+	return nil
+}
+
+// patchVolumeGroupReplicationSite is the group analog of
+// patchVolumeReplicationSite: it sets a VolumeGroupReplication's SyncSiteAnnotation
+// and replicationState, the write half of the group switchover (design §14). The
+// one patch moves the whole consistency group, so every member follows together.
+// As with the per-volume patch, it is a JSON merge that leaves the class and the
+// member selector the administrator set untouched.
+func patchVolumeGroupReplicationSite(
+	ctx context.Context, dyn dynamic.Interface, vgr kube.VolumeGroupReplicationRef, site, state string,
+) error {
+	patch := []byte(fmt.Sprintf(
+		`{"metadata":{"annotations":{%q:%q}},"spec":{"replicationState":%q}}`,
+		kube.SyncSiteAnnotation, site, state))
+	_, err := dyn.Resource(kube.VolumeGroupReplicationGVR).Namespace(vgr.Namespace).
+		Patch(ctx, vgr.Name, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("patch VolumeGroupReplication %s/%s to site %s: %w", vgr.Namespace, vgr.Name, site, err)
 	}
 	return nil
 }

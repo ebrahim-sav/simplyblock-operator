@@ -107,7 +107,7 @@ func volumeIDFrom(req volumeIDCarrier) string {
 // (2026-10-02, WordPress: the demote fenced the live primary's paths and
 // took demote snapshots of it; the fail-back never got PeerReady). A secret
 // that marks no cluster local (an operator predating the flag) keeps the
-// previous behaviour, the chain's active end.
+// previous behavior, the chain's active end.
 func resolveToLocalReplica(
 	ctx context.Context, h *lvol.Handle, client *atlascp.Client,
 ) (*lvol.Handle, *atlascp.Client, error) {
@@ -230,7 +230,7 @@ type chainHop struct {
 
 // chooseReplica picks the chain member a Replication RPC acts on: the last
 // member on a local cluster when the secret marks local clusters (and the
-// chain's end when none of the members is local, e.g. a volume that only
+// chain's end when none of the members is local, e.g., a volume that only
 // ever lived elsewhere), else the chain's end.
 func chooseReplica(hops []chainHop, local map[string]bool, flagged bool) chainHop {
 	end := hops[len(hops)-1]
@@ -466,6 +466,36 @@ func (cs *Server) resolveSyncSite(ctx context.Context, h lvol.VolumeHandle) (str
 	return site, nil
 }
 
+// resolveGroupSyncSite reads the site a consistency group is served from, from its
+// VolumeGroupReplication's SyncSiteAnnotation (design §14). When the group resolver
+// is not wired it falls back to the transitional site class parameter, so a cluster
+// without the VGR correlation still drives the group through the class. An empty
+// site either way is a FailedPrecondition: the group verb refuses rather than reach
+// the backend with no site.
+func (cs *Server) resolveGroupSyncSite(
+	ctx context.Context, gh lvol.GroupHandle, params map[string]string,
+) (string, error) {
+	if cs.syncGroupSite == nil {
+		site := params[siteParam]
+		if site == "" {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"group %s carries no site: no group-replication resolver is wired and the %s class parameter is unset",
+				gh.GroupID, siteParam)
+		}
+		return site, nil
+	}
+	site, err := cs.syncGroupSite(ctx, gh.Handle())
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable,
+			"resolve the site of group %s from its VolumeGroupReplication: %v", gh.GroupID, err)
+	}
+	if site == "" {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"group %s carries no %s annotation naming its site", gh.GroupID, kube.SyncSiteAnnotation)
+	}
+	return site, nil
+}
+
 func (cs *Server) PromoteVolume(
 	ctx context.Context,
 	req *replication.PromoteVolumeRequest,
@@ -476,15 +506,20 @@ func (cs *Server) PromoteVolume(
 	}
 	if method == methodSync {
 		if gh, ok := lvol.ParseGroupHandle(lvol.VolumeHandle(volumeIDFrom(req))); ok {
-			// The whole consistency group promotes as one unit (design §13).
-			// Phase-2 transitional: the group's site is read from the class
-			// parameter until it moves to the VolumeGroupReplication annotation
-			// (design §14); the single-volume path below reads the annotation.
+			// The whole consistency group promotes as one unit (design §13, §14).
+			// The group's active site is read from its VolumeGroupReplication's
+			// SyncSiteAnnotation, the group analog of the single-volume path below,
+			// with a fall back to the transitional class parameter when no group
+			// resolver is wired.
+			site, err := cs.resolveGroupSyncSite(ctx, gh, req.GetParameters())
+			if err != nil {
+				return nil, err
+			}
 			client, err := clusters.ReplicationClient(ctx, gh.ClusterID)
 			if err != nil {
 				return nil, status.Error(codes.Unavailable, err.Error())
 			}
-			if _, err := client.SyncPromoteGroup(ctx, gh, req.GetParameters()[siteParam], !req.GetForce()); err != nil {
+			if _, err := client.SyncPromoteGroup(ctx, gh, site, !req.GetForce()); err != nil {
 				return nil, classifySyncError(err)
 			}
 			return &replication.PromoteVolumeResponse{}, nil
@@ -585,15 +620,19 @@ func (cs *Server) DemoteVolume(
 	}
 	if method == methodSync {
 		if gh, ok := lvol.ParseGroupHandle(lvol.VolumeHandle(volumeIDFrom(req))); ok {
-			// The whole consistency group fences as one unit (design §13).
-			// Phase-2 transitional: the group's site is read from the class
-			// parameter until it moves to the VolumeGroupReplication annotation
-			// (design §14); the single-volume path below reads the annotation.
+			// The whole consistency group fences as one unit (design §13, §14).
+			// The site is read from the VolumeGroupReplication's SyncSiteAnnotation,
+			// with a fall back to the transitional class parameter when no group
+			// resolver is wired.
+			site, err := cs.resolveGroupSyncSite(ctx, gh, req.GetParameters())
+			if err != nil {
+				return nil, err
+			}
 			client, err := clusters.ReplicationClient(ctx, gh.ClusterID)
 			if err != nil {
 				return nil, status.Error(codes.Unavailable, err.Error())
 			}
-			if err := client.SyncDemoteGroup(ctx, gh, req.GetParameters()[siteParam]); err != nil {
+			if err := client.SyncDemoteGroup(ctx, gh, site); err != nil {
 				return nil, classifySyncError(err)
 			}
 			return &replication.DemoteVolumeResponse{}, nil

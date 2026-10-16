@@ -680,8 +680,10 @@ type mockGroup struct {
 	// Group-replication state the driver's group-handle routing drives.
 	PolicyID         string
 	Promoted         bool
+	PromotedSite     string // the site= query the last group failover carried
 	Demoted          bool
-	DemoteConverging bool // when set, /demote answers 202 (still converging)
+	DemotedSite      string // the site= query the last group demote carried
+	DemoteConverging bool   // when set, /demote answers 202 (still converging)
 	FailbackSource   string
 	LastReplicatedAt int64 // unix seconds surfaced by /replication/status
 }
@@ -740,6 +742,7 @@ func (m *mockSBCLI) handleGroupFailover(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	g.Promoted = true
+	g.PromotedSite = r.URL.Query().Get("site")
 	writeJSON(w, http.StatusOK, map[string]any{"members": []any{}})
 }
 
@@ -754,6 +757,7 @@ func (m *mockSBCLI) handleGroupDemote(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.Demoted = true
+	g.DemotedSite = r.URL.Query().Get("site")
 	w.WriteHeader(http.StatusNoContent)
 }
 

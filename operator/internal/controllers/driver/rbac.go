@@ -66,6 +66,13 @@ var clusterRoleRules = map[string][]rbacv1.PolicyRule{
 		// read-only.
 		rule(replication, []string{"volumereplications"}, "get", "list", "watch", "patch"),
 		rule(replication, []string{"volumereplicationclasses"}, "get", "list", "watch"),
+		// Consistency groups: the node drives a VolumeGroupReplication exactly as it
+		// drives a per-volume one -- it patches the sync-site annotation and
+		// replicationState to move the whole group to the pod's site (design §14).
+		// It reads the class to tell a synchronous group apart, and never creates or
+		// deletes a VGR.
+		rule(replication, []string{"volumegroupreplications"}, "get", "list", "watch", "patch"),
+		rule(replication, []string{"volumegroupreplicationclasses"}, "get", "list", "watch"),
 	},
 	// The driver's own controller plugin, as distinct from the sidecars. It
 	// had no role until pNFS: every API-server call on that pod was a
@@ -93,6 +100,15 @@ var clusterRoleRules = map[string][]rbacv1.PolicyRule{
 		rule(core, []string{"persistentvolumes"}, "get", "list", "watch"),
 		rule(core, []string{"persistentvolumeclaims"}, "get", "list", "watch"),
 		rule(replication, []string{"volumereplications"}, "get", "list", "watch"),
+		// Consistency groups: a group replication request names the group by a
+		// backend handle and carries no claim, so the controller correlates it to
+		// its VolumeGroupReplication through the content object (handle -> content ->
+		// VGR) to read the group's active site from the VGR annotation (design §14).
+		// It needs cluster-wide read on the VGR and the content, and the class to
+		// stay symmetric with the per-volume path; it never writes any of them.
+		rule(replication, []string{"volumegroupreplications"}, "get", "list", "watch"),
+		rule(replication, []string{"volumegroupreplicationclasses"}, "get", "list", "watch"),
+		rule(replication, []string{"volumegroupreplicationcontents"}, "get", "list", "watch"),
 	},
 	"provisioner": {
 		rule(core, []string{"secrets"}, "get", "list"),

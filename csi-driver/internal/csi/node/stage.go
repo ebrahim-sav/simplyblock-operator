@@ -118,6 +118,12 @@ func (ns *Server) NodeStageVolume(
 	// node's site, and the connection is gated on that, so it takes a different
 	// staging path (design §6). An ordinary volume (the common case, and every
 	// volume when sync replication is not configured) falls through unchanged.
+	//
+	// The two sync paths are mutually exclusive: a volume is protected either by
+	// its own VolumeReplication (per-volume) or as a member of a
+	// VolumeGroupReplication (a consistency group, design §14), never both. The
+	// per-volume check runs first; a volume it does not claim is tried against the
+	// group path.
 	if vr, isSync, err := ns.detectSyncReplication(ctx, vc); err != nil {
 		return nil, err
 	} else if isSync {
@@ -127,6 +133,15 @@ func (ns *Server) NodeStageVolume(
 		// volume is led from this site and the ordinary attach below connects to
 		// it (design §6.2-§6.4).
 		if err := ns.ensureSyncPromoted(ctx, vr); err != nil {
+			return nil, err
+		}
+	} else if vgr, isGroup, err := ns.detectSyncGroup(ctx, vc); err != nil {
+		return nil, err
+	} else if isGroup {
+		// A consistency-group member follows its pod as a unit: the whole group's
+		// leadership moves to this node's site before any member is attached, so a
+		// pod never comes up with members led from two sites (design §14).
+		if err := ns.ensureGroupPromoted(ctx, vgr); err != nil {
 			return nil, err
 		}
 	}

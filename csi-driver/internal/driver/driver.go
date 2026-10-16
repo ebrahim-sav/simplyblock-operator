@@ -321,9 +321,33 @@ func enableSyncReplication(
 		klog.Errorf("sync replication: build resolver: %v; node staging stays site-unaware", err)
 		return
 	}
+
+	// The consistency-group path is additive and only wired when the cluster also
+	// carries the VolumeGroupReplication CRD (design §14). When it is, the group
+	// informers are added to the same resolver (before Start, so their indexers
+	// take) and folded into the cache-synced gate, so a group member fails closed
+	// at staging until the VGR caches are warm, exactly as a per-volume one does.
+	synced := func() bool { return vr.HasSynced() && vrClass.HasSynced() }
+	groupEnabled := false
+	var vgr, vgrClass cache.SharedIndexInformer
+	if volumeGroupReplicationCRDPresent(kubeClient.Discovery()) {
+		vgr = factory.ForResource(kube.VolumeGroupReplicationGVR).Informer()
+		vgrClass = factory.ForResource(kube.VolumeGroupReplicationClassGVR).Informer()
+		if err := resolver.EnableGroupInformers(vgr, vgrClass); err != nil {
+			klog.Errorf("sync replication: enable group informers: %v; group staging stays site-unaware", err)
+		} else {
+			groupEnabled = true
+			synced = func() bool { return vr.HasSynced() && vrClass.HasSynced() && vgr.HasSynced() && vgrClass.HasSynced() }
+		}
+	}
+
 	factory.Start(ctx.Done())
-	ns.EnableSyncReplication(resolver, func() bool { return vr.HasSynced() && vrClass.HasSynced() }, dynClient)
+	ns.EnableSyncReplication(resolver, synced, dynClient)
 	klog.Info("sync replication: node staging is site-aware for VolumeReplication-managed volumes")
+	if groupEnabled {
+		ns.EnableGroupReplication(dynClient)
+		klog.Info("sync replication: node staging is site-aware for VolumeGroupReplication consistency groups")
+	}
 
 	// Report whether the caches actually sync, bounded, without blocking startup.
 	// The node's own gate holds staging of a sync volume until they do; a wait
@@ -332,7 +356,11 @@ func enableSyncReplication(
 	go func() {
 		wctx, cancel := context.WithTimeout(context.Background(), syncCacheSyncTimeout)
 		defer cancel()
-		if cache.WaitForCacheSync(wctx.Done(), vr.HasSynced, vrClass.HasSynced) {
+		waitFor := []cache.InformerSynced{vr.HasSynced, vrClass.HasSynced}
+		if groupEnabled {
+			waitFor = append(waitFor, vgr.HasSynced, vgrClass.HasSynced)
+		}
+		if cache.WaitForCacheSync(wctx.Done(), waitFor...) {
 			klog.Info("sync replication: VolumeReplication caches synced; site-aware staging is ready")
 			return
 		}
@@ -356,6 +384,23 @@ func volumeReplicationCRDPresent(disc discovery.DiscoveryInterface) bool {
 	}
 	for _, r := range list.APIResources {
 		if r.Name == kube.VolumeReplicationGVR.Resource {
+			return true
+		}
+	}
+	return false
+}
+
+// volumeGroupReplicationCRDPresent reports whether the VolumeGroupReplication CRD
+// is served by the API server, so the node only runs the group informers where
+// they resolve (design §14). The VGR and VR CRDs share a group version, so the
+// same lookup serves both.
+func volumeGroupReplicationCRDPresent(disc discovery.DiscoveryInterface) bool {
+	list, err := disc.ServerResourcesForGroupVersion(kube.VolumeGroupReplicationGVR.GroupVersion().String())
+	if err != nil {
+		return false
+	}
+	for _, r := range list.APIResources {
+		if r.Name == kube.VolumeGroupReplicationGVR.Resource {
 			return true
 		}
 	}
@@ -395,6 +440,26 @@ func enableControllerSyncSite(
 		klog.Errorf("sync replication: build controller resolver: %v; sync verbs stay site-unaware", err)
 		return
 	}
+	// The consistency-group path is additive and only wired when the cluster also
+	// carries the VolumeGroupReplication CRD (design §14). The controller correlates
+	// a group replication request (which names the group by a backend handle) to its
+	// VGR through the content object, so it needs the VGR and VGRContent informers in
+	// addition to the per-volume ones.
+	groupEnabled := false
+	var vgr, vgrClass, vgrContent cache.SharedIndexInformer
+	if volumeGroupReplicationCRDPresent(kubeClient.Discovery()) {
+		vgr = dynFactory.ForResource(kube.VolumeGroupReplicationGVR).Informer()
+		vgrClass = dynFactory.ForResource(kube.VolumeGroupReplicationClassGVR).Informer()
+		vgrContent = dynFactory.ForResource(kube.VolumeGroupReplicationContentGVR).Informer()
+		if err := resolver.EnableGroupInformers(vgr, vgrClass); err != nil {
+			klog.Errorf("sync replication: enable controller group informers: %v; group verbs stay site-unaware", err)
+		} else if err := resolver.EnableGroupContentInformer(vgrContent); err != nil {
+			klog.Errorf("sync replication: enable controller group-content informer: %v; group verbs stay site-unaware", err)
+		} else {
+			groupEnabled = true
+		}
+	}
+
 	typed.Start(ctx.Done())
 	dynFactory.Start(ctx.Done())
 	cs.EnableSyncSiteResolution(func(ctx context.Context, h lvol.VolumeHandle) (string, error) {
@@ -405,6 +470,16 @@ func enableControllerSyncSite(
 		return ref.Site, nil
 	})
 	klog.Info("sync replication: controller sync verbs read the active site from the VolumeReplication annotation")
+	if groupEnabled {
+		cs.EnableGroupSyncSiteResolution(func(ctx context.Context, h lvol.VolumeHandle) (string, error) {
+			ref, err := resolver.VolumeGroupReplicationForGroupHandle(ctx, h)
+			if err != nil {
+				return "", err
+			}
+			return ref.Site, nil
+		})
+		klog.Info("sync replication: controller group verbs read the active site from the VolumeGroupReplication annotation")
+	}
 
 	// Report whether the caches actually sync, bounded, without blocking startup,
 	// for the same reason the node path does: a wait that never completes is almost
@@ -412,7 +487,11 @@ func enableControllerSyncSite(
 	go func() {
 		wctx, cancel := context.WithTimeout(context.Background(), syncCacheSyncTimeout)
 		defer cancel()
-		if cache.WaitForCacheSync(wctx.Done(), pv.HasSynced, pvc.HasSynced, vr.HasSynced) {
+		waitFor := []cache.InformerSynced{pv.HasSynced, pvc.HasSynced, vr.HasSynced}
+		if groupEnabled {
+			waitFor = append(waitFor, vgr.HasSynced, vgrClass.HasSynced, vgrContent.HasSynced)
+		}
+		if cache.WaitForCacheSync(wctx.Done(), waitFor...) {
 			klog.Info("sync replication: controller caches synced; site resolution is ready")
 			return
 		}

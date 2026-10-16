@@ -10,11 +10,13 @@ import (
 // on its manager cache via FieldIndexer and stay consistent with the CSI
 // driver.
 const (
-	IndexPVByVolumeHandle = "atlas.simplyblock.io/pv-by-volume-handle"
-	IndexVAByPV           = "atlas.simplyblock.io/va-by-pv"
-	IndexSCByName         = "atlas.simplyblock.io/sc-by-name"
-	IndexVRByClaim        = "atlas.simplyblock.io/vr-by-claim"
-	IndexVRClassByName    = "atlas.simplyblock.io/vrclass-by-name"
+	IndexPVByVolumeHandle   = "atlas.simplyblock.io/pv-by-volume-handle"
+	IndexVAByPV             = "atlas.simplyblock.io/va-by-pv"
+	IndexSCByName           = "atlas.simplyblock.io/sc-by-name"
+	IndexVRByClaim          = "atlas.simplyblock.io/vr-by-claim"
+	IndexVRClassByName      = "atlas.simplyblock.io/vrclass-by-name"
+	IndexVGRClassByName     = "atlas.simplyblock.io/vgrclass-by-name"
+	IndexVGRContentByHandle = "atlas.simplyblock.io/vgrcontent-by-handle"
 )
 
 // VolumeHandleKeys returns the index keys for a PV: its CSI volume handle

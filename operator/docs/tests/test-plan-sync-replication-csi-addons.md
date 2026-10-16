@@ -4,7 +4,7 @@ Related design: [`designs/design-sync-replication-csi-addons.md`](../designs/des
 
 Scenario IDs are permanent. `Type` is one of `Positive`, `Negative`, `Boundary`, `Regression`. The `Test` column holds the verbatim test function, or `—` when nothing covers the scenario yet, in which case the ID reappears in [What Is Not Yet Covered](#what-is-not-yet-covered). Parts of this design are implemented on the `sync-replication` branch (design [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status)): the method dispatch and the sync write verbs (§5, §7) and the operator provisioning (§9.4–§9.6) are built and carry the tests named below. The node path (§6), the sync status read (§5.3, §8), and most integration and end-to-end coverage are not yet built and stay `—`.
 
-Class prefixes: `U-` unit (mock backend HTTP and fake Kubernetes objects, no cluster), `I-` integration (`envtest` plus the csi-addons sidecar plus a mock backend), `E-` end-to-end (a live two-site synchronous cluster, the switch driven by pod scheduling), `M-` manual (needs orchestration not yet automated). The group scenarios (`G-`, Phase 2) are a planned block and carry no `Type` until the work is scoped (design §14).
+Class prefixes: `U-` unit (mock backend HTTP and fake Kubernetes objects, no cluster), `I-` integration (`envtest` plus the csi-addons sidecar plus a mock backend), `E-` end-to-end (a live two-site synchronous cluster, the switch driven by pod scheduling), `M-` manual (needs orchestration not yet automated). The group scenarios (`G-`, Phase 2) carry the unit coverage of the node and controller paths; the backend-dependent and live-cluster group scenarios remain planned (design §14).
 
 The control model is scheduling-driven: the node plugin reads the pod's site, signals it onto the `VolumeReplication`, the replication controller promotes there, and `NodeStageVolume` gates the connection on the promote (design §6). There is no RamenDR for sync. The per-RPC behavior (dispatch, verbs, status) is tested on its own, and the node-stage logic and the gate are tested as their own group, because the gate is where a wrong-site attach would happen and it is the property the design exists to guarantee.
 
@@ -173,17 +173,21 @@ File: live-cluster recipe (see M-01 for the orchestration this shares)
 
 ---
 
-## 4. Group Tests — Phase 2 (Planned)
+## 4. Group Tests — Phase 2
 
-The consistency-group variant (design §14). A planned block: the type of each scenario is decided when the group RPC handlers are scoped.
+The consistency-group variant (design §14). The node and controller paths follow the C′ model of §6 applied to the one `VolumeGroupReplication`: selector-based correlation, the site on a mutable annotation, the node-driven flip, and a gate on the group promote. The unit tier covers each; the ordered-fencing, cluster-wide status, member-resolution, and split-site guarantees that need the backend or a live cluster stay planned.
 
-| #    | Scenario                                                                                                                                 | Type |
-|------|------------------------------------------------------------------------------------------------------------------------------------------|------|
-| G-01 | One pod mounting several members of a group patches the one `VolumeGroupReplication` and promotes the group as a unit on the node's site | —    |
-| G-02 | A group demote fences members in order, and a retry is a no-op for those already fenced                                                  | —    |
-| G-03 | The group status reads cluster-wide plus `member_count`, never a per-member sum                                                          | —    |
-| G-04 | A group with an unresolvable or foreign member refuses the whole request before fencing anything                                         | —    |
-| G-05 | Every member's stage gates on the one group promote, so no pod comes up with members split across sites                                  | —    |
+| #    | Scenario                                                                                                                                 | Type       | Test                                                                                           |
+|------|------------------------------------------------------------------------------------------------------------------------------------------|------------|------------------------------------------------------------------------------------------------|
+| G-01 | One pod mounting several members of a group patches the one `VolumeGroupReplication` and promotes the group as a unit on the node's site | Positive   | `TestDetectSyncGroup`, `TestEnsureGroupPromoted`, `TestSyncGroupDispatch`                      |
+| G-02 | A group demote fences members in order, and a retry is a no-op for those already fenced                                                  | —          | —                                                                                              |
+| G-03 | The group status reads cluster-wide plus `member_count`, never a per-member sum                                                          | —          | —                                                                                              |
+| G-04 | A group with an unresolvable or foreign member refuses the whole request before fencing anything                                         | —          | —                                                                                              |
+| G-05 | Every member's stage gates on the one group promote, so no pod comes up with members split across sites                                  | Positive   | `TestEnsureGroupPromoted`                                                                      |
+| G-06 | A member is correlated to its group by the VGR's label selector, and an empty selector matches nothing                                   | Positive   | `TestDetectSyncGroup`, `TestInformerResolver_SyncVolumeGroupReplicationForClaim`               |
+| G-07 | A move drives the group's `replicationState` primary→secondary→primary, demoting the old site before promoting this one                  | Regression | `TestEnsureGroupPromoted`                                                                      |
+| G-08 | The controller reads the group's site from the VGR annotation, correlating the group handle through the content object                   | Positive   | `TestSyncGroupSiteFromAnnotation`, `TestInformerResolver_VolumeGroupReplicationForGroupHandle` |
+| G-09 | A wired group resolver that finds no site refuses the promote rather than reaching the backend with an empty site                        | Negative   | `TestSyncGroupMissingSite`                                                                     |
 
 ---
 
@@ -212,9 +216,9 @@ The consistency-group variant (design §14). A planned block: the type of each s
 | Unit (`U-`)           | 44        | 42      | 2           |
 | Integration (`I-`)    | 15        | 1       | 14          |
 | End-to-end (`E-`)     | 5         | 0       | 5           |
-| Group, Phase 2 (`G-`) | 5         | 0       | 5           |
+| Group, Phase 2 (`G-`) | 9         | 6       | 3           |
 | Manual (`M-`)         | 1         | 0       | 1           |
-| **Total**             | **70**    | **43**  | **27**      |
+| **Total**             | **74**    | **49**  | **25**      |
 
 The method dispatch and sync write verbs including the edge cases (`U-01`–`U-20`), the status read (`U-25`, `U-26`), the baseline node-stage path with the gate (`U-27`, `U-30`, `U-32`–`U-35`, `U-40`, `U-41`), the misconfiguration and transport cases (`U-38`, `U-39`), the mutable site-annotation signal and the driver reading the site from it (`U-42`, `U-43`, `U-46`, `U-47`, §6.2, §5.2, §6.3, superseding the struck patch-the-class path `U-29`, `U-31`, `U-36`), and the unstage-teardown robustness (`U-48`, `U-49`, `U-50`, `U-51`, §12) are covered. The unstage-time demote (`U-37`) is struck: the node no longer demotes the old site, so the switch rests on the new site's planned promote (§6.5). They span the controller package, the node package (`TestDetectSyncReplication`, `TestEnsureSyncPromoted`, `TestReadNodeSite`, `TestPatchVolumeReplicationSite`, `TestUnstageCompletesWhenTheDisconnectIsAbandoned`), and the `atlas-lib/kube` resolver tests (`TestInformerResolver_VolumeReplicationForVolumeHandle`). The two uncovered unit scenarios are the crash-idempotency of the site patch (`U-44`) and the server-side-apply co-ownership of the annotation (`U-45`, §6.2, §6.7, §9.1), which need an envtest harness against a real API server rather than a fake client. `I-14` is the sync-site provisioning check. See the [Implementation Status](../designs/design-sync-replication-csi-addons.md#implementation-status) in the design.
 
@@ -230,5 +234,5 @@ The gaps are the `VolumeReplication` replacement at the unit tier, then the inte
 | I-01 through I-10      | The reconcile loop and the staging path against the sidecar, plus the node plugin RBAC      | The node path is built and unit-tested; these prove it against a live API server and the csi-addons sidecar (the informer sync, the real patch, the RBAC), which the units cannot. Needs an envtest harness.                                                                                                        |
 | I-11, I-12, I-13, I-15 | The operator provisioning CR fields beyond the site check                                   | The cluster toggle's expansion and body, the node-site expansion, and the two immutability webhooks are wired but not yet each asserted (design §9.5, §9.6).                                                                                                                                                        |
 | E-01 through E-05      | Pod placement and movement, disaster, recovery resync, and the gate's wrong-site guard      | Needs a two-site cluster; the only proof the gate prevents a wrong-site attach and the connection entries serve the volume.                                                                                                                                                                                         |
-| G-01 through G-05      | The group variant scenarios                                                                 | The group dispatch is covered by `TestSyncGroupDispatch`; these scenarios (ordered demote, member resolution, split-site guard) are not yet each asserted (design §14).                                                                                                                                             |
+| G-02, G-03, G-04       | The backend-dependent group scenarios                                                       | The node and controller group paths are built and unit-tested (`G-01`, `G-05`–`G-09`); ordered demote, cluster-wide status, and member resolution are backend behaviors asserted against a live group, not the unit mock (design §14).                                                                              |
 | M-01                   | Shared-store blocking                                                                       | Needs a store deliberately shared across the site boundary.                                                                                                                                                                                                                                                         |

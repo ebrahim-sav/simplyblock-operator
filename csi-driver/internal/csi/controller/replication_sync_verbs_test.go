@@ -17,6 +17,10 @@ import (
 	"github.com/simplyblock/atlas/lvol"
 )
 
+// testAnnotationSite is the site a wired group resolver reports, distinct from the
+// stale class parameter, so a test can tell which source the verb used.
+const testAnnotationSite = "site-b"
+
 func syncParams(site string) map[string]string {
 	p := map[string]string{methodParam: methodSync}
 	if site != "" {
@@ -262,5 +266,61 @@ func TestSyncGroupDispatch(t *testing.T) {
 		VolumeId: vgGroupHandle, Parameters: syncParams("site-a"),
 	}); err != nil {
 		t.Fatalf("group DemoteVolume: %v", err)
+	}
+}
+
+// §14: with a group-replication resolver wired, the group's site is read from its
+// VolumeGroupReplication's SyncSiteAnnotation, not the class parameter. The wired
+// site is what reaches the backend; the stale class parameter is ignored.
+func TestSyncGroupSiteFromAnnotation(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.seedGroup(vgGroupID, vgMember1, vgMember2)
+	cs := newReplicationTestServer(t, mock)
+	ctx := context.Background()
+	// The annotation names site-b; the class parameter (stale) names site-a.
+	cs.EnableGroupSyncSiteResolution(func(context.Context, lvol.VolumeHandle) (string, error) {
+		return testAnnotationSite, nil
+	})
+
+	if _, err := cs.PromoteVolume(ctx, &replication.PromoteVolumeRequest{
+		VolumeId: vgGroupHandle, Parameters: syncParams("site-a"),
+	}); err != nil {
+		t.Fatalf("group PromoteVolume: %v", err)
+	}
+	if got := mock.groups[vgGroupID].PromotedSite; got != testAnnotationSite {
+		t.Errorf("group promoted on %q, want the annotation site, not the class parameter", got)
+	}
+
+	if _, err := cs.DemoteVolume(ctx, &replication.DemoteVolumeRequest{
+		VolumeId: vgGroupHandle, Parameters: syncParams("site-a"),
+	}); err != nil {
+		t.Fatalf("group DemoteVolume: %v", err)
+	}
+	if got := mock.groups[vgGroupID].DemotedSite; got != testAnnotationSite {
+		t.Errorf("group demoted on %q, want the annotation site, not the class parameter", got)
+	}
+}
+
+// §14: a wired group resolver that finds no site refuses the promote with
+// FailedPrecondition rather than reaching the backend with an empty site, mirroring
+// the single-volume TestSyncPromoteMissingSite.
+func TestSyncGroupMissingSite(t *testing.T) {
+	mock := newMockSBCLI()
+	defer mock.Close()
+	mock.seedGroup(vgGroupID, vgMember1, vgMember2)
+	cs := newReplicationTestServer(t, mock)
+	cs.EnableGroupSyncSiteResolution(func(context.Context, lvol.VolumeHandle) (string, error) {
+		return "", nil
+	})
+
+	_, err := cs.PromoteVolume(context.Background(), &replication.PromoteVolumeRequest{
+		VolumeId: vgGroupHandle, Parameters: map[string]string{methodParam: methodSync},
+	})
+	if got := status.Code(err); got != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition", got)
+	}
+	if mock.groups[vgGroupID].Promoted {
+		t.Error("a missing site must not promote the group")
 	}
 }

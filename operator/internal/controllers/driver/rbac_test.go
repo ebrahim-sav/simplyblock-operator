@@ -154,7 +154,7 @@ func TestNodeRoleCanPatchNodesForVDOCapability(t *testing.T) {
 	}
 	hasPatch := false
 	for _, v := range found.Verbs {
-		if v == "patch" {
+		if v == verbPatch {
 			hasPatch = true
 		}
 	}
@@ -185,10 +185,19 @@ func TestNodeRoleDrivesSyncReplication(t *testing.T) {
 	if got := verbsFor("volumereplicationclasses"); !slices.Equal(got, []string{"get", "list", "watch"}) {
 		t.Errorf("volumereplicationclasses verbs = %v, want [get list watch]", got)
 	}
-	for _, v := range verbsFor("volumereplications") {
-		switch v {
-		case "create", "update", "delete", "deletecollection":
-			t.Errorf("the node role grants %q on volumereplications; it must only get/list/watch/patch", v)
+	// The group path mirrors the per-volume one: the node patches the VGR and reads
+	// the VGRClass (design §14).
+	if got := verbsFor("volumegroupreplications"); !slices.Equal(got, []string{"get", "list", "watch", "patch"}) {
+		t.Errorf("volumegroupreplications verbs = %v, want [get list watch patch]", got)
+	}
+	if got := verbsFor("volumegroupreplicationclasses"); !slices.Equal(got, []string{"get", "list", "watch"}) {
+		t.Errorf("volumegroupreplicationclasses verbs = %v, want [get list watch]", got)
+	}
+	for _, resource := range []string{"volumereplications", "volumegroupreplications"} {
+		for _, v := range verbsFor(resource) {
+			if slices.Contains(writeVerbs, v) && v != verbPatch {
+				t.Errorf("the node role grants %q on %s; it must only get/list/watch/patch", v, resource)
+			}
 		}
 	}
 }
@@ -439,7 +448,12 @@ func TestControllerCanRecordANewSizeOnAnExport(t *testing.T) {
 //	"system:serviceaccount:simplyblock:simplyblock-csi-controller-sa" cannot
 //	list resource "volumereplications" at the cluster scope
 func TestControllerRoleCanReadVolumeReplications(t *testing.T) {
-	need := []string{"volumereplications", "persistentvolumes", "persistentvolumeclaims"}
+	need := []string{
+		"volumereplications", "persistentvolumes", "persistentvolumeclaims",
+		// The group path correlates a group handle to its VGR through the content
+		// object, so it reads all three group resources (design §14).
+		"volumegroupreplications", "volumegroupreplicationclasses", "volumegroupreplicationcontents",
+	}
 	for _, resource := range need {
 		var got []string
 		for _, r := range clusterRoleRules[controllerComponent] {
@@ -457,15 +471,17 @@ func TestControllerRoleCanReadVolumeReplications(t *testing.T) {
 			}
 		}
 	}
-	// It must never write a VolumeReplication: the node owns the sync-site
-	// annotation and the administrator owns the object.
+	// It must never write a VolumeReplication or a VolumeGroupReplication: the node
+	// owns the sync-site annotation and the administrator owns the object.
 	for _, r := range clusterRoleRules[controllerComponent] {
-		if !slices.Contains(r.Resources, "volumereplications") {
+		if !slices.Contains(r.Resources, "volumereplications") &&
+			!slices.Contains(r.Resources, "volumegroupreplications") &&
+			!slices.Contains(r.Resources, "volumegroupreplicationcontents") {
 			continue
 		}
 		for _, v := range r.Verbs {
 			if slices.Contains(writeVerbs, v) {
-				t.Errorf("the controller role grants %q on volumereplications; it must only read them", v)
+				t.Errorf("the controller role grants %q on %v; it must only read them", v, r.Resources)
 			}
 		}
 	}
@@ -473,4 +489,8 @@ func TestControllerRoleCanReadVolumeReplications(t *testing.T) {
 
 // writeVerbs are the RBAC verbs that mutate an object; a read-only grant must
 // include none of them.
-var writeVerbs = []string{"create", "update", "patch", "delete", "deletecollection"}
+var writeVerbs = []string{"create", "update", verbPatch, "delete", "deletecollection"}
+
+// verbPatch is the one write verb the node plugin legitimately holds (it patches
+// its own node label and the sync-site annotation), so tests name it to exempt it.
+const verbPatch = "patch"

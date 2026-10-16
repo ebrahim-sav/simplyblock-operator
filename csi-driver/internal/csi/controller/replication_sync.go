@@ -23,11 +23,12 @@ const (
 	// "async" keeps the snapshot-replication path (design-csi-addons-replication.md).
 	// "sync" drives the two-site synchronous backend (sync-replication.md).
 	methodParam = "replication.storage.simplyblock.io/method"
-	// siteParam is a transitional, Phase-2 bridge: the consistency-group sync
-	// verbs still read the site from the class parameter until it moves to the
-	// VolumeGroupReplication annotation (design §14). The single-volume path takes
-	// the site from the VolumeReplication's SyncSiteAnnotation (design §5.1, §6.2),
-	// not from this parameter.
+	// siteParam is the fallback the consistency-group sync verbs use for the site
+	// only when no group-replication resolver is wired: with one, the group's site
+	// is read from its VolumeGroupReplication's SyncSiteAnnotation (design §14),
+	// the group analog of the single-volume path, which takes the site from the
+	// VolumeReplication's SyncSiteAnnotation (design §5.1, §6.2) and never from a
+	// class parameter.
 	siteParam = "replication.storage.simplyblock.io/site"
 
 	methodAsync = "async"

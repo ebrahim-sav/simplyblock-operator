@@ -45,6 +45,13 @@ type Server struct {
 	// driver wires it (the controller needs a VolumeReplication resolver); the
 	// sync write verbs error rather than guess a site when it is unset.
 	syncVolumeSite func(context.Context, lvol.VolumeHandle) (string, error)
+	// syncGroupSite resolves the site a consistency group is served from, read from
+	// its VolumeGroupReplication's SyncSiteAnnotation (design §14), the group
+	// analog of syncVolumeSite. A group replication request names the group by a
+	// backend handle and carries no claim, so this resolves handle -> content ->
+	// VGR. Nil until the driver wires it; when unset, the group sync verbs fall
+	// back to the transitional site class parameter.
+	syncGroupSite func(context.Context, lvol.VolumeHandle) (string, error)
 }
 
 // EnableSyncSiteResolution wires the resolver the sync write verbs (PromoteVolume,
@@ -54,6 +61,15 @@ type Server struct {
 // source and refuse rather than guess.
 func (cs *Server) EnableSyncSiteResolution(resolve func(context.Context, lvol.VolumeHandle) (string, error)) {
 	cs.syncVolumeSite = resolve
+}
+
+// EnableGroupSyncSiteResolution wires the resolver the group sync write verbs use
+// to read a consistency group's active site from its VolumeGroupReplication's
+// SyncSiteAnnotation (design §14). The driver calls it when the cluster carries
+// the VolumeGroupReplication CRD; until then the group verbs fall back to the
+// transitional site class parameter.
+func (cs *Server) EnableGroupSyncSiteResolution(resolve func(context.Context, lvol.VolumeHandle) (string, error)) {
+	cs.syncGroupSite = resolve
 }
 
 //nolint:unparam // error return kept for constructor symmetry / future use

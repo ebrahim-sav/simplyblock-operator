@@ -10,12 +10,12 @@
 
 ## Phasing Overview
 
-| Phase               | Status                        | csi-addons surface                   | Backend routes                                                             |
-|---------------------|-------------------------------|--------------------------------------|----------------------------------------------------------------------------|
-| **Phase 1** (§5–§9) | Partial (verbs done, §6 open) | `VolumeReplication` (per volume)     | `V/replication/{failover,demote,sync-status,status,failback}`, `V/connect` |
-| **Phase 2** (§14)   | Partial (dispatch done)       | `VolumeGroupReplication` (per group) | `G/replication/{failover,demote,sync-status,status,failback}`              |
+| Phase               | Status                             | csi-addons surface                   | Backend routes                                                             |
+|---------------------|------------------------------------|--------------------------------------|----------------------------------------------------------------------------|
+| **Phase 1** (§5–§9) | Partial (verbs done, §6 open)      | `VolumeReplication` (per volume)     | `V/replication/{failover,demote,sync-status,status,failback}`, `V/connect` |
+| **Phase 2** (§14)   | Partial (node and controller done) | `VolumeGroupReplication` (per group) | `G/replication/{failover,demote,sync-status,status,failback}`              |
 
-Phase 1 makes a single sync-replicated volume follow its pod between the two sites of a stretched cluster: the node plugin signals the pod's site, the replication controller promotes there, and staging is gated on the promote. Phase 2 adds the consistency-group variant, which the backend already serves as one unit (one gate, one promote task for all members). Phase 2 reuses Phase 1's method dispatch, site signaling, and gating unchanged, so it ships independently once the group routes are wired in the driver.
+Phase 1 makes a single sync-replicated volume follow its pod between the two sites of a stretched cluster: the node plugin signals the pod's site, the replication controller promotes there, and staging is gated on the promote. Phase 2 adds the consistency-group variant, which the backend already serves as one unit (one gate, one promote task for all members). Phase 2 reuses Phase 1's method dispatch, site signaling, and gating unchanged: the node patches the one `VolumeGroupReplication` and gates every member on the one group promote, and the controller reads the group's site from the VGR annotation.
 
 ## Implementation Status
 
@@ -28,6 +28,7 @@ As of 2026-10-14 parts of this design are implemented on the `sync-replication` 
 - **Operator provisioning (§9.4–§9.6).** The `FN_SYNC_PROMOTE`/`FN_SYNC_RESYNC` runner registration (`TestTheSyncReplicationRunnersAreRegistered`), `EnableSyncReplication` on `ClusterDeploymentConfig`/`StorageCluster` and its `sync_replication` cluster-create body, and `Site` on `NodeGroup`/`StorageNode.spec.config` with the `SiteMissing` provisioning hold (`TestSitesAreCheckedAgainstTheTemplate`).
 - **The scheduling-driven node path, baseline parts (§6).** The PVC-to-`VolumeReplication` correlation in `atlas-lib/kube` (`SyncVolumeReplicationForClaim`, `NewSyncResolver`); the node's per-PVC detection with the fail-closed-until-synced, trust-the-cache gate (`detectSyncReplication`); the switchover gate that holds on the promote (`ensureSyncPromoted`); the site read (`readNodeSite`); and the driver wiring that stands up the informers and resolver when the VolumeReplication CRD is present (`enableSyncReplication`). The node does not demote the old site on unstage (§6.5): the new site's planned promote fences it. Unit tests cover each step; a sync volume whose promote has not completed holds at staging, and an ordinary volume is untouched. The class-by-site lookup built here (`VolumeReplicationClassForSite`) is superseded by the single class of §9.1.
 - **`GetVolumeReplicationInfo` for sync (§5.3, §8).** It reads `GET V/replication/status`, which the backend fills from the sync status on a sync cluster, and a sync volume (no async relationship) resolves the chain walk to itself rather than erroring (`TestGetVolumeReplicationInfoServesASyncVolume`). The csi-addons response carries only `LastSyncTime`, which it sets.
+- **The consistency-group path (§14).** The group is followed by the same C′ mechanism as a single volume. In `atlas-lib/kube`: the selector-based PVC-to-VGR correlation (`SyncVolumeGroupReplicationForClaim`), the group-handle-to-VGR correlation through the content object (`VolumeGroupReplicationForGroupHandle`, `EnableGroupInformers`, `EnableGroupContentInformer`). In the node (`stage_sync.go`): the per-PVC group detection (`detectSyncGroup`) and the group flip (`ensureGroupPromoted`), wired from `NodeStageVolume` after the per-volume check. In the controller: the group branches of `PromoteVolume`/`DemoteVolume` read the site from the VGR annotation (`resolveGroupSyncSite`, `EnableGroupSyncSiteResolution`), with the class-parameter fallback. The node and controller RBAC carry the VGR, VGRClass, and VGRContent rules. Unit tests cover each step (`TestDetectSyncGroup`, `TestEnsureGroupPromoted`, `TestSyncGroupSiteFromAnnotation`, `TestSyncGroupMissingSite`, the `atlas-lib` resolver tests). Not yet validated on a live cluster.
 
 **Not yet implemented:**
 
@@ -542,9 +543,27 @@ The CSI driver emits no Kubernetes events today and exposes the async replicatio
 
 ## 14. VolumeGroupReplication
 
-Phase 2 adds the consistency-group variant. The backend drives a group as one unit: one gate for every member, the store rule checked over the union of the members' stores, one promote task for all (`sync-replication.md` §3, group routes). The driver's group RPCs (`EnableVolumeGroupReplication`, `PromoteVolumeGroup`, `DemoteVolumeGroup`, and the group info read) dispatch by the same `method` and `site` read from the `VolumeGroupReplicationClass`, exactly as Phase 1 does per volume.
+Phase 2 adds the consistency-group variant. The backend drives a group as one unit: one gate for every member, the store rule checked over the union of the members' stores, one promote task for all (`sync-replication.md` §3, group routes). The group follows its pod by the same mechanism Phase 1 defines for a single volume (one site-agnostic class, the active site on a mutable annotation, the node-driven flip, and a gate on the promote), applied to the one `VolumeGroupReplication` (VGR) that stands for the whole group. Because the group promotes as a unit, a pod never comes up with some members led from one site and some from the other. The subsections below are the group analogs of §6.1–§6.4, and where a step is identical to the per-volume one it is named rather than restated.
 
-The scheduling trigger extends naturally. A pod that mounts several PVCs of one consistency group causes `NodeStageVolume` to run per member on the same node, so each member resolves to the same `VolumeGroupReplication`. The node plugin patches that one `VolumeGroupReplication` to the node's site's `VolumeGroupReplicationClass` (the first member's stage does it; the rest find it already pointed there), and every member's gate waits on the one group promote. Because the group promotes as a unit, a pod never comes up with some members led from one site and some from the other.
+### 14.1 The trigger and group correlation
+
+A pod that mounts several PVCs of one consistency group causes `NodeStageVolume` to run per member on the same node, and each member resolves to the same VGR. A VGR names its members by a label selector (`spec.source.selector`), not by a per-claim reference, so the correlation is a selector match rather than the `spec.dataSource` lookup a `VolumeReplication` uses: from the volume handle the node reads the `PersistentVolumeClaim`'s labels and finds the VGR in the claim's namespace whose selector matches them. A VGR with an empty or absent selector matches nothing, so a misconfigured group never captures a volume by accident.
+
+The per-volume and group paths are mutually exclusive. The node checks for a per-volume `VolumeReplication` first (§6.6), and only a volume no sync `VolumeReplication` claims is tried against the group path, so a volume is driven by its own object or as a group member, never both. A volume that is neither stages exactly as today.
+
+### 14.2 Signaling the site: the VGR's annotation
+
+The site rides on the VGR's `simplyblock.io/sync-site` annotation, exactly as it rides on a `VolumeReplication`'s (§6.2), and for the same reason: `spec.volumeGroupReplicationClass` is immutable, and a sync cluster has one site-agnostic group class (§9.1). The node patches that one annotation and `spec.replicationState` on the VGR. The first member's stage does it; the rest find the VGR already pointed at this site and fall straight through to the gate. The one patch moves the whole group, so there is no per-member signaling and no window in which some members are signaled and others are not. Ownership splits as in §6.2: the administrator owns the VGR spec (it declares the group protected and names the one class), and the node owns the annotation.
+
+### 14.3 The controller performs the group switch
+
+The csi-addons `VolumeGroupReplication` reconciler observes the patched object and issues the group promote, which the driver turns into `POST G/replication/failover?site=<site>&planned=true`. The node drives a move the RamenDR way (§6.3): because an annotation-only change leaves the VGR already `primary`/`Completed`, the node transitions `replicationState` `primary → secondary → primary`, the `secondary` step keeping the old site's annotation so the group demote targets the old site (the one the planned group promote requires demoted first). Only once the demote is observed (status `Secondary`) does the node move the annotation to this site and set `primary`.
+
+The controller reads the group's site from the VGR annotation, the group analog of the per-volume `PromoteVolume`/`DemoteVolume` reading it off the `VolumeReplication` (§5.2). A group replication request names the group only by its backend handle (`cg:<cluster>:<group>`) and carries no claim, so the controller correlates the handle to its VGR through the content object: the `VolumeGroupReplicationContent` is indexed by the `spec.volumeGroupReplicationHandle` the driver returned at group creation, and it references the VGR it is bound to (`spec.volumeGroupReplicationRef`). The resolution is handle → content → VGR → the `simplyblock.io/sync-site` annotation. When no group resolver is wired the group verbs fall back to a transitional site class parameter, but a cluster running Phase 2 reads the annotation.
+
+### 14.4 The group gate and the RPCs
+
+Every member's `NodeStageVolume` gates on the one group promote, exactly as a single volume gates on its own (§6.4): staging reads no connection entries and attaches no device until the VGR is `Primary`/`Completed` on this node's site, and each invocation checks once and returns a retryable error rather than polling inline. The group routes mirror the volume ones:
 
 | Method | Endpoint                                 | Notes                                                                                                                                                         |
 |--------|------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -556,7 +575,9 @@ The scheduling trigger extends naturally. A pod that mounts several PVCs of one 
 
 A group member that cannot be resolved to a live volume, or that belongs to another cluster, refuses the whole group request with `409` and the ids in `volumes`, before anything is fenced or queued. The driver surfaces that as a retryable `codes.FailedPrecondition` naming the members, and the staging of every member holds. The status is cluster-wide, so the group gets the same `state` and `lag` as any volume, plus `member_count`. The driver does not combine per-member status (§8).
 
-Phase 2 is independent of Phase 1 only in the driver wiring. The dispatch, the site signaling, the gate, the status mapping, the `force` inversion, and the `409` / `412` protocol are all shared, so Phase 2 is the group RPC handlers and the group correlation calling the `G` routes with the Phase 1 machinery.
+Leadership is per-LVS: the backend moves a group to a site by moving the LVS its members live on. Members spread across more than one LVS are moved by their own LVS's leadership, and a group whose members share one LVS with volumes outside the group moves those too. Keeping a consistency group's members on a dedicated LVS is the deployment rule that keeps the group's leadership independent, and a shared LVS is a documented limitation rather than a correctness defect: the group still promotes as a unit.
+
+Phase 2 is independent of Phase 1 only in the driver and node wiring. The dispatch, the site signaling, the gate, the status mapping, the `force` inversion, and the `409` / `412` protocol are all shared.
 
 ---
 

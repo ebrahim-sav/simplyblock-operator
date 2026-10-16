@@ -5,6 +5,7 @@ package node
 import (
 	"context"
 
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/simplyblock/atlas/kube"
@@ -63,6 +64,14 @@ type Server struct {
 	// syncResolver when sync replication is configured.
 	syncNodeSite func(context.Context) (string, error)
 	syncPatchVR  func(ctx context.Context, vr kube.VolumeReplicationRef, site, state string) error
+	// The consistency-group (VolumeGroupReplication) seams, the group analogs of
+	// the above (design §14). syncGroupPatchVGR sets the VGR's sync-site annotation
+	// and replicationState; syncClaimLabels reads a PVC's labels (a VGR names its
+	// members by selector, so the group lookup needs them). Both nil unless the
+	// group path is configured (EnableGroupReplication), and detectSyncGroup is a
+	// no-op then -- a volume stages via the per-volume path or ordinarily.
+	syncGroupPatchVGR func(ctx context.Context, vgr kube.VolumeGroupReplicationRef, site, state string) error
+	syncClaimLabels   func(ctx context.Context, claim types.NamespacedName) (map[string]string, error)
 }
 
 // New builds the node service. It performs no I/O and starts nothing: the

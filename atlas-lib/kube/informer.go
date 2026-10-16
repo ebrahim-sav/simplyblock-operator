@@ -55,12 +55,15 @@ type ResolverConfig struct {
 // manager cache (operator), so both consumers share one resolution
 // implementation instead of keeping a second cache.
 type InformerResolver struct {
-	pv      cache.SharedIndexInformer
-	pvc     cache.SharedIndexInformer
-	va      cache.SharedIndexInformer
-	sc      cache.SharedIndexInformer
-	vr      cache.SharedIndexInformer
-	vrClass cache.SharedIndexInformer
+	pv         cache.SharedIndexInformer
+	pvc        cache.SharedIndexInformer
+	va         cache.SharedIndexInformer
+	sc         cache.SharedIndexInformer
+	vr         cache.SharedIndexInformer
+	vrClass    cache.SharedIndexInformer
+	vgr        cache.SharedIndexInformer
+	vgrClass   cache.SharedIndexInformer
+	vgrContent cache.SharedIndexInformer
 }
 
 var _ Resolver = (*InformerResolver)(nil)
