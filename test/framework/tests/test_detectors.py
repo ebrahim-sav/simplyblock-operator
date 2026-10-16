@@ -1660,6 +1660,75 @@ class PnfsDeviceIO(unittest.TestCase):
         found = self._found(blocks, jobs=jobs, vol=vol, max_stall_s=60)
         self.assertEqual([f.severity for f in found], [Severity.WARNING])
 
+    # One instance on w1 whose writes reach its namespace until 30s, then stop.
+    SOLO = PnfsVolume(claim="c1", lvol="lv1", shared=False, nodes=["w1"],
+                      instances={"r-fio-0-c0": "w1"})
+    STOPPED = [blk("w1", o, o * 10 + 1, min(o, 30) * 5 + 1) for o in (0, 10, 20, 30, 110, 200)]
+
+    def _ev(self, nfs: dict[str, dict[str, int]]) -> list:
+        jobs = [FioJob(pod="r-fio-0-c0", start=ts(0), runtime_s=200)]
+        ev = FakeEvidence(blocks=self.STOPPED, pnfs=[self.SOLO], jobs=jobs, nfs=nfs)
+        return list(build_detector("pnfs.device-io", max_stall_s=60).detect(ev))
+
+    def test_writes_that_reached_neither_the_namespace_nor_the_server_are_a_hang(self):
+        """pnfs-1792142480 solo-0 and solo-1: both clients' I/O stopped at 10:19-10:20 with
+        minutes of runtime left, one fio never exited, and each mount's NFS WRITE count was
+        0. The writes went nowhere, so the finding must not say they went through the
+        metadata server."""
+        found = self._ev(nfs={"r-fio-0-c0": {"LAYOUTGET": 4, "WRITE": 0, "READ": 0}})
+        self.assertEqual([f.severity for f in found], [Severity.CRITICAL])
+        self.assertNotIn("metadata server from then on", found[0].note)
+        self.assertIn("NFS WRITE 0", found[0].detail)
+
+    def test_writes_that_moved_to_the_server_still_say_so(self):
+        found = self._ev(nfs={"r-fio-0-c0": {"LAYOUTGET": 4, "WRITE": 900, "READ": 0}})
+        self.assertEqual([f.severity for f in found], [Severity.CRITICAL])
+        self.assertIn("through the metadata server", found[0].note)
+        self.assertIn("NFS WRITE 900", found[0].detail)
+
+    # Two containers of one pod on w1, whose evidence each carries a copy of the pod's one
+    # mount's counters.
+    PAIR = PnfsVolume(claim="c1", lvol="lv1", shared=False, nodes=["w1"],
+                      instances={"r-fio-0-c0": "w1", "r-fio-0-c1": "w1"},
+                      mounts={"r-fio-0-c0": "r-pnfs-0", "r-fio-0-c1": "r-pnfs-0"})
+    COPIES = {"r-fio-0-c0": {"LAYOUTGET": 4, "WRITE": 900, "READ": 0},
+              "r-fio-0-c1": {"LAYOUTGET": 4, "WRITE": 900, "READ": 0}}
+
+    def _pair(self, vol: PnfsVolume) -> list:
+        jobs = [FioJob(pod=p, start=ts(0), runtime_s=200) for p in vol.instances]
+        ev = FakeEvidence(blocks=self.STOPPED, pnfs=[vol], jobs=jobs, nfs=self.COPIES)
+        return list(build_detector("pnfs.device-io", max_stall_s=60).detect(ev))
+
+    def test_the_instances_of_one_pod_count_its_mount_once(self):
+        found = self._pair(self.PAIR)
+        self.assertIn("NFS WRITE 900", found[0].detail)
+
+    def test_a_run_without_the_mount_map_counts_identical_copies_once(self):
+        """Runs before the volume map named each instance's pod carry the same copies,
+        byte for byte, which two different mounts never do."""
+        found = self._pair(PnfsVolume(claim="c1", lvol="lv1", shared=False, nodes=["w1"],
+                                      instances=dict(self.PAIR.instances)))
+        self.assertIn("NFS WRITE 900", found[0].detail)
+
+    # w1 writes to its namespace throughout, and reads nothing from it.
+    UNREAD = [blk("w1", o, 7, o * 5) for o in (0, 10, 20, 30, 110, 200)]
+
+    def _unread(self, nfs: dict[str, dict[str, int]]) -> list:
+        jobs = [FioJob(pod="r-fio-0-c0", start=ts(0), runtime_s=200)]
+        ev = FakeEvidence(blocks=self.UNREAD, pnfs=[self.SOLO], jobs=jobs, nfs=nfs)
+        return list(build_detector("pnfs.device-io", max_stall_s=60).detect(ev))
+
+    def test_missing_reads_while_writes_progress_are_not_called_a_write_hang(self):
+        found = self._unread({"r-fio-0-c0": {"LAYOUTGET": 4, "WRITE": 0, "READ": 0}})
+        self.assertEqual([f.severity for f in found], [Severity.CRITICAL])
+        self.assertNotIn("writes", found[0].note)
+        self.assertIn("NFS READ 0", found[0].detail)
+
+    def test_reads_that_went_to_the_server_say_so(self):
+        found = self._unread({"r-fio-0-c0": {"LAYOUTGET": 4, "WRITE": 0, "READ": 700}})
+        self.assertIn("reads went through the metadata server", found[0].note)
+        self.assertIn("NFS READ 700", found[0].detail)
+
 
 class ChaosRecovery(unittest.TestCase):
     """Every restart the run made must have come back: a pod that never returned is a
