@@ -72,6 +72,14 @@ type Server struct {
 	// no-op then -- a volume stages via the per-volume path or ordinarily.
 	syncGroupPatchVGR func(ctx context.Context, vgr kube.VolumeGroupReplicationRef, site, state string) error
 	syncClaimLabels   func(ctx context.Context, claim types.NamespacedName) (map[string]string, error)
+	// refreshConn is a test seam for the connection refresh (a GET .../connect).
+	// It is nil in production and in most tests; fetchConnection falls back to
+	// (*Server).refreshVolumeConnection when it is unset. A test sets it to assert
+	// the stage ordering -- a sync-managed volume must not be connected before its
+	// switchover gate runs, because the connect resolves to the volume's current
+	// (stale) led site and clears its birth state there, which deadlocks the
+	// first-placement promote to this node's site.
+	refreshConn func(ctx context.Context, volumeID string, vc map[string]string)
 }
 
 // New builds the node service. It performs no I/O and starts nothing: the

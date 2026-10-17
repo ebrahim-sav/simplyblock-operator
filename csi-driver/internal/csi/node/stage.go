@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/simplyblock/atlas/bounded"
+	"github.com/simplyblock/atlas/kube"
 	"github.com/simplyblock/atlas/lvm"
 	"github.com/simplyblock/atlas/lvol"
 	"github.com/simplyblock/atlas/nqn"
@@ -107,12 +108,14 @@ func (ns *Server) NodeStageVolume(
 	if vc == nil {
 		// A statically provisioned PV can carry no csi.volumeAttributes, which
 		// arrives here as a nil map. The volume's identity is re-resolved from its
-		// handle by refreshVolumeContext regardless, so an empty context is enough
+		// handle by resolveHostAndPool regardless, so an empty context is enough
 		// to stage; a nil one would panic on the first write below.
 		vc = map[string]string{}
 	}
 	vc["stagingParentPath"] = stagingParentPath
-	ns.refreshVolumeContext(ctx, volumeID, vc)
+	// The host identity and pool resolve locally, with no control-plane connect,
+	// so they are safe to set before the sync switchover gate below.
+	ns.resolveHostAndPool(ctx, volumeID, vc)
 
 	// A sync-managed volume follows its pod: its leadership must move to this
 	// node's site, and the connection is gated on that, so it takes a different
@@ -124,19 +127,36 @@ func (ns *Server) NodeStageVolume(
 	// VolumeGroupReplication (a consistency group, design §14), never both. The
 	// per-volume check runs first; a volume it does not claim is tried against the
 	// group path.
-	if vr, isSync, err := ns.detectSyncReplication(ctx, vc); err != nil {
+	vr, isSync, err := ns.detectSyncReplication(ctx, vc)
+	if err != nil {
 		return nil, err
-	} else if isSync {
+	}
+	var vgr kube.VolumeGroupReplicationRef
+	isGroup := false
+	if !isSync {
+		if vgr, isGroup, err = ns.detectSyncGroup(ctx, vc); err != nil {
+			return nil, err
+		}
+	}
+
+	// Fetch the volume's connection info. An ordinary volume is connected up
+	// front, as before. A sync-managed volume defers this until AFTER the
+	// switchover gate: the connect resolves to the volume's current (stale) led
+	// site and clears its birth state there, which deadlocks the first-placement
+	// promote to this node's site -- the backend keys its auto-demote of the old
+	// site on the volume never having been connected.
+	if !isSync && !isGroup {
+		ns.fetchConnection(ctx, volumeID, vc)
+	}
+
+	if isSync {
 		// A sync-managed volume must be served on this node's site before it is
 		// attached. ensureSyncPromoted signals the site and gates on the promote,
 		// returning a retryable error until it is done; once it returns nil, the
-		// volume is led from this site and the ordinary attach below connects to
-		// it (design §6.2-§6.4).
+		// volume is led from this site (design §6.2-§6.4).
 		if err := ns.ensureSyncPromoted(ctx, vr); err != nil {
 			return nil, err
 		}
-	} else if vgr, isGroup, err := ns.detectSyncGroup(ctx, vc); err != nil {
-		return nil, err
 	} else if isGroup {
 		// A consistency-group member follows its pod as a unit: the whole group's
 		// leadership moves to this node's site before any member is attached, so a
@@ -144,6 +164,13 @@ func (ns *Server) NodeStageVolume(
 		if err := ns.ensureGroupPromoted(ctx, vgr); err != nil {
 			return nil, err
 		}
+	}
+
+	// The volume is now led from this site; connect to it on the correct site.
+	// Deferred from above for the sync paths, so the pre-gate connect never
+	// cleared birth state on the stale led site.
+	if isSync || isGroup {
+		ns.fetchConnection(ctx, volumeID, vc)
 	}
 
 	plan, err := ns.attachPlan(ctx, volumeID, stagingTargetPath, vc, req.GetVolumeCapability())
@@ -719,7 +746,11 @@ func controlPlaneLvolID(vc map[string]string, handle *lvol.Handle) string {
 // and transport type until a host is named, and a volume that may have failed over
 // needs the refresh so the backend can redirect to the clone and answer with
 // the namespace the data is actually being served from.
-func (ns *Server) refreshVolumeContext(ctx context.Context, volumeID string, vc map[string]string) {
+// resolveHostAndPool fills vc with this node's host NQN and the volume's pool.
+// Both are resolved locally -- from the node object and the parsed volume handle
+// -- with no control-plane connect, so it is safe to call before the sync
+// switchover gate, unlike refreshVolumeConnection.
+func (ns *Server) resolveHostAndPool(ctx context.Context, volumeID string, vc map[string]string) {
 	if ns.kubeClient != nil {
 		nodeName := ns.Driver.GetNodeID()
 		node, nodeErr := ns.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
@@ -730,11 +761,36 @@ func (ns *Server) refreshVolumeContext(ctx context.Context, volumeID string, vc 
 		}
 	}
 
+	if spdkVol, err := csicommon.ParseVolumeHandle(volumeID); err == nil {
+		vc["poolID"] = spdkVol.PoolRef
+	}
+}
+
+// fetchConnection refreshes the volume's connection info, through the refreshConn
+// test seam when one is set and otherwise through refreshVolumeConnection. The
+// fallback means a Server built directly (as tests do) behaves like production
+// without having to wire the seam.
+func (ns *Server) fetchConnection(ctx context.Context, volumeID string, vc map[string]string) {
+	if ns.refreshConn != nil {
+		ns.refreshConn(ctx, volumeID, vc)
+		return
+	}
+	ns.refreshVolumeConnection(ctx, volumeID, vc)
+}
+
+// refreshVolumeConnection fills vc with the volume's current NVMe-oF connection
+// info from the control plane (a GET .../connect). For a sync-managed volume
+// this must run only AFTER the switchover gate (ensureSyncPromoted): the connect
+// resolves to the volume's currently led site and clears its birth state
+// (sync_never_connected) there, so issuing it on the stale site before the
+// promote defeats the backend's first-placement auto-demote and deadlocks the
+// move to this node's site ("not demoted on site <old>" forever). The default
+// value of the refreshConn seam; call through that field, not directly.
+func (ns *Server) refreshVolumeConnection(ctx context.Context, volumeID string, vc map[string]string) {
 	spdkVol, err := csicommon.ParseVolumeHandle(volumeID)
 	if err != nil {
 		return
 	}
-	vc["poolID"] = spdkVol.PoolRef
 
 	sbcClient, clientErr := clusters.Client(ctx, spdkVol.ClusterID, spdkVol.PoolRef)
 	if clientErr != nil {
