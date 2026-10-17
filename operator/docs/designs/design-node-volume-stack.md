@@ -690,8 +690,9 @@ plan replayed on another host arrives at the same names. The lvol UUID is alread
 globally unique, stable, and inside LVM's length and character limits, which makes
 it a better identifier than a hash of namespace and PVC name and is the convention
 PR #402 established. [`design-pnfs-striped.md`](design-pnfs-striped.md) §2.3
-should adopt it rather than deriving a separate one, because a failover that
-recomputes a different name cannot find the export it is recovering.
+names a striped export's group the same way, from its first member's lvol UUID,
+so a failover that replays the plan in another guest arrives at the names the
+export was assembled under.
 
 The striped and the VDO plans differ only in the logical-volume type and its
 options. The `Artifact` a striped volume reports carries its real `Geometry`, and

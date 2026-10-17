@@ -115,7 +115,7 @@ than an existing capability.
 ### 1.1 Goals
 
 - Provision an RWX PVC of size `S` as `n` lvols of `ceil(S/n)` each, GiB-aligned per `util.AlignToGiBBytes`, where `1 ≤ n ≤` the number of eligible storage nodes.
-- Assemble those `n` namespaces into one LVM stripe on the MDS host and make one XFS filesystem on it.
+- Assemble those `n` namespaces into one LVM stripe in the metadata server's guest and make one XFS filesystem on it.
 - Describe that stripe to clients as a pNFS SCSI volume topology, so every client reaches every member directly and runs no volume manager.
 - Reproduce that assembly deterministically on another host, so failover keeps working.
 - Snapshot, clone, and restore a striped volume through a backend consistency group, so the result is mountable.
@@ -132,15 +132,21 @@ than an existing capability.
 
 ## 2. Striping the Backing Volume
 
-### 2.1 Assembly on the MDS host
+### 2.1 Assembly in the metadata server's guest
 
-`CreateExport` gains a volume-manager step between attaching the namespaces and
-making the filesystem. The steps stay idempotent and individually skippable, which
+The export assembler runs in the metadata server's guest as `mds-agent`
+([`design-pnfs-mds-vm.md`](design-pnfs-mds-vm.md)), and brings an export up as a
+volume stack ([`design-node-volume-stack.md`](design-node-volume-stack.md)). A
+single-volume export is the `Plain` plan, `fabric` → `filesystem`
+(`csi-driver/internal/nfsexport/plan.go`). A striped export is the `Striped` plan,
+`members(n)` → `lvmPhysicalVolume` → `lvmVolumeGroup` → `lvmLogicalVolume` →
+`filesystem` (`atlas-lib/volstack/plans/plans.go`), so `CreateExport` gains a
+volume-manager step between attaching the namespaces and making the filesystem. The steps stay idempotent and individually skippable, which
 matters more here than in the base design because there are now more of them:
 
-1. **Attach namespaces:** csi-node connects all `n` member namespaces and owns their reconnect lifecycle. `CreateExport` waits for `n` devices before proceeding.
+1. **Attach namespaces:** the `members` layer attaches all `n` member namespaces in the recorded order. The metadata server pod resolves one connection per member for the guest, which holds no control-plane credential, and the guest's path keeper reconnects every member as it does a single namespace (`design-pnfs-mds-vm.md` §6.4, §7.6). `CreateExport` waits for `n` devices before proceeding.
 2. **Physical volumes:** `pvcreate` each member device.
-3. **Volume group:** `vgcreate <vg> <member-1> … <member-n>`, with the members passed **in the recorded order** (§2.3).
+3. **Volume group:** `vgcreate <vg> <member-1> … <member-n>`, with the members passed **in the recorded order** (§2.3). The group carries the ownership tag every volume-stack group carries (`design-node-volume-stack.md` §5.7).
 4. **Striped logical volume:** `lvcreate --stripes <n> --stripesize <chunk> -l 100%FREE -n <lv> <vg>`.
 5. **Filesystem:** `mkfs.xfs /dev/<vg>/<lv>`, only when `blkid` shows it is unformatted.
 6. **Mount and export:** as the base design, against the striped logical volume rather than a raw namespace.
@@ -230,15 +236,14 @@ the volume group and the next, on whichever metadata server failover selects:
   volume group assembled from the wrong devices is caught before it is exported.
 - **Stripe geometry.** nfsd reads `n` and the chunk size from the live table, so no
   second copy of either exists to drift.
-- **Names.** `<vg>` and `<lv>` derive from a stable identifier and nothing
-  host-specific, because failover re-runs the assembly elsewhere and has to arrive
-  at the same names. A host-derived or random suffix would make an export
-  unrecoverable.
-- **Namespace scope.** The identifier cannot be the PVC name alone: PVC names are
-  unique only within a namespace, so two same-named PVCs in different namespaces
-  would select the same volume group on one host. It carries namespace and UID
-  information, and it has to stay inside LVM's name length and character limits,
-  which means a deterministic hash rather than a concatenation.
+- **Names.** The group is `vol-<uuid>` and the logical volume `lv-<uuid>`, the
+  volume stack's naming rule (`plans.VolumeGroupName` and
+  `plans.LogicalVolumeName`, `design-node-volume-stack.md` §5.5). The UUID is the
+  first member's lvol UUID, which is also the volume ID in the striped volume's
+  handle. Failover re-runs the assembly on another guest and arrives at the same
+  names, because nothing in them is host-specific. An lvol UUID is unique across
+  clusters and Kubernetes namespaces and fits LVM's name limits, so two
+  same-named PVCs in different namespaces never select the same group.
 
 ### 2.4 One volume group, one host
 
@@ -312,9 +317,10 @@ than silently building a degenerate stripe. Refusing rather than warning is what
 test plan asserts (`SU-09`, `SE-09`), and S4 is the decision that could soften it to
 a warning. Until S4 is answered, refusal is the contract.
 
-The MDS host is chosen independently of where members live, as in the base design.
-Co-locating the MDS with a member buys nothing, because the MDS reaches every member
-over NVMe-oF regardless.
+The metadata server's placement is independent of where members live. One
+metadata server pod serves every export of a storage cluster
+(`design-pnfs-mds-vm.md`), and its guest reaches every member over NVMe-oF
+wherever the member lives.
 
 ---
 
@@ -328,7 +334,7 @@ to blocks that another member's image does not have. The result does not mount, 
 it does not fail loudly at snapshot time. It fails at restore, which is the worst
 place to find out.
 
-`xfs_freeze` on the MDS host, which is how the base design quiesces a single-volume
+`xfs_freeze` in the metadata server's guest, which is how the base design quiesces a single-volume
 snapshot, is necessary here but no longer sufficient. Freezing stops new writes, but
 the members are still snapshotted by `n` separate backend calls, and nothing makes
 those calls simultaneous. The atomicity has to come from the backend.
@@ -358,7 +364,7 @@ possible, the rule and that scenario relax together.
 ### 3.3 What the driver does with it
 
 - **Snapshot:** `xfs_freeze -f` on the MDS, one group-snapshot call, `xfs_freeze -u`. The CSI snapshot id encodes the group as `{clusterID}:{poolID}:{groupSnapUUID}`, and list and delete operate on the group.
-- **Clone and restore:** clone the group, then run the full `CreateExport` assembly on a newly selected MDS host. The clone is an independent RWX volume with its own `NFSExport` CR, its own Service, and its own `fsid`.
+- **Clone and restore:** clone the group, then run the full `CreateExport` assembly in the storage cluster's metadata server, as for any new export. The clone is an independent RWX volume with its own `NFSExport` CR, its own Service, and its own `fsid`.
 - **Resize:** grow every member by the same amount, `pvresize` each, `lvextend`, then `xfs_growfs` on the MDS. Members must grow uniformly, because an LVM stripe cannot use unequal extents. Uniform growth also keeps the table at one target, the shape §2.2 requires: the new extents follow the old ones on every member, so the extension continues the existing striped segment (S6). The assembler checks that the table is still a single `striped` target before it grows the filesystem, and leaves the export `Degraded` otherwise (SM-8). A client keeps the slice lengths of its last GETDEVICEINFO, so grown space reaches it the way grown space on a single namespace does in the base design.
 
 ---
@@ -368,18 +374,19 @@ possible, the rule and that scenario relax together.
 Everything else in [`design-pnfs-rwx.md`](design-pnfs-rwx.md) stands. These are the
 edits striping forces:
 
-| Base design section     | Change                                                                                                                                                                                                                                                                     |
-|-------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| §7.1 `NFSExport` CRD    | `status` gains `stripeCount` and `members[]` of `{lvolID, nguid, sizeBytes}`, replacing the single `lvolID` and `nguid`. `status` gains `vgName`, `lvName`, and the member **order**, all controller-derived, so failover reproduces the assembly byte-identically (§2.3). |
-| §8.2 `CreateExport`     | The LVM steps in §2.1 sit between attach and `mkfs.xfs`.                                                                                                                                                                                                                   |
-| §10.1 `NodeStageVolume` | The `lvmFilter` layer comes first (§2.4), then attaching and aliasing repeat per member (§2.2). No LVM activation runs, and unstage releases `n` namespaces where the base design releases one.                                                                            |
-| §8.3 `DeleteExport`     | `lvremove`, `vgremove`, and `pvremove` before the namespaces are released.                                                                                                                                                                                                 |
-| §9.2 StorageClass       | A `stripe_count` parameter, defaulting to `1`, bounded by the eligible node count.                                                                                                                                                                                         |
-| §9.3 `CreateVolume`     | Create `n` lvols of `ceil(S/n)`, verify distinct placement (§2.5), and record all members.                                                                                                                                                                                 |
-| §12.2 Snapshot          | The group path in §3.3 replaces the per-lvol snapshot.                                                                                                                                                                                                                     |
-| §13 Failover            | Unchanged in shape, but step 4 rebuilds an LVM stripe rather than mounting a device, which lengthens the freeze. The `fsid` and the VG and LV names still have to match.                                                                                                   |
-| §5.3 Compatibility      | The guest additionally needs S0-6 and S0-7. Client kernels need nothing beyond the base design, because the block layout client already decodes `STRIPE` and `SLICE` topologies.                                                                                           |
-| §16 Failure modes       | The lost member, the missing topology support, the reshaped table, the unresolved member, and the activating client (§6).                                                                                                                                                  |
+| Base design section          | Change                                                                                                                                                                                                                                                                     |
+|------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| §7.1 `NFSExport` CRD         | `status` gains `stripeCount` and `members[]` of `{lvolID, nguid, sizeBytes}`, replacing the single `lvolID` and `nguid`. `status` gains `vgName`, `lvName`, and the member **order**, all controller-derived, so failover reproduces the assembly byte-identically (§2.3). |
+| §8.2 `CreateExport`          | The LVM steps in §2.1 sit between attach and `mkfs.xfs`.                                                                                                                                                                                                                   |
+| §10.1 `NodeStageVolume`      | The `lvmFilter` layer comes first (§2.4), then attaching and aliasing repeat per member (§2.2). No LVM activation runs, and unstage releases `n` namespaces where the base design releases one.                                                                            |
+| §8.3 `DeleteExport`          | `lvremove`, `vgremove`, and `pvremove` before the namespaces are released.                                                                                                                                                                                                 |
+| §9.2 StorageClass            | A `stripe_count` parameter, defaulting to `1`, bounded by the eligible node count.                                                                                                                                                                                         |
+| §9.3 `CreateVolume`          | Create `n` lvols of `ceil(S/n)`, verify distinct placement (§2.5), and record all members.                                                                                                                                                                                 |
+| §12.2 Snapshot               | The group path in §3.3 replaces the per-lvol snapshot.                                                                                                                                                                                                                     |
+| §13 Failover                 | Unchanged in shape, but step 4 rebuilds an LVM stripe rather than mounting a device, which lengthens the freeze. The `fsid` and the VG and LV names still have to match.                                                                                                   |
+| §5.3 Compatibility           | The guest additionally needs S0-6 and S0-7. Client kernels need nothing beyond the base design, because the block layout client already decodes `STRIPE` and `SLICE` topologies.                                                                                           |
+| `design-pnfs-mds-vm.md` §6.4 | The runner resolves one connection per member, and `ExportSpec` carries them as a repeated field in member order. The path keeper reconciles every member's paths.                                                                                                         |
+| §16 Failure modes            | The lost member, the missing topology support, the reshaped table, the unresolved member, and the activating client (§6).                                                                                                                                                  |
 
 The `NFSExport` status change is the only one that touches a shipped API, and it
 cannot be done by rewriting stored objects in place: an object already persisted
