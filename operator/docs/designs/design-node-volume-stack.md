@@ -300,7 +300,7 @@ input to plan construction and not a property of the volume:
 | pNFS single, MDS host                         | `fabric` → `filesystem` → `nfsExport`                                                                            |
 | pNFS single, client node                      | `fabric` → `alias` → `nfsMount`                                                                                  |
 | pNFS striped, MDS host                        | `members(n)` → `lvmPhysicalVolume` → `lvmVolumeGroup` → `lvmLogicalVolume(striped)` → `filesystem` → `nfsExport` |
-| pNFS striped, client node                     | `members(n)` → `alias` → `lvmVolumeGroup(activate)` → `lvmLogicalVolume(read-only)` → `nfsMount`                 |
+| pNFS striped, client node                     | `lvmFilter` → `members(n)` → `alias` → `nfsMount`                                                                |
 
 Three results are worth reading off that table. Raw block mode is the plain plan
 with its top layer absent rather than a conditional inside a stage function. The
@@ -524,8 +524,8 @@ type Recorder interface {
 }
 ```
 
-Optional rather than mandatory is deliberate. Five of the nine layers in §5 have
-nothing to heal, five have nothing to grow, and `lvmPhysicalVolume` has nothing to
+Optional rather than mandatory is deliberate. Five of the ten layers in §5 have
+nothing to heal, six have nothing to grow, and `lvmPhysicalVolume` has nothing to
 record, and a mandatory interface would fill them with methods that return nil.
 The runner's assertion is also what keeps
 `NodeExpandVolume` honest: a plan whose layers implement no `Grower` at all is a
@@ -551,9 +551,10 @@ error on kubelet's reconciliation retry.
 | `alias`                    | Publish the `eui64` symlink                                                          | Remove the symlink                                                  | —                  | —                            |
 | `nfsExport`                | Write the export drop-in, `exportfs -ra`                                             | `exportfs -u`                                                       | Remove the drop-in | `Grower`                     |
 | `nfsMount`                 | `mount -t nfs -o v4.1`                                                               | Unmount                                                             | —                  | `Healer`                     |
+| `lvmFilter`                | Exclude the members from the host's LVM before they are attached                     | Remove the exclusion                                                | —                  | `Healer`, `Recorder`         |
 
-`alias`, `nfsExport`, and `nfsMount` are listed for completeness and are out of
-scope here (§2). They are specified by
+`alias`, `nfsExport`, `nfsMount`, and `lvmFilter` are listed for completeness and
+are out of scope here (§2). They are specified by
 [`design-pnfs-rwx.md`](design-pnfs-rwx.md) §8 and §10 and
 [`design-pnfs-striped.md`](design-pnfs-striped.md) §2.
 

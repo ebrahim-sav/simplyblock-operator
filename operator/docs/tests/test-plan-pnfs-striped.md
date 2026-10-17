@@ -8,7 +8,7 @@ Harness: `csi-driver` (`make -C csi-driver unit-test`, `e2e-test`) and `operator
 (`make -C operator test`).
 
 This work is unimplemented, so every `Test` cell is `—` and every scenario appears
-in §7 as a gap.
+in §9 as a gap.
 
 Scope: the CSI driver, the operator, and the Kubernetes surface of this repository.
 The consistency-group primitive itself is a control-plane dependency, faked at the
@@ -62,6 +62,19 @@ Mock `ClusterAPI` and mock HTTP. No cluster, no host commands.
 | SU-15 | `stripe_count = 2`, the smallest true stripe, plans two members and a two-way stripe          | Boundary | —    |
 | SU-16 | `stripe_count` exactly equal to the eligible node count is accepted, not rejected             | Boundary | —    |
 
+### Client plan and the `lvmFilter` layer (design §2.2, §2.4)
+
+| #     | Scenario                                                                                                   | Type     | Test |
+|-------|------------------------------------------------------------------------------------------------------------|----------|------|
+| SU-17 | The striped client plan is `lvmFilter` → `members(n)` → `alias` → `nfsMount`, with no LVM activation layer | Positive | —    |
+| SU-18 | `lvmFilter` `Ensure` writes one reject entry per member NGUID into the marked `global_filter` block        | Positive | —    |
+| SU-19 | `lvmFilter` on a host without LVM reports `StateReady` and writes nothing                                  | Boundary | —    |
+| SU-20 | `lvmFilter` on a devices-file host that lists no member reports `StateReady` and writes nothing            | Positive | —    |
+| SU-21 | `lvmFilter` on a devices-file host that lists a member reports `StateForeign`, and staging is refused      | Negative | —    |
+| SU-22 | `lvmFilter` with some entries present reports `StatePartial`, and `Ensure` adds only the missing ones      | Boundary | —    |
+| SU-23 | `lvmFilter` `Release` removes this volume's entries and leaves another volume's entries in place           | Positive | —    |
+| SU-24 | `lvmFilter` `Healthy` reports false when a device-mapper device holds a member                             | Negative | —    |
+
 ---
 
 ## 2. Unit Tests — operator (`operator/internal`)
@@ -91,22 +104,30 @@ stubbed. The step sequence and its idempotency are what break here.
 | SI-06 | `DeleteExport` tears down in reverse: unexport, unmount, `lvremove`, `vgremove`, `pvremove`, release | Positive | —    |
 | SI-07 | `mkfs.xfs` is skipped when `blkid` already reports XFS on the logical volume                         | Boundary | —    |
 | SI-08 | Snapshot freezes, calls the group API once, and thaws even when the call fails                       | Negative | —    |
+| SI-09 | The assembler refuses to export `n > 1` when the guest nfsd lacks the `pnfs_dm_stripe` parameter     | Negative | —    |
+| SI-10 | After a resize, a table that is not one `striped` target stops the grow before `xfs_growfs`          | Negative | —    |
+| SI-11 | After activation, a table whose device order differs from the CR's member order is not exported      | Negative | —    |
 
 ---
 
 ## 4. End-to-End Tests (live cluster, kernel ≥ 6.11, three or more storage nodes)
 
-| #     | Scenario                                                                                                 | Type     | Test |
-|-------|----------------------------------------------------------------------------------------------------------|----------|------|
-| SE-01 | Provision a striped RWX PVC with `n = 3`, mount it on three nodes, read and write shared data            | Positive | —    |
-| SE-02 | Members verifiably landed on three distinct storage nodes                                                | Positive | —    |
-| SE-03 | Aggregate sequential throughput exceeds a single-member export by a meaningful margin                    | Positive | —    |
-| SE-04 | The direct block path is in use, confirmed by per-namespace counters rather than by absence of errors    | Positive | —    |
-| SE-05 | Snapshot a striped volume, restore it, mount the restore, and `fsck` clean                               | Positive | —    |
-| SE-06 | Restore a snapshot taken under sustained write load, then verify a database checkpoint replays           | Positive | —    |
-| SE-07 | Online resize grows every member, then the LV, then the filesystem, with data intact                     | Positive | —    |
-| SE-08 | Clone a striped volume and confirm the clone is independent, with its own export, Service, and `fsid`    | Positive | —    |
-| SE-09 | Provision with `n` greater than the available nodes and confirm a clean failure, not a degenerate stripe | Negative | —    |
+| #     | Scenario                                                                                                  | Type     | Test |
+|-------|-----------------------------------------------------------------------------------------------------------|----------|------|
+| SE-01 | Provision a striped RWX PVC with `n = 3`, mount it on three nodes, read and write shared data             | Positive | —    |
+| SE-02 | Members verifiably landed on three distinct storage nodes                                                 | Positive | —    |
+| SE-03 | Aggregate sequential throughput exceeds a single-member export by a meaningful margin                     | Positive | —    |
+| SE-04 | The direct block path is in use, confirmed by per-namespace counters rather than by absence of errors     | Positive | —    |
+| SE-05 | Snapshot a striped volume, restore it, mount the restore, and `fsck` clean                                | Positive | —    |
+| SE-06 | Restore a snapshot taken under sustained write load, then verify a database checkpoint replays            | Positive | —    |
+| SE-07 | Online resize grows every member, then the LV, then the filesystem, with data intact                      | Positive | —    |
+| SE-08 | Clone a striped volume and confirm the clone is independent, with its own export, Service, and `fsid`     | Positive | —    |
+| SE-09 | Provision with `n` greater than the available nodes and confirm a clean failure, not a degenerate stripe  | Negative | —    |
+| SE-10 | GETDEVICEINFO for a striped export returns one `STRIPE` of `n` `SLICE` and `SCSI` volumes, in table order | Positive | —    |
+| SE-11 | Data written through the direct path reads back identically from each member at the table's offsets       | Positive | —    |
+| SE-12 | A fenced client is preempted on every member, and its direct writes fail on all `n`                       | Negative | —    |
+| SE-13 | A client node with LVM event activation enabled stages a striped volume and never activates its group     | Negative | —    |
+| SE-14 | After an online resize the table is still one `striped` target and the direct path stays in use           | Positive | —    |
 
 ---
 
@@ -154,31 +175,33 @@ beta feature enabled.
 | Group membership     | valid single-cluster and single-pool group (VGS-01, VGS-02), rejected cross-cluster or cross-pool sources (VGS-04). A striped volume spanning two clusters is out of scope by design (§1.2) and is not the same case |
 | Snapshot consistency | idle (SE-05), under load (SE-06), failed midway (SF-04)                                                                                                                                                              |
 | Failover             | planned (SF-02), partitioned (SF-05), unreassemblable (SO-04, SO-05)                                                                                                                                                 |
+| Guest kernel         | topology support present (SE-10, SE-11), absent (SI-09)                                                                                                                                                              |
+| Client LVM           | none installed (SU-19), devices file (SU-20, SU-21), `global_filter` (SU-18, SU-22, SU-23), event activation enabled (SE-13)                                                                                         |
 
 ## 8. Coverage Summary
 
 | Class                        | Scenarios | Covered | Gap           |
 |------------------------------|-----------|---------|---------------|
-| CSI driver unit (`SU-`)      | 16        | 0       | SU-01…SU-16   |
+| CSI driver unit (`SU-`)      | 24        | 0       | SU-01…SU-24   |
 | Operator (`SO-`)             | 5         | 0       | SO-01…SO-05   |
-| Integration (`SI-`)          | 8         | 0       | SI-01…SI-08   |
-| End-to-end (`SE-`)           | 9         | 0       | SE-01…SE-09   |
+| Integration (`SI-`)          | 11        | 0       | SI-01…SI-11   |
+| End-to-end (`SE-`)           | 14        | 0       | SE-01…SE-14   |
 | Failure injection (`SF-`)    | 6         | 0       | SF-01…SF-06   |
 | VolumeGroupSnapshot (`VGS-`) | 10        | 0       | VGS-01…VGS-10 |
-| **Total**                    | **54**    | **0**   |               |
+| **Total**                    | **70**    | **0**   |               |
 
 ---
 
 ## 9. What Is Not Yet Covered
 
-| IDs           | Reason                                                                                                  |
-|---------------|---------------------------------------------------------------------------------------------------------|
-| SU-01…SU-16   | Nothing is implemented, so there is no `CreateVolume` striping path to plan against                     |
-| SO-01…SO-05   | The `NFSExport` CRD does not carry `members[]` yet, and no reconciler assembles a stripe                |
-| SI-01…SI-08   | No `CreateExport` LVM path exists to drive, on either side                                              |
-| SE-01…SE-09   | Requires a live cluster with three or more storage nodes on kernel 6.11 or later, and the feature built |
-| SF-01…SF-06   | Requires the above plus fault injection, and SF-04 additionally requires the consistency group (S0-1)   |
-| VGS-01…VGS-10 | Requires the GroupController service, the group CRDs in the chart, and Kubernetes ≥ 1.32                |
+| IDs           | Reason                                                                                                    |
+|---------------|-----------------------------------------------------------------------------------------------------------|
+| SU-01…SU-24   | Nothing is implemented, so there is no `CreateVolume` striping path and no `lvmFilter` layer to test      |
+| SO-01…SO-05   | The `NFSExport` CRD does not carry `members[]` yet, and no reconciler assembles a stripe                  |
+| SI-01…SI-11   | No `CreateExport` LVM path exists to drive                                                                |
+| SE-01…SE-14   | Requires a live cluster with three or more storage nodes, the guest topology patch, and the feature built |
+| SF-01…SF-06   | Requires the above plus fault injection, and SF-04 additionally requires the consistency group (S0-1)     |
+| VGS-01…VGS-10 | Requires the GroupController service, the group CRDs in the chart, and Kubernetes ≥ 1.32                  |
 
 Three further gaps are deliberate rather than pending, and are recorded so they are
 not mistaken for coverage:
