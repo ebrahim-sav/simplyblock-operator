@@ -92,7 +92,7 @@
       health: {probes: [{name: "storefront", type: "http", target: "http://shop.shop.svc/healthz", expectStatus: 200}]}}},
     [{name: "fra-a-to-fra-b", from: "fra-a", to: "fra-b", actions: ["Failover", "Relocate", "Test"], readiness: {verdict: "Degraded", checks: readyChecks(true), lastTransitionTime: agoIso(600)}},
      {name: "fra-b-to-fra-a", from: "fra-b", to: "fra-a", actions: ["Relocate"], readiness: {verdict: "Degraded", checks: readyChecks(false, [check("at-path-source", "Fail", true, "NotAtSource", "application runs on cluster-a, path starts at fra-b")]).map(c => c.name === "at-path-source" && c.status === "Pass" ? null : c).filter(Boolean), lastTransitionTime: agoIso(600)}}],
-    {drpc: `${OPS}/shop`, placement: `${OPS}/shop-placement`, drPolicy: "fra-primary-5m", recipe: {name: "shop", namespace: OPS, generated: true, hash: "9c1e2f"}, lastAction: `${OPS}/test-shop-w4`, siteMapping: "NotApplicable"}));
+    {drpc: `${OPS}/shop`, placement: `${OPS}/shop-placement`, drPolicy: "fra-primary-5m", replication: {lastSyncTime: agoIso(3.2), interval: "5m0s"}, recipe: {name: "shop", namespace: OPS, generated: true, hash: "9c1e2f"}, lastAction: `${OPS}/test-shop-w4`, siteMapping: "NotApplicable"}));
   // a KubeVirt application on the cross-cluster plan: one NAD resolved by role, one open; guests on the backend role (ADR 0020)
   store.ProtectedApplication.push(app("erp-vms", OPS, "fra", "fra-a", "fra-b", "discovered",
     {spec: {method: "primary", discovered: {protectedNamespaces: ["erp"], pvcSelector: {matchLabels: {app: "erp"}}}, tiers: [{name: "db", selector: {resourceTypes: ["virtualmachines"], matchLabels: {tier: "db"}}, ready: [{type: "vmRunning"}]}, {name: "app", selector: {resourceTypes: ["virtualmachines"], matchLabels: {tier: "app"}}, ready: [{type: "vmRunning"}]}]}},
@@ -114,13 +114,13 @@
     {spec: {method: "vault", discovered: {protectedNamespaces: ["ledger"], pvcSelector: {matchLabels: {app: "ledger"}}, recipeRef: {name: "ledger-recipe"}}}},
     [{name: "fra-a-to-fra-b", from: "fra-a", to: "fra-b", actions: ["Failover", "Relocate", "Test"], readiness: {verdict: "NotReady", checks: readyChecks(true).map(c => c.name === "ramen-healthy" ? check("ramen-healthy", "Fail", true, "VRGUnhealthy", "VolumeReplicationGroup ledger: DataProtected=False (lastGroupSyncTime 2h old)") : c), lastTransitionTime: agoIso(115)}},
      {name: "fra-b-to-fra-a", from: "fra-b", to: "fra-a", actions: ["Relocate"], readiness: {verdict: "NotReady", checks: [check("at-path-source", "Fail", true, "NotAtSource", "application runs on cluster-a")], lastTransitionTime: agoIso(600)}}],
-    {drpc: `${OPS}/ledger`, drPolicy: "fra-vault-15m", recipe: {name: "ledger-recipe", namespace: OPS, generated: false}, lastAction: `${OPS}/relocate-ledger-1`,
+    {drpc: `${OPS}/ledger`, drPolicy: "fra-vault-15m", replication: {lastSyncTime: agoIso(115), interval: "15m0s"}, recipe: {name: "ledger-recipe", namespace: OPS, generated: false}, lastAction: `${OPS}/relocate-ledger-1`,
       conditions: [cond("Bound", true, "Bound", ""), cond("Protected", false, "ReplicationUnhealthy", "VRG DataProtected=False", 115)]}));
   store.ProtectedApplication.push(app("payments", "payments", "fra", "fra-a", "fra-b", "managed",
     {spec: {method: "primary", managed: {placementRef: {name: "payments"}, pvcSelector: {matchLabels: {app: "payments"}}}, dependsOn: ["ledger"]}},
     [{name: "fra-a-to-fra-b", from: "fra-a", to: "fra-b", actions: ["Failover", "Relocate", "Test"], readiness: {verdict: "Ready", checks: readyChecks(true).map(c => c.name === "storage-replicating" ? check("storage-replicating", "Pass", false, "Replicating", "lag 42s") : c), lastTransitionTime: agoIso(3000)}},
      {name: "fra-b-to-fra-a", from: "fra-b", to: "fra-a", actions: ["Relocate"], readiness: {verdict: "NotReady", checks: [check("at-path-source", "Fail", true, "NotAtSource", "application runs on cluster-a")], lastTransitionTime: agoIso(3000)}}],
-    {drpc: "payments/payments", placement: "payments/payments", drPolicy: "fra-primary-5m", recipe: {name: "payments", namespace: "payments", generated: true, hash: "0b77aa"}}));
+    {drpc: "payments/payments", placement: "payments/payments", drPolicy: "fra-primary-5m", replication: {lastSyncTime: agoIso(0.7), interval: "5m0s"}, recipe: {name: "payments", namespace: "payments", generated: true, hash: "0b77aa"}}));
   // a consistency-group relocate stuck in the target's restore (2026-10-03): Ramen keeps retrying, the action ended
   store.ProtectedApplication.push(app("wiki", OPS, "fra", "fra-a", "fra-b", "discovered",
     {spec: {method: "primary", discovered: {protectedNamespaces: ["wiki"], pvcSelector: {matchLabels: {app: "wiki"}}}}},

@@ -1347,6 +1347,7 @@ function DRPathTile({o: p, nav}) {
 }
 
 function PAppTile({o: a, nav}) {
+  const rl = replicationLag(a);
   return (
     <div className="tile" style={{"--sc": STATUS_META[a.status].c}} onDoubleClick={() => nav.detail(a)}>
       <TileHead obj={a} left={<><TrafficLight status={a.status} /><Name>{a.name}</Name></>} right={<span className="badge">{a.appKind}</span>} />
@@ -1355,6 +1356,7 @@ function PAppTile({o: a, nav}) {
       <div className="labels">
         <span className="lab"><i>now on</i>{a.currentCluster || "—"}</span>
         {a.method && <span className="lab"><i>method</i>{a.method}</span>}
+        {rl && <span className={"lab" + (rl.over ? " warn" : "")} title={`last replicated ${fmtDate(rl.at)}; interval ${fmtSecs(rl.interval)}`}><i>RPO now</i>{fmtSecs(rl.lag)}</span>}
         {a.protected === false && <span className="lab warn">not protected</span>}
         {a.awaitingRestore && <span className="lab warn">awaiting restore</span>}
         {a.zoneBinding && <span className="lab"><i>zone</i>{a.zoneBinding}</span>}
@@ -1724,6 +1726,7 @@ function PAppDetail({o: a, nav}) {
   const [actions, tests, restores, scheds] = runs.data || [[], [], [], []];
   const [tab, setTab] = useState("readiness");
   const running = [...actions, ...tests].filter(r => !r.terminal);
+  const rl = replicationLag(a);
   return (
     <div>
       <DetailHead obj={a} title={a.name} sub={<><span className="mono" style={{color: "var(--dim)"}}>{a.namespace}</span><PathArrow from={a.source} to={a.target} /></>}
@@ -1744,6 +1747,8 @@ function PAppDetail({o: a, nav}) {
         <Stat k="Readiness" v={<VerdictBadge v={a.verdict} />} s={`${a.paths.length} declared path${a.paths.length === 1 ? "" : "s"}`} />
         <Stat k="Currently on" v={a.currentCluster || "—"} s={a.zoneBinding ? `zone binding ${a.zoneBinding}` : a.drpc ? `DRPC ${a.drpc}` : ""} />
         <Stat k="Plan" v={a.planName} s={a.drPolicy ? `DRPolicy ${a.drPolicy}` : ""} />
+        <Stat k="RPO now" v={rl ? fmtSecs(rl.lag) : "—"} c={rl && rl.over ? "var(--bad)" : null}
+          s={rl ? `last replicated ${clockOf(rl.at)} · interval ${fmtSecs(rl.interval)}` : "no async replication reported"} />
         <Stat k="Last action" v={a.lastAction ? a.lastAction.name : "—"} />
         <Stat k="Site mapping" v={<TrafficLight status={a.siteMapping} />} s={a.mapping ? `${a.counts.openFindings} open · ${a.mapping.counts.resolved} resolved` : "VM networks and guest addresses"} />
         <Stat k="Runs" v={actions.length + tests.length} s={`${actions.length} actions · ${tests.length} tests`} />
